@@ -17,7 +17,7 @@ P1.Age = 30
 P2 = P1  ' ← Complete struct copy with string refcounting!
 ```
 
-See [UDT_ASSIGNMENT_GUIDE.md](UDT_ASSIGNMENT_GUIDE.md) for full documentation.
+See [docs/UDT_ASSIGNMENT_GUIDE.md](docs/UDT_ASSIGNMENT_GUIDE.md) for full documentation.
 
 ---
 
@@ -31,6 +31,8 @@ A native-code ahead-of-time (AOT) compiler backend for FasterBASIC using the QBE
 > ```
 > The `qbe_basic` executable at the project root is a **symlink** to `qbe_basic_integrated/qbe_basic`.
 > See [BUILD.md](BUILD.md) for detailed build instructions.
+>
+> **📁 Project Structure:** See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for an overview of the repository organization.
 
 ## Overview
 
@@ -43,7 +45,7 @@ FBCQBE compiles FasterBASIC programs to native machine code through the QBE (Qui
 
 ## Project Status
 
-**Latest Update (February 2025)**: UDT-to-UDT whole-struct assignment with proper string refcounting, nested UDT support, and memory safety. See [UDT_ASSIGNMENT_STATUS.md](UDT_ASSIGNMENT_STATUS.md) for details.
+**Latest Update (February 2025)**: UDT-to-UDT whole-struct assignment with proper string refcounting, nested UDT support, and memory safety. See [docs/UDT_ASSIGNMENT_STATUS.md](docs/UDT_ASSIGNMENT_STATUS.md) for details.
 
 **Previous Update (January 2025)**: Complete exception handling (TRY/CATCH/FINALLY/THROW) and dynamic array operations (ERASE/REDIM/REDIM PRESERVE) with comprehensive test coverage. String array support with read/write access and string slicing functionality.
 
