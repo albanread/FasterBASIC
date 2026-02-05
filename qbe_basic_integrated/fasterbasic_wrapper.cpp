@@ -17,6 +17,7 @@
 #include "fasterbasic_ast_dump.h"
 #include "modular_commands.h"
 #include "command_registry_core.h"
+#include "plugin_loader.h"
 #include "codegen_v2/qbe_codegen_v2.h"
 
 using namespace FasterBASIC;
@@ -41,6 +42,10 @@ char* compile_basic_to_qbe_string(const char *basic_path) {
             auto& registry = FasterBASIC::ModularCommands::getGlobalCommandRegistry();
             FasterBASIC::ModularCommands::CoreCommandRegistry::registerCoreCommands(registry);
             FasterBASIC::ModularCommands::CoreCommandRegistry::registerCoreFunctions(registry);
+            
+            // Load plugins from plugins/enabled directory
+            FasterBASIC::PluginSystem::initializeGlobalPluginLoader(registry);
+            
             FasterBASIC::ModularCommands::markGlobalRegistryInitialized();
             registryInitialized = true;
         }

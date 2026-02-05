@@ -1,5 +1,6 @@
 #include "ast_emitter.h"
 #include "../runtime_objects.h"
+#include "../modular_commands.h"
 #include <sstream>
 #include <cmath>
 #include <iostream>
@@ -618,6 +619,133 @@ std::string ASTEmitter::emitFunctionCall(const FunctionCallExpression* expr) {
     // Convert to uppercase for case-insensitive matching
     std::string upperName = funcName;
     std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+    
+    // Check for plugin functions first
+    auto& cmdRegistry = FasterBASIC::ModularCommands::getGlobalCommandRegistry();
+    const auto* pluginFunc = cmdRegistry.getFunction(upperName);
+    
+    if (pluginFunc && pluginFunc->functionPtr != nullptr) {
+        // Plugin function found - emit native call via runtime context
+        builder_.emitComment("Plugin function call: " + upperName);
+        
+        // Allocate runtime context on stack (pointer size)
+        std::string ctxPtr = builder_.newTemp();
+        builder_.emitCall(ctxPtr, "l", "fb_context_create", "");
+        
+        // Marshal arguments into context
+        for (size_t i = 0; i < expr->arguments.size() && i < pluginFunc->parameters.size(); ++i) {
+            std::string argTemp = emitExpression(expr->arguments[i].get());
+            BaseType argType = getExpressionType(expr->arguments[i].get());
+            
+            const auto& param = pluginFunc->parameters[i];
+            
+            // Add parameter to context based on type
+            switch (param.type) {
+                case FasterBASIC::ModularCommands::ParameterType::INT:
+                case FasterBASIC::ModularCommands::ParameterType::BOOL: {
+                    // Convert to int32 if needed
+                    if (typeManager_.isFloatingPoint(argType)) {
+                        std::string intTemp = builder_.newTemp();
+                        std::string qbeType = typeManager_.getQBEType(argType);
+                        builder_.emitRaw("    " + intTemp + " =w " + qbeType + "tosi " + argTemp);
+                        argTemp = intTemp;
+                    } else if (typeManager_.getQBEType(argType) == "l") {
+                        // Truncate long to int
+                        std::string intTemp = builder_.newTemp();
+                        builder_.emitRaw("    " + intTemp + " =w copy " + argTemp);
+                        argTemp = intTemp;
+                    }
+                    builder_.emitCall("", "", "fb_context_add_int_param", "l " + ctxPtr + ", w " + argTemp);
+                    break;
+                }
+                case FasterBASIC::ModularCommands::ParameterType::FLOAT: {
+                    // Convert to float if needed
+                    if (typeManager_.isIntegral(argType)) {
+                        argTemp = emitTypeConversion(argTemp, argType, BaseType::SINGLE);
+                    } else if (argType == BaseType::DOUBLE) {
+                        std::string floatTemp = builder_.newTemp();
+                        builder_.emitRaw("    " + floatTemp + " =s dtof " + argTemp);
+                        argTemp = floatTemp;
+                    }
+                    builder_.emitCall("", "", "fb_context_add_float_param", "l " + ctxPtr + ", s " + argTemp);
+                    break;
+                }
+                case FasterBASIC::ModularCommands::ParameterType::STRING: {
+                    // String argument - pass descriptor pointer
+                    if (argType != BaseType::STRING) {
+                        // Convert non-string to string
+                        argTemp = emitTypeConversion(argTemp, argType, BaseType::STRING);
+                    }
+                    builder_.emitCall("", "", "fb_context_add_string_param", "l " + ctxPtr + ", l " + argTemp);
+                    break;
+                }
+                default:
+                    builder_.emitComment("WARNING: Unsupported plugin parameter type");
+                    break;
+            }
+        }
+        
+        // Get function pointer and call it
+        std::string funcPtrTemp = builder_.newTemp();
+        // Cast the function pointer to long (pointer)
+        std::stringstream funcPtrStr;
+        funcPtrStr << reinterpret_cast<intptr_t>(pluginFunc->functionPtr);
+        builder_.emitRaw("    " + funcPtrTemp + " =l copy " + funcPtrStr.str());
+        
+        // Call the plugin function via indirect call
+        // The function signature is: void (*)(FB_RuntimeContext*)
+        builder_.emitRaw("    call " + funcPtrTemp + "(l " + ctxPtr + ")");
+        
+        // Check for errors
+        std::string hasError = builder_.newTemp();
+        builder_.emitCall(hasError, "w", "fb_context_has_error", "l " + ctxPtr);
+        
+        std::string errorCheckLabel = "plugin_err_" + std::to_string(builder_.getTempCounter());
+        std::string noErrorLabel = "plugin_ok_" + std::to_string(builder_.getTempCounter());
+        
+        builder_.emitRaw("    jnz " + hasError + ", @" + errorCheckLabel + ", @" + noErrorLabel);
+        builder_.emitLabel(errorCheckLabel);
+        
+        // Get error message and print it
+        std::string errorMsg = builder_.newTemp();
+        builder_.emitCall(errorMsg, "l", "fb_context_get_error", "l " + ctxPtr);
+        runtime_.emitPrintString(errorMsg);
+        runtime_.emitPrintNewline();
+        
+        // Call END to terminate program on error
+        builder_.emitCall("", "", "basic_end", "w 1");
+        
+        builder_.emitLabel(noErrorLabel);
+        
+        // Extract return value based on function return type
+        std::string result;
+        switch (pluginFunc->returnType) {
+            case FasterBASIC::ModularCommands::ReturnType::INT:
+            case FasterBASIC::ModularCommands::ReturnType::BOOL:
+                result = builder_.newTemp();
+                builder_.emitCall(result, "w", "fb_context_get_return_int", "l " + ctxPtr);
+                break;
+                
+            case FasterBASIC::ModularCommands::ReturnType::FLOAT:
+                result = builder_.newTemp();
+                builder_.emitCall(result, "s", "fb_context_get_return_float", "l " + ctxPtr);
+                break;
+                
+            case FasterBASIC::ModularCommands::ReturnType::STRING:
+                result = builder_.newTemp();
+                builder_.emitCall(result, "l", "fb_context_get_return_string", "l " + ctxPtr);
+                break;
+                
+            default:
+                result = "0";
+                break;
+        }
+        
+        // Destroy context (frees temporary allocations)
+        builder_.emitCall("", "", "fb_context_destroy", "l " + ctxPtr);
+        
+        return result;
+    }
     
     // Check for intrinsic/built-in functions
     
@@ -2322,6 +2450,112 @@ void ASTEmitter::emitCallStatement(const CallStatement* stmt) {
     if (stmt->subName == "__method_call" && stmt->methodCallExpr) {
         // Emit the method call expression and discard the result
         emitExpression(stmt->methodCallExpr.get());
+        return;
+    }
+    
+    // Check for plugin commands first
+    std::string upperName = stmt->subName;
+    std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+    
+    auto& cmdRegistry = FasterBASIC::ModularCommands::getGlobalCommandRegistry();
+    const auto* pluginCmd = cmdRegistry.getCommand(upperName);
+    
+    if (pluginCmd && pluginCmd->functionPtr != nullptr) {
+        // Plugin command found - emit native call via runtime context
+        builder_.emitComment("Plugin command call: " + upperName);
+        
+        // Allocate runtime context
+        std::string ctxPtr = builder_.newTemp();
+        builder_.emitCall(ctxPtr, "l", "fb_context_create", "");
+        
+        // Marshal arguments into context
+        for (size_t i = 0; i < stmt->arguments.size() && i < pluginCmd->parameters.size(); ++i) {
+            std::string argTemp = emitExpression(stmt->arguments[i].get());
+            BaseType argType = getExpressionType(stmt->arguments[i].get());
+            
+            const auto& param = pluginCmd->parameters[i];
+            
+            // Add parameter to context based on type
+            switch (param.type) {
+                case FasterBASIC::ModularCommands::ParameterType::INT:
+                case FasterBASIC::ModularCommands::ParameterType::BOOL: {
+                    // Convert to int32 if needed
+                    if (typeManager_.isFloatingPoint(argType)) {
+                        std::string intTemp = builder_.newTemp();
+                        std::string qbeType = typeManager_.getQBEType(argType);
+                        builder_.emitRaw("    " + intTemp + " =w " + qbeType + "tosi " + argTemp);
+                        argTemp = intTemp;
+                    } else if (typeManager_.getQBEType(argType) == "l") {
+                        // Truncate long to int
+                        std::string intTemp = builder_.newTemp();
+                        builder_.emitRaw("    " + intTemp + " =w copy " + argTemp);
+                        argTemp = intTemp;
+                    }
+                    builder_.emitCall("", "", "fb_context_add_int_param", "l " + ctxPtr + ", w " + argTemp);
+                    break;
+                }
+                case FasterBASIC::ModularCommands::ParameterType::FLOAT: {
+                    // Convert to float if needed
+                    if (typeManager_.isIntegral(argType)) {
+                        argTemp = emitTypeConversion(argTemp, argType, BaseType::SINGLE);
+                    } else if (argType == BaseType::DOUBLE) {
+                        std::string floatTemp = builder_.newTemp();
+                        builder_.emitRaw("    " + floatTemp + " =s dtof " + argTemp);
+                        argTemp = floatTemp;
+                    }
+                    builder_.emitCall("", "", "fb_context_add_float_param", "l " + ctxPtr + ", s " + argTemp);
+                    break;
+                }
+                case FasterBASIC::ModularCommands::ParameterType::STRING: {
+                    // String argument - pass descriptor pointer
+                    if (argType != BaseType::STRING) {
+                        // Convert non-string to string
+                        argTemp = emitTypeConversion(argTemp, argType, BaseType::STRING);
+                    }
+                    builder_.emitCall("", "", "fb_context_add_string_param", "l " + ctxPtr + ", l " + argTemp);
+                    break;
+                }
+                default:
+                    builder_.emitComment("WARNING: Unsupported plugin parameter type");
+                    break;
+            }
+        }
+        
+        // Get function pointer and call it
+        std::string funcPtrTemp = builder_.newTemp();
+        // Cast the function pointer to long (pointer)
+        std::stringstream funcPtrStr;
+        funcPtrStr << reinterpret_cast<intptr_t>(pluginCmd->functionPtr);
+        builder_.emitRaw("    " + funcPtrTemp + " =l copy " + funcPtrStr.str());
+        
+        // Call the plugin function via indirect call
+        // The function signature is: void (*)(FB_RuntimeContext*)
+        builder_.emitRaw("    call " + funcPtrTemp + "(l " + ctxPtr + ")");
+        
+        // Check for errors
+        std::string hasError = builder_.newTemp();
+        builder_.emitCall(hasError, "w", "fb_context_has_error", "l " + ctxPtr);
+        
+        std::string errorCheckLabel = "plugin_err_" + std::to_string(builder_.getTempCounter());
+        std::string noErrorLabel = "plugin_ok_" + std::to_string(builder_.getTempCounter());
+        
+        builder_.emitRaw("    jnz " + hasError + ", @" + errorCheckLabel + ", @" + noErrorLabel);
+        builder_.emitLabel(errorCheckLabel);
+        
+        // Get error message and print it
+        std::string errorMsg = builder_.newTemp();
+        builder_.emitCall(errorMsg, "l", "fb_context_get_error", "l " + ctxPtr);
+        runtime_.emitPrintString(errorMsg);
+        runtime_.emitPrintNewline();
+        
+        // Call END to terminate program on error
+        builder_.emitCall("", "", "basic_end", "w 1");
+        
+        builder_.emitLabel(noErrorLabel);
+        
+        // Destroy context (frees temporary allocations)
+        builder_.emitCall("", "", "fb_context_destroy", "l " + ctxPtr);
+        
         return;
     }
     

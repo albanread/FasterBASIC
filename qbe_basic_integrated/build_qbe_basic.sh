@@ -78,6 +78,8 @@ printf '%s\n' \
     "$FASTERBASIC_SRC/codegen_v2/ast_emitter.cpp" \
     "$FASTERBASIC_SRC/codegen_v2/cfg_emitter.cpp" \
     "$FASTERBASIC_SRC/codegen_v2/qbe_codegen_v2.cpp" \
+    "$FASTERBASIC_SRC/plugin_runtime_context.cpp" \
+    "$FASTERBASIC_SRC/plugin_loader.cpp" \
 | xargs -n 1 -P "$NUM_JOBS" -I {} bash -c 'compile_source "$@"' _ {}
 
 if [ $? -ne 0 ]; then

@@ -117,15 +117,15 @@ static int g_nextCommandId = 1;
 
 // Callback: Begin registering a command
 static int Plugin_BeginCommand(void* userData, const char* name, const char* description,
-                              const char* luaFunction, const char* category) {
-    if (!userData || !name || !description || !luaFunction || !category) {
+                              FB_FunctionPtr functionPtr, const char* category) {
+    if (!userData || !name || !description || !functionPtr || !category) {
         return -1;
     }
     
     int cmdId = g_nextCommandId++;
     
     auto* def = new ModularCommands::CommandDefinition(
-        name, description, luaFunction, category
+        name, description, functionPtr, category
     );
     
     g_commandsInProgress[cmdId] = CommandInProgress{ def, true };
@@ -134,8 +134,8 @@ static int Plugin_BeginCommand(void* userData, const char* name, const char* des
 
 // Callback: Begin registering a function
 static int Plugin_BeginFunction(void* userData, const char* name, const char* description,
-                               const char* luaFunction, const char* category, int returnType) {
-    if (!userData || !name || !description || !luaFunction || !category) {
+                               FB_FunctionPtr functionPtr, const char* category, int returnType) {
+    if (!userData || !name || !description || !functionPtr || !category) {
         return -1;
     }
     
@@ -145,7 +145,7 @@ static int Plugin_BeginFunction(void* userData, const char* name, const char* de
     ModularCommands::ReturnType retType = static_cast<ModularCommands::ReturnType>(returnType);
     
     auto* def = new ModularCommands::CommandDefinition(
-        name, description, luaFunction, category, false, retType
+        name, description, functionPtr, category, false, retType
     );
     
     g_commandsInProgress[cmdId] = CommandInProgress{ def, true };

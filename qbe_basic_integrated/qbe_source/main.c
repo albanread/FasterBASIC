@@ -621,6 +621,7 @@ main(int ac, char *av[])
 			"array_descriptor_runtime.c",
 			"memory_mgmt.c",
 			"basic_data.c",
+			"plugin_context_runtime.c",
 			NULL
 		};
 		
@@ -723,8 +724,61 @@ main(int ac, char *av[])
 			}
 		}
 		
+		/* Find and link plugin libraries from plugins/enabled directory */
+		char plugin_libs[2048] = "";
+		char *plugin_search_paths[] = {
+			"plugins/enabled",
+			"../plugins/enabled",
+			NULL
+		};
+		
+		for (char **plugin_path = plugin_search_paths; *plugin_path; plugin_path++) {
+			if (access(*plugin_path, R_OK) == 0) {
+				/* Scan for .so, .dylib, or .dll files */
+				DIR *dir = opendir(*plugin_path);
+				if (dir) {
+					struct dirent *entry;
+					while ((entry = readdir(dir)) != NULL) {
+						if (entry->d_type == DT_REG || entry->d_type == DT_LNK) {
+							char *name = entry->d_name;
+							size_t len = strlen(name);
+							
+							/* Check for plugin extension */
+							int is_plugin = 0;
+							if (len > 3 && strcmp(name + len - 3, ".so") == 0) is_plugin = 1;
+							if (len > 6 && strcmp(name + len - 6, ".dylib") == 0) is_plugin = 1;
+							if (len > 4 && strcmp(name + len - 4, ".dll") == 0) is_plugin = 1;
+							
+							if (is_plugin) {
+								char full_path[1024];
+								snprintf(full_path, sizeof(full_path), "%s/%s", *plugin_path, name);
+								
+								/* Add to plugin libs string */
+								size_t current_len = strlen(plugin_libs);
+								size_t path_len = strlen(full_path);
+								if (current_len + path_len + 2 < sizeof(plugin_libs)) {
+									if (current_len > 0) strcat(plugin_libs, " ");
+									strcat(plugin_libs, full_path);
+									
+									if (!dbg) {
+										fprintf(stderr, "Linking plugin: %s\n", name);
+									}
+								}
+							}
+						}
+					}
+					closedir(dir);
+				}
+				break;  /* Found plugins directory, stop searching */
+			}
+		}
+		
 		/* Build final link command */
-		if (qbe_modules_objs[0]) {
+		if (plugin_libs[0] && qbe_modules_objs[0]) {
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s %s -o %s", temp_asm, obj_list, qbe_modules_objs, plugin_libs, output_file);
+		} else if (plugin_libs[0]) {
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -o %s", temp_asm, obj_list, plugin_libs, output_file);
+		} else if (qbe_modules_objs[0]) {
 			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -o %s", temp_asm, obj_list, qbe_modules_objs, output_file);
 		} else {
 			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s -o %s", temp_asm, obj_list, output_file);

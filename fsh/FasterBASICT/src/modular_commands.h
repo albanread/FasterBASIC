@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <memory>
 #include <shared_mutex>
+#include "plugin_interface.h"  // For FB_FunctionPtr
 
 namespace FasterBASIC {
 namespace ModularCommands {
@@ -66,7 +67,8 @@ struct CommandDefinition {
     std::string commandName;             // BASIC command name (e.g., "PRINT_AT")
     std::string description;             // Human-readable description
     std::vector<ParameterDefinition> parameters; // Command parameters
-    std::string luaFunction;             // Target Lua function to call
+    std::string luaFunction;             // Target Lua function to call (legacy, deprecated)
+    FB_FunctionPtr functionPtr;          // Native function pointer (C ABI)
     std::string category;                // Command category ("text", "graphics", etc.)
     bool requiresParentheses;            // Whether command requires () syntax
     std::string customCodeTemplate;      // Custom code generation template (optional)
@@ -76,8 +78,8 @@ struct CommandDefinition {
     std::string usage;                   // Optional usage string (auto-generated if empty)
     
     // Default constructor for std::unordered_map
-    CommandDefinition() : commandName(""), description(""), luaFunction(""), 
-                         category("general"), requiresParentheses(false),
+    CommandDefinition() : commandName(""), description(""), luaFunction(""),
+                         functionPtr(nullptr), category("general"), requiresParentheses(false),
                          customCodeTemplate(""), hasCustomCodeGen(false),
                          returnType(ReturnType::VOID), isFunction(false), usage("") {}
     
@@ -88,7 +90,19 @@ struct CommandDefinition {
                      bool needParens = false,
                      ReturnType retType = ReturnType::VOID)
         : commandName(name), description(desc), luaFunction(luaFunc),
-          category(cat), requiresParentheses(needParens),
+          functionPtr(nullptr), category(cat), requiresParentheses(needParens),
+          customCodeTemplate(""), hasCustomCodeGen(false),
+          returnType(retType), isFunction(retType != ReturnType::VOID), usage("") {}
+    
+    // Constructor with native function pointer (preferred for plugins)
+    CommandDefinition(const std::string& name,
+                     const std::string& desc,
+                     FB_FunctionPtr funcPtr,
+                     const std::string& cat = "general",
+                     bool needParens = false,
+                     ReturnType retType = ReturnType::VOID)
+        : commandName(name), description(desc), luaFunction(""),
+          functionPtr(funcPtr), category(cat), requiresParentheses(needParens),
           customCodeTemplate(""), hasCustomCodeGen(false),
           returnType(retType), isFunction(retType != ReturnType::VOID), usage("") {}
     

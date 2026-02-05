@@ -13,6 +13,7 @@
 #define FASTERBASIC_PLUGIN_INTERFACE_H
 
 #include <cstdint>
+#include <cstddef>
 
 // =============================================================================
 // Forward Declarations
@@ -173,6 +174,7 @@ extern "C" {
     typedef const char* (*FB_PluginDescriptionFunc)();
     typedef const char* (*FB_PluginAuthorFunc)();
     typedef int (*FB_PluginAPIVersionFunc)();
+    typedef const char* (*FB_PluginRuntimeFilesFunc)();  // Comma-separated list of .c files
     
     // Plugin lifecycle functions
     // FB_PLUGIN_INIT: Called when plugin is loaded
@@ -200,13 +202,19 @@ extern "C" {
 
 // Plugin metadata macro - Use this at the start of your plugin
 // Example:
-//   FB_PLUGIN_BEGIN("My Plugin", "1.0.0", "Description", "Author", "my_runtime.lua")
+//   FB_PLUGIN_BEGIN("My Plugin", "1.0.0", "Description", "Author")
 #define FB_PLUGIN_BEGIN(name, version, description, author) \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_NAME() { return name; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_VERSION() { return version; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_DESCRIPTION() { return description; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_AUTHOR() { return author; } \
     FB_PLUGIN_EXPORT int FB_PLUGIN_API_VERSION() { return FB_PLUGIN_API_VERSION_CURRENT; }
+
+// Optional: Specify runtime files that must be compiled and linked
+// Example:
+//   FB_PLUGIN_RUNTIME_FILES("my_helpers.c, data_parser.c")
+#define FB_PLUGIN_RUNTIME_FILES(files) \
+    FB_PLUGIN_EXPORT const char* FB_PLUGIN_RUNTIME_FILES() { return files; }
 
 // Plugin initialization macro - Use this to define your init function
 // Example:
