@@ -1,0 +1,6 @@
+FUNCTION get_five() AS INTEGER
+  RETURN 5
+END FUNCTION
+
+PRINT get_five()
+END

@@ -1,0 +1,10 @@
+10 REM Minimal UDT assignment test
+20 TYPE Point
+30   X AS INTEGER
+40 END TYPE
+50 DIM P1 AS Point
+60 DIM P2 AS Point
+70 P1.X = 42
+80 P2 = P1
+90 PRINT P2.X
+100 END

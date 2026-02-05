@@ -1,0 +1,10 @@
+TYPE Inner
+  V AS INTEGER
+END TYPE
+TYPE Outer
+  I AS Inner
+END TYPE
+DIM O AS Outer
+O.I.V = 99
+PRINT O.I.V
+END

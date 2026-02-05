@@ -1,0 +1,18 @@
+REM Test DATA/READ with integers only
+DATA 10, 20, 30, 40, 50
+
+DIM a AS INTEGER
+DIM b AS INTEGER
+DIM c AS INTEGER
+
+READ a, b, c
+PRINT a
+PRINT b
+PRINT c
+
+RESTORE
+READ a, b
+PRINT a
+PRINT b
+
+END

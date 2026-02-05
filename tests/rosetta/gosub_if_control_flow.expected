@@ -1,0 +1,41 @@
+=== GOSUB/RETURN Control Flow Test ===
+
+Test 1: Multiline IF with GOSUB
+  Before GOSUB
+    In Sub1
+  After GOSUB
+  Still in IF block
+  After END IF
+
+Test 2: Nested IFs with GOSUB
+  In outer IF
+    In inner IF, before GOSUB
+      In Sub2
+    After GOSUB in inner IF
+  After inner END IF
+  After outer END IF
+
+Test 3: WHILE with GOSUB in multiline IF
+  Loop iteration 1
+    Before GOSUB (odd number)
+      In Sub3, value=1
+    After GOSUB, result=100
+  After IF block
+  Loop iteration 2
+  After IF block
+  Loop iteration 3
+    Before GOSUB (odd number)
+      In Sub3, value=3
+    After GOSUB, result=300
+  After IF block
+  After WHILE
+
+Test 4: Multiple GOSUBs in same IF
+  Before first GOSUB
+    In Sub4a
+  Between GOSUBs, val1=42
+    In Sub4b
+  After second GOSUB, val2=99
+  After END IF
+
+=== All Tests Completed Successfully ===

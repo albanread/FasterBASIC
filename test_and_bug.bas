@@ -1,0 +1,6 @@
+A$ = "Alice"
+B = 25
+IF A$ = "Alice" THEN PRINT "A check PASS" ELSE PRINT "A check FAIL"
+IF B = 25 THEN PRINT "B check PASS" ELSE PRINT "B check FAIL"
+IF A$ = "Alice" AND B = 25 THEN PRINT "AND PASS" ELSE PRINT "AND FAIL"
+END

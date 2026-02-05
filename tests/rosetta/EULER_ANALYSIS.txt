@@ -1,0 +1,125 @@
+================================================================================
+EULER'S METHOD ERROR ANALYSIS
+Newton's Cooling Law: dT/dt = -k(T - T_room)
+================================================================================
+
+ERROR AT t=100 seconds vs STEP SIZE
+------------------------------------
+
+Step Size    Computational     Final Error    Error per
+(seconds)    Steps             (°C)           Step (°C)
+--------------------------------------------------------------
+   2            51              0.030          0.00059
+   5            21              0.058          0.00276
+  10            11              0.072          0.00655
+
+OBSERVATION: Smaller step size → Better accuracy but more computation
+
+
+ERROR GROWTH OVER TIME (Step size h=2s)
+----------------------------------------
+
+Time (s)    Error (°C)    % Error
+-------------------------------------
+   0          0.000         0.00%
+  10          2.093         3.50%
+  20          2.024         5.09%
+  30          1.468         4.93%
+  40          0.947         3.81%
+  50          0.573         2.55%
+  60          0.333         1.57%
+  70          0.188         0.91%
+  80          0.104         0.51%
+  90          0.057         0.28%
+ 100          0.030         0.15%
+
+OBSERVATION: Error is largest in the middle of the transition,
+             decreases as temperature stabilizes near room temp
+
+
+COMPARISON: ALL THREE STEP SIZES AT KEY TIMES
+----------------------------------------------
+
+Time: 10 seconds
+  h=2s:  Error = 2.09°C    (Euler: 57.63°C)
+  h=5s:  Error = 5.93°C    (Euler: 53.80°C)
+  h=10s: Error = 15.73°C   (Euler: 44.00°C)
+  Analytical: 59.73°C
+
+Time: 50 seconds  
+  h=2s:  Error = 0.57°C    (Euler: 21.84°C)
+  h=5s:  Error = 1.34°C    (Euler: 21.08°C)
+  h=10s: Error = 2.22°C    (Euler: 20.19°C)
+  Analytical: 22.42°C
+
+Time: 100 seconds
+  h=2s:  Error = 0.03°C    (Euler: 20.04°C)
+  h=5s:  Error = 0.06°C    (Euler: 20.01°C)
+  h=10s: Error = 0.07°C    (Euler: 20.00°C)
+  Analytical: 20.07°C
+
+
+EULER'S METHOD FORMULA
+----------------------
+
+Given: dy/dt = f(t,y)
+
+Approximation: y(n+1) = y(n) + h * f(t(n), y(n))
+
+For Newton's Cooling:
+  f(t,T) = -k * (T - T_room)
+  
+  T(n+1) = T(n) + h * [-k * (T(n) - T_room)]
+  T(n+1) = T(n) - h * k * (T(n) - T_room)
+
+With our values (k=0.07, T_room=20):
+  T(n+1) = T(n) - 0.07*h * (T(n) - 20)
+
+
+ACCURACY ORDER
+--------------
+
+Euler's method is a first-order method:
+  Global error ∝ h
+
+Halving the step size approximately halves the final error:
+  h=10 → h=5:  Error 0.072 → 0.058  (Factor: 1.24)
+  h=5  → h=2:  Error 0.058 → 0.030  (Factor: 1.93)
+
+(Factors not exactly 2.0 due to problem-specific behavior)
+
+
+COMPUTATIONAL EFFICIENCY
+------------------------
+
+Accuracy × Efficiency Trade-off:
+
+  h=2s:  51 steps → 0.030°C error → 0.00059°C/step
+  h=5s:  21 steps → 0.058°C error → 0.00276°C/step
+  h=10s: 11 steps → 0.072°C error → 0.00655°C/step
+
+For this problem, h=2s provides best overall value:
+  - Excellent accuracy
+  - Still very fast (< 1 second)
+  - Only 51 steps total
+
+
+PHYSICAL INTERPRETATION
+-----------------------
+
+The cooling follows an exponential decay curve:
+  
+  T(t) = 20 + 80 * exp(-0.07*t)
+
+At t=0:   T = 20 + 80 = 100°C (initial)
+At t=100: T = 20 + 80*e⁻⁷ ≈ 20.07°C (nearly room temp)
+
+Half-life: t₁/₂ = ln(2)/k = 0.693/0.07 ≈ 9.9 seconds
+
+After 100 seconds (≈10 half-lives), the temperature difference
+has reduced to (1/2)¹⁰ ≈ 1/1024 of the original.
+
+================================================================================
+CONCLUSION: Euler's method successfully approximates the solution with
+            acceptable accuracy. Smaller step sizes improve results.
+================================================================================

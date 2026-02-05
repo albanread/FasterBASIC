@@ -1,0 +1,31 @@
+Initializing 100 doors...
+Making 100 passes through the doors...
+
+============================================
+Final State of Doors
+============================================
+
+Door 1 is OPEN
+Door 4 is OPEN
+Door 9 is OPEN
+Door 16 is OPEN
+Door 25 is OPEN
+Door 36 is OPEN
+Door 49 is OPEN
+Door 64 is OPEN
+Door 81 is OPEN
+Door 100 is OPEN
+
+--------------------------------------------
+Total open doors: 10
+
+Pattern: Only perfect squares are open!
+1, 4, 9, 16, 25, 36, 49, 64, 81, 100
+
+Verification:
+✓ All doors in correct state!
+
+Algorithm explanation:
+A door is toggled once for each of its divisors.
+Only perfect squares have an odd number of divisors,
+so only those doors end up open.

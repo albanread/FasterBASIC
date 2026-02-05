@@ -1,0 +1,202 @@
+1000 REM Levenshtein Distance - Rosetta Code Challenge
+1010 REM https://rosettacode.org/wiki/Levenshtein_distance
+1020 REM
+1030 REM The Levenshtein distance is a string metric for measuring the
+1040 REM difference between two sequences. It is the minimum number of
+1050 REM single-character edits (insertions, deletions or substitutions)
+1060 REM required to change one word into the other.
+1070 REM
+1080 REM This implementation uses dynamic programming with a 2D array
+1090 REM to compute the edit distance efficiently.
+1100
+1110 PRINT "=== Levenshtein Distance Calculator ==="
+1120 PRINT ""
+1130
+1140 REM Declare all variables at the top level
+1150 DIM str1 AS STRING
+1160 DIM str2 AS STRING
+1170 DIM dist AS INTEGER
+1175 DIM d(101, 101) AS INTEGER
+1176 DIM len1 AS INTEGER
+1177 DIM len2 AS INTEGER
+1178 DIM i AS INTEGER
+1179 DIM j AS INTEGER
+1180 DIM cost AS INTEGER
+1181 DIM min1 AS INTEGER
+1182 DIM min2 AS INTEGER
+1183 DIM min3 AS INTEGER
+1184 DIM i1 AS INTEGER
+1185 DIM j1 AS INTEGER
+1186 DIM dist1 AS INTEGER
+1187
+1188 REM Initialize all integer variables
+1189 dist = 0
+1190 len1 = 0
+1191 len2 = 0
+1192 i = 0
+1193 j = 0
+1194 cost = 0
+1195 min1 = 0
+1196 min2 = 0
+1197 min3 = 0
+1198 i1 = 0
+1199 j1 = 0
+1200 dist1 = 0
+1201
+1202 REM Test Case 1: kitten -> sitting
+1203
+1204 str1 = "kitten"
+1210 str2 = "sitting"
+1220 GOSUB 2000
+1230 PRINT "Distance between '"; str1; "' and '"; str2; "' = "; dist
+1240 IF dist = 3 THEN
+1250     PRINT "  ✓ PASS: Expected 3"
+1260 ELSE
+1270     PRINT "  ✗ FAIL: Expected 3, got "; dist
+1280 END IF
+1290 PRINT ""
+1300
+1310 REM Test Case 2: rosettacode -> raisethysword
+1320 str1 = "rosettacode"
+1330 str2 = "raisethysword"
+1340 GOSUB 2000
+1350 PRINT "Distance between '"; str1; "' and '"; str2; "' = "; dist
+1360 IF dist = 8 THEN
+1370     PRINT "  ✓ PASS: Expected 8"
+1380 ELSE
+1390     PRINT "  ✗ FAIL: Expected 8, got "; dist
+1400 END IF
+1410 PRINT ""
+1420
+1430 REM Test Case 3: Empty strings
+1440 str1 = ""
+1450 str2 = "hello"
+1460 GOSUB 2000
+1470 PRINT "Distance between '' and '"; str2; "' = "; dist
+1480 IF dist = 5 THEN
+1490     PRINT "  ✓ PASS: Expected 5 (length of 'hello')"
+1500 ELSE
+1510     PRINT "  ✗ FAIL: Expected 5, got "; dist
+1520 END IF
+1530 PRINT ""
+1540
+1550 REM Test Case 4: Identical strings
+1560 str1 = "identical"
+1570 str2 = "identical"
+1580 GOSUB 2000
+1590 PRINT "Distance between '"; str1; "' and '"; str2; "' = "; dist
+1600 IF dist = 0 THEN
+1610     PRINT "  ✓ PASS: Expected 0 (identical strings)"
+1620 ELSE
+1630     PRINT "  ✗ FAIL: Expected 0, got "; dist
+1640 END IF
+1650 PRINT ""
+1660
+1670 REM Test Case 5: Single character difference
+1680 str1 = "cat"
+1690 str2 = "bat"
+1700 GOSUB 2000
+1710 PRINT "Distance between '"; str1; "' and '"; str2; "' = "; dist
+1720 IF dist = 1 THEN
+1730     PRINT "  ✓ PASS: Expected 1 (single substitution)"
+1740 ELSE
+1750     PRINT "  ✗ FAIL: Expected 1, got "; dist
+1760 END IF
+1770 PRINT ""
+1780
+1790 REM Test Case 6: Reversed strings have same distance
+1800 str1 = "reverse"
+1810 str2 = "esrever"
+1820 GOSUB 2000
+1830 dist1 = dist
+1850 str1 = "esrever"
+1860 str2 = "reverse"
+1870 GOSUB 2000
+1875 PRINT "Distance 'reverse' <-> 'esrever': "; dist1; " and "; dist
+1880 IF dist1 = dist THEN
+1890     PRINT "  ✓ PASS: Symmetric (both = "; dist; ")"
+1900 ELSE
+1910     PRINT "  ✗ FAIL: Should be symmetric"
+1920 END IF
+1930 PRINT ""
+1940
+1950 PRINT "All test cases completed!"
+1960 END
+1970
+1980 REM ============================================================
+1990 REM Subroutine: Calculate Levenshtein Distance
+2000 REM Input: str1, str2 (strings to compare)
+2010 REM Output: dist (edit distance)
+2020 REM ============================================================
+2030
+2040
+2045 PRINT "DEBUG: Entered subroutine, str1='"; str1; "' str2='"; str2; "'"
+2050 REM Get string lengths
+2060 len1 = LEN(str1)
+2070 len2 = LEN(str2)
+2080
+2170 REM Handle edge cases
+2180 IF len1 = 0 THEN
+2190     dist = len2
+2200     RETURN
+2210 END IF
+2220
+2230 IF len2 = 0 THEN
+2240     dist = len1
+2250     RETURN
+2260 END IF
+2270
+2280 REM Create distance matrix (len1+1) x (len2+1)
+2290 REM Using a 2D array: d(i,j) represents distance between
+2300 REM first i characters of str1 and first j characters of str2
+2310
+2320 REM Initialize first row and column (1-based arrays)
+2340 FOR i = 0 TO len1
+2350     d(i + 1, 1) = i
+2360 NEXT i
+2370
+2380 FOR j = 0 TO len2
+2390     d(1, j + 1) = j
+2400 NEXT j
+2410
+2420 REM Fill in the matrix using dynamic programming
+2430 FOR i = 1 TO len1
+2440     FOR j = 1 TO len2
+2450         REM Cost is 0 if characters match, 1 if they don't
+2460         IF MID$(str1, i, 1) = MID$(str2, j, 1) THEN
+2470             cost = 0
+2480         ELSE
+2490             cost = 1
+2500         END IF
+2510
+2520         REM Compute minimum of three operations:
+2530         REM 1. Deletion: d(i-1, j) + 1
+2540         REM 2. Insertion: d(i, j-1) + 1
+2550         REM 3. Substitution: d(i-1, j-1) + cost
+2560
+2565         i1 = i - 1
+2566         j1 = j - 1
+2570         min1 = d(i1 + 1, j + 1) + 1
+2580         min2 = d(i + 1, j1 + 1) + 1
+2590         min3 = d(i1 + 1, j1 + 1) + cost
+2600
+2610         REM Find minimum of the three
+2620         IF min1 < min2 THEN
+2630             IF min1 < min3 THEN
+2640                 d(i + 1, j + 1) = min1
+2650             ELSE
+2660                 d(i + 1, j + 1) = min3
+2670             END IF
+2680         ELSE
+2690             IF min2 < min3 THEN
+2700                 d(i + 1, j + 1) = min2
+2710             ELSE
+2720                 d(i + 1, j + 1) = min3
+2730             END IF
+2740         END IF
+2750     NEXT j
+2760 NEXT i
+2770
+2780 REM The bottom-right cell contains the final distance
+2790 dist = d(len1 + 1, len2 + 1)
+2800 RETURN

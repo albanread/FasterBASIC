@@ -1,0 +1,191 @@
+10 REM Test: ON GOSUB Statement
+20 PRINT "=== ON GOSUB Tests ==="
+30 PRINT ""
+40 REM Test 1: Basic ON GOSUB with index 1
+50 LET INDEX% = 1
+60 LET RESULT% = 0
+70 ON INDEX% GOSUB 1000, 2000, 3000
+80 IF RESULT% <> 1 THEN PRINT "ERROR: ON GOSUB index 1 failed" : END
+90 PRINT "PASS: ON GOSUB index 1 works"
+100 GOTO 200
+1000 REM Subroutine 1
+1010 LET RESULT% = 1
+1020 RETURN
+2000 REM Subroutine 2
+2010 LET RESULT% = 2
+2020 RETURN
+3000 REM Subroutine 3
+3010 LET RESULT% = 3
+3020 RETURN
+200 REM Test 2: ON GOSUB with index 2
+210 LET INDEX% = 2
+220 LET RESULT% = 0
+230 ON INDEX% GOSUB 4000, 4100, 4200
+240 IF RESULT% <> 2 THEN PRINT "ERROR: ON GOSUB index 2 failed" : END
+250 PRINT "PASS: ON GOSUB index 2 works"
+260 GOTO 300
+4000 REM Subroutine 1 for test 2
+4010 LET RESULT% = 1
+4020 RETURN
+4100 REM Subroutine 2 for test 2
+4110 LET RESULT% = 2
+4120 RETURN
+4200 REM Subroutine 3 for test 2
+4210 LET RESULT% = 3
+4220 RETURN
+300 REM Test 3: ON GOSUB with index 3
+310 LET INDEX% = 3
+320 LET RESULT% = 0
+330 ON INDEX% GOSUB 4300, 4400, 4500
+340 IF RESULT% <> 3 THEN PRINT "ERROR: ON GOSUB index 3 failed" : END
+350 PRINT "PASS: ON GOSUB index 3 works"
+360 GOTO 400
+4300 REM Subroutine 1 for test 3
+4310 LET RESULT% = 1
+4320 RETURN
+4400 REM Subroutine 2 for test 3
+4410 LET RESULT% = 2
+4420 RETURN
+4500 REM Subroutine 3 for test 3
+4510 LET RESULT% = 3
+4520 RETURN
+400 REM Test 4: ON GOSUB with computed expression
+410 LET A% = 7
+420 LET B% = 5
+430 LET RESULT% = 0
+440 ON A% - B% GOSUB 4600, 4700, 4800
+450 IF RESULT% <> 2 THEN PRINT "ERROR: ON GOSUB with expression failed" : END
+460 PRINT "PASS: ON GOSUB with expression (7-5=2) works"
+470 GOTO 500
+4600 REM Subroutine 1 for test 4
+4610 LET RESULT% = 1
+4620 RETURN
+4700 REM Subroutine 2 for test 4
+4710 LET RESULT% = 2
+4720 RETURN
+4800 REM Subroutine 3 for test 4
+4810 LET RESULT% = 3
+4820 RETURN
+500 REM Test 5: ON GOSUB with index 0 (should fall through)
+510 LET INDEX% = 0
+520 LET RESULT% = 99
+530 ON INDEX% GOSUB 4900, 5000, 5100
+540 IF RESULT% <> 99 THEN PRINT "ERROR: Index 0 called a subroutine" : END
+550 PRINT "PASS: ON GOSUB with index 0 falls through"
+560 GOTO 600
+4900 REM Subroutine 1 for test 5
+4910 LET RESULT% = 1
+4920 RETURN
+5000 REM Subroutine 2 for test 5
+5010 LET RESULT% = 2
+5020 RETURN
+5100 REM Subroutine 3 for test 5
+5110 LET RESULT% = 3
+5120 RETURN
+600 REM Test 6: ON GOSUB with out-of-range index (should fall through)
+610 LET INDEX% = 5
+620 LET RESULT% = 99
+630 ON INDEX% GOSUB 5200, 5300, 5400
+640 IF RESULT% <> 99 THEN PRINT "ERROR: Out-of-range index called a subroutine" : END
+650 PRINT "PASS: ON GOSUB with out-of-range index falls through"
+660 GOTO 700
+5200 REM Subroutine 1 for test 6
+5210 LET RESULT% = 1
+5220 RETURN
+5300 REM Subroutine 2 for test 6
+5310 LET RESULT% = 2
+5320 RETURN
+5400 REM Subroutine 3 for test 6
+5410 LET RESULT% = 3
+5420 RETURN
+700 REM Test 7: ON GOSUB with negative index (should fall through)
+710 LET INDEX% = -2
+720 LET RESULT% = 99
+730 ON INDEX% GOSUB 5500, 5600
+740 IF RESULT% <> 99 THEN PRINT "ERROR: Negative index called a subroutine" : END
+750 PRINT "PASS: ON GOSUB with negative index falls through"
+760 GOTO 800
+5500 REM Subroutine 1 for test 7
+5510 LET RESULT% = 1
+5520 RETURN
+5600 REM Subroutine 2 for test 7
+5610 LET RESULT% = 2
+5620 RETURN
+800 REM Test 8: ON GOSUB with single target
+810 LET INDEX% = 1
+820 LET RESULT% = 0
+830 ON INDEX% GOSUB 5700
+840 IF RESULT% <> 42 THEN PRINT "ERROR: Single-target ON GOSUB failed" : END
+850 PRINT "PASS: ON GOSUB with single target works"
+860 GOTO 900
+5700 REM Single subroutine for test 8
+5710 LET RESULT% = 42
+5720 RETURN
+900 REM Test 9: Nested ON GOSUB calls
+910 LET X% = 0
+920 LET Y% = 0
+930 LET INDEX% = 2
+940 ON INDEX% GOSUB 5800, 5900, 6000
+950 IF X% <> 10 THEN PRINT "ERROR: Nested ON GOSUB outer failed" : END
+960 IF Y% <> 20 THEN PRINT "ERROR: Nested ON GOSUB inner failed" : END
+970 PRINT "PASS: Nested ON GOSUB works"
+980 GOTO 1050
+5800 REM Subroutine 1 for test 9
+5810 LET X% = 5
+5820 RETURN
+5900 REM Subroutine 2 for test 9 (calls another ON GOSUB)
+5910 LET X% = 10
+5920 LET INNER% = 1
+5930 ON INNER% GOSUB 6100, 6200
+5940 RETURN
+6000 REM Subroutine 3 for test 9
+6010 LET X% = 15
+6020 RETURN
+6100 REM Inner subroutine 1
+6110 LET Y% = 20
+6120 RETURN
+6200 REM Inner subroutine 2
+6210 LET Y% = 25
+6220 RETURN
+1050 REM Test 10: ON GOSUB with many targets
+1060 LET INDEX% = 4
+1070 LET RESULT% = 0
+1080 ON INDEX% GOSUB 6300, 6400, 6500, 6600, 6700, 6800
+1090 IF RESULT% <> 4 THEN PRINT "ERROR: Many-target ON GOSUB failed" : END
+1100 PRINT "PASS: ON GOSUB with many targets (index 4)"
+1110 GOTO 1150
+6300 REM Target 1 for test 10
+6310 LET RESULT% = 1
+6320 RETURN
+6400 REM Target 2 for test 10
+6410 LET RESULT% = 2
+6420 RETURN
+6500 REM Target 3 for test 10
+6510 LET RESULT% = 3
+6520 RETURN
+6600 REM Target 4 for test 10
+6610 LET RESULT% = 4
+6620 RETURN
+6700 REM Target 5 for test 10
+6710 LET RESULT% = 5
+6720 RETURN
+6800 REM Target 6 for test 10
+6810 LET RESULT% = 6
+6820 RETURN
+1150 REM Test 11: ON GOSUB execution continues after RETURN
+1160 LET INDEX% = 1
+1170 LET RESULT% = 0
+1180 LET CONTINUE% = 0
+1190 ON INDEX% GOSUB 7000
+1200 LET CONTINUE% = 1
+1210 IF RESULT% <> 77 THEN PRINT "ERROR: ON GOSUB subroutine not executed" : END
+1220 IF CONTINUE% <> 1 THEN PRINT "ERROR: Execution did not continue after RETURN" : END
+1230 PRINT "PASS: Execution continues after ON GOSUB RETURN"
+1240 GOTO 9000
+7000 REM Subroutine for test 11
+7010 LET RESULT% = 77
+7020 RETURN
+9000 REM All tests passed
+9010 PRINT ""
+9020 PRINT "=== All ON GOSUB Tests PASSED ==="
+9030 END

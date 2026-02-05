@@ -1,0 +1,9 @@
+10 REM Test: Simple UDT with one field
+20 TYPE Point
+30   X AS INTEGER
+40 END TYPE
+50 DIM P AS Point
+60 P.X = 42
+70 PRINT "P.X = "; P.X
+80 IF P.X = 42 THEN PRINT "PASS" ELSE PRINT "FAIL"
+90 END
