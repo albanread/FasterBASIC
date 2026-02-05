@@ -6,13 +6,24 @@
 // developers to create dynamic libraries that extend the compiler with
 // custom commands and functions.
 //
-// API Version: 1.0
+// API Version: 2.0 (C-Native)
 //
 
 #ifndef FASTERBASIC_PLUGIN_INTERFACE_H
 #define FASTERBASIC_PLUGIN_INTERFACE_H
 
 #include <cstdint>
+
+// =============================================================================
+// Forward Declarations
+// =============================================================================
+
+// Opaque runtime context (defined in runtime implementation)
+struct FB_RuntimeContext;
+typedef struct FB_RuntimeContext FB_RuntimeContext;
+
+// Plugin function pointer type
+typedef void (*FB_FunctionPtr)(FB_RuntimeContext* ctx);
 
 // =============================================================================
 // Parameter and Return Type Enumerations
@@ -25,7 +36,9 @@ enum FB_ParameterType {
     FB_PARAM_STRING = 2,
     FB_PARAM_COLOR = 3,
     FB_PARAM_BOOL = 4,
-    FB_PARAM_TYPENAME = 5  // User-defined TYPE name (generates schema at compile time)
+    FB_PARAM_LONG = 5,
+    FB_PARAM_DOUBLE = 6,
+    FB_PARAM_TYPENAME = 7  // User-defined TYPE name (generates schema at compile time)
 };
 
 // Return types (must match ReturnType enum in modular_commands.h)
@@ -34,8 +47,41 @@ enum FB_ReturnType {
     FB_RETURN_INT = 1,
     FB_RETURN_FLOAT = 2,
     FB_RETURN_STRING = 3,
-    FB_RETURN_BOOL = 4
+    FB_RETURN_BOOL = 4,
+    FB_RETURN_LONG = 5,
+    FB_RETURN_DOUBLE = 6
 };
+
+// =============================================================================
+// Runtime Context API (for use within plugin functions)
+// =============================================================================
+
+extern "C" {
+    // Parameter access functions
+    int32_t    fb_get_int_param(FB_RuntimeContext* ctx, int index);
+    int64_t    fb_get_long_param(FB_RuntimeContext* ctx, int index);
+    float      fb_get_float_param(FB_RuntimeContext* ctx, int index);
+    double     fb_get_double_param(FB_RuntimeContext* ctx, int index);
+    const char* fb_get_string_param(FB_RuntimeContext* ctx, int index);
+    int        fb_get_bool_param(FB_RuntimeContext* ctx, int index);
+    int        fb_param_count(FB_RuntimeContext* ctx);
+    
+    // Return value functions
+    void fb_return_int(FB_RuntimeContext* ctx, int32_t value);
+    void fb_return_long(FB_RuntimeContext* ctx, int64_t value);
+    void fb_return_float(FB_RuntimeContext* ctx, float value);
+    void fb_return_double(FB_RuntimeContext* ctx, double value);
+    void fb_return_string(FB_RuntimeContext* ctx, const char* value);
+    void fb_return_bool(FB_RuntimeContext* ctx, int value);
+    
+    // Error handling
+    void fb_set_error(FB_RuntimeContext* ctx, const char* message);
+    int  fb_has_error(FB_RuntimeContext* ctx);
+    
+    // Memory management (automatically freed when function returns)
+    void* fb_alloc(FB_RuntimeContext* ctx, size_t size);
+    const char* fb_create_string(FB_RuntimeContext* ctx, const char* str);
+}
 
 // =============================================================================
 // Plugin Callback Functions
@@ -50,7 +96,7 @@ extern "C" {
         void* userData,
         const char* name,
         const char* description,
-        const char* luaFunction,
+        FB_FunctionPtr functionPtr,
         const char* category
     );
 
@@ -60,7 +106,7 @@ extern "C" {
         void* userData,
         const char* name,
         const char* description,
-        const char* luaFunction,
+        FB_FunctionPtr functionPtr,
         const char* category,
         int returnType  // FB_ReturnType
     );
@@ -128,12 +174,6 @@ extern "C" {
     typedef const char* (*FB_PluginAuthorFunc)();
     typedef int (*FB_PluginAPIVersionFunc)();
     
-    // Plugin runtime files
-    // Returns: Comma-separated list of Lua runtime files (relative to runtime/)
-    // Example: "my_plugin_runtime.lua" or "plugin_a.lua,plugin_b.lua"
-    // Returns NULL or empty string if no runtime files needed
-    typedef const char* (*FB_PluginRuntimeFilesFunc)();
-    
     // Plugin lifecycle functions
     // FB_PLUGIN_INIT: Called when plugin is loaded
     //   - callbacks: Structure containing registration callbacks
@@ -145,7 +185,8 @@ extern "C" {
     
     // API version constants
     #define FB_PLUGIN_API_VERSION_1 1
-    #define FB_PLUGIN_API_VERSION_CURRENT FB_PLUGIN_API_VERSION_1
+    #define FB_PLUGIN_API_VERSION_2 2  // C-Native (no Lua)
+    #define FB_PLUGIN_API_VERSION_CURRENT FB_PLUGIN_API_VERSION_2
 }
 
 // =============================================================================
@@ -160,13 +201,12 @@ extern "C" {
 // Plugin metadata macro - Use this at the start of your plugin
 // Example:
 //   FB_PLUGIN_BEGIN("My Plugin", "1.0.0", "Description", "Author", "my_runtime.lua")
-#define FB_PLUGIN_BEGIN(name, version, description, author, runtimeFiles) \
+#define FB_PLUGIN_BEGIN(name, version, description, author) \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_NAME() { return name; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_VERSION() { return version; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_DESCRIPTION() { return description; } \
     FB_PLUGIN_EXPORT const char* FB_PLUGIN_AUTHOR() { return author; } \
-    FB_PLUGIN_EXPORT int FB_PLUGIN_API_VERSION() { return FB_PLUGIN_API_VERSION_CURRENT; } \
-    FB_PLUGIN_EXPORT const char* FB_PLUGIN_RUNTIME_FILES() { return runtimeFiles; }
+    FB_PLUGIN_EXPORT int FB_PLUGIN_API_VERSION() { return FB_PLUGIN_API_VERSION_CURRENT; }
 
 // Plugin initialization macro - Use this to define your init function
 // Example:
@@ -238,17 +278,17 @@ public:
 
 // Helper function to begin a command
 inline FB_CommandBuilder FB_BeginCommand(FB_PluginCallbacks* callbacks, const char* name,
-                                        const char* description, const char* luaFunc,
+                                        const char* description, FB_FunctionPtr funcPtr,
                                         const char* category = "custom") {
-    int id = callbacks->beginCommand(callbacks->userData, name, description, luaFunc, category);
+    int id = callbacks->beginCommand(callbacks->userData, name, description, funcPtr, category);
     return FB_CommandBuilder(callbacks, id);
 }
 
 // Helper function to begin a function
 inline FB_CommandBuilder FB_BeginFunction(FB_PluginCallbacks* callbacks, const char* name,
-                                         const char* description, const char* luaFunc,
+                                         const char* description, FB_FunctionPtr funcPtr,
                                          FB_ReturnType returnType, const char* category = "custom") {
-    int id = callbacks->beginFunction(callbacks->userData, name, description, luaFunc, category, returnType);
+    int id = callbacks->beginFunction(callbacks->userData, name, description, funcPtr, category, returnType);
     return FB_CommandBuilder(callbacks, id);
 }
 
@@ -265,7 +305,6 @@ inline FB_CommandBuilder FB_BeginFunction(FB_PluginCallbacks* callbacks, const c
 //    - FB_PLUGIN_DESCRIPTION()
 //    - FB_PLUGIN_AUTHOR()
 //    - FB_PLUGIN_API_VERSION()
-//    - FB_PLUGIN_RUNTIME_FILES()  (can return NULL/empty if no runtime needed)
 //    - FB_PLUGIN_INIT(FB_PluginCallbacks*)
 //    - FB_PLUGIN_SHUTDOWN()
 //
@@ -305,7 +344,7 @@ inline FB_CommandBuilder FB_BeginFunction(FB_PluginCallbacks* callbacks, const c
 // 8. NAMING CONVENTIONS
 //    - Commands: UPPERCASE (e.g., MY_COMMAND)
 //    - Functions: UPPERCASE, use $ suffix for strings (e.g., REVERSE$)
-//    - Lua functions: lowercase_with_underscores (e.g., my_command)
+//    - C functions: lowercase_with_underscores_impl (e.g., my_command_impl)
 //    - Categories: lowercase (e.g., "math", "string", "custom")
 //
 // =============================================================================
@@ -314,18 +353,29 @@ inline FB_CommandBuilder FB_BeginFunction(FB_PluginCallbacks* callbacks, const c
 /*
 
 #include "plugin_interface.h"
+#include <stdio.h>
 
-FB_PLUGIN_BEGIN("Example Plugin", "1.0.0", "Example plugin", "FasterBASIC Team",
-                "example_runtime.lua")
+// Plugin function implementations
+void hello_impl(FB_RuntimeContext* ctx) {
+    const char* name = fb_get_string_param(ctx, 0);
+    printf("Hello, %s!\n", name);
+}
+
+void double_impl(FB_RuntimeContext* ctx) {
+    int32_t value = fb_get_int_param(ctx, 0);
+    fb_return_int(ctx, value * 2);
+}
+
+FB_PLUGIN_BEGIN("Example Plugin", "1.0.0", "Example plugin", "FasterBASIC Team")
 
 FB_PLUGIN_INIT(callbacks) {
     // Register a command
-    FB_BeginCommand(callbacks, "HELLO", "Print greeting", "my_hello")
+    FB_BeginCommand(callbacks, "HELLO", "Print greeting", hello_impl)
         .addParameter("name", FB_PARAM_STRING, "Name to greet")
         .finish();
     
     // Register a function
-    FB_BeginFunction(callbacks, "DOUBLE", "Double a number", "my_double", FB_RETURN_INT)
+    FB_BeginFunction(callbacks, "DOUBLE", "Double a number", double_impl, FB_RETURN_INT)
         .addParameter("value", FB_PARAM_INT, "Value to double")
         .finish();
     
@@ -344,14 +394,19 @@ FB_PLUGIN_SHUTDOWN() {
 /*
 
 #include "plugin_interface.h"
+#include <stdio.h>
 
-FB_PLUGIN_BEGIN("Example Plugin", "1.0.0", "Example plugin", "FasterBASIC Team",
-                "example_runtime.lua")
+void hello_impl(FB_RuntimeContext* ctx) {
+    const char* name = fb_get_string_param(ctx, 0);
+    printf("Hello, %s!\n", name);
+}
+
+FB_PLUGIN_BEGIN("Example Plugin", "1.0.0", "Example plugin", "FasterBASIC Team")
 
 FB_PLUGIN_INIT(callbacks) {
     // Register a command using raw callbacks
     int cmdId = callbacks->beginCommand(callbacks->userData, "HELLO", 
-                                       "Print greeting", "my_hello", "custom");
+                                       "Print greeting", hello_impl, "custom");
     if (cmdId >= 0) {
         callbacks->addParameter(callbacks->userData, cmdId, "name", 
                               FB_PARAM_STRING, "Name to greet", 0, "");
