@@ -1,6 +1,25 @@
 # FBCQBE - FasterBASIC QBE Backend
 
-Working on V2 of the CFG and V2 of the codegen, so right now everything is very broken, but it should be more maintainable when it works.
+## 🎉 Latest Feature: UDT Assignment (February 2025)
+
+**NEW:** Complete UDT-to-UDT whole-struct assignment is now implemented!
+
+```basic
+TYPE Person
+  Name AS STRING
+  Age AS INTEGER
+END TYPE
+
+DIM P1 AS Person, P2 AS Person
+P1.Name = "Alice"
+P1.Age = 30
+
+P2 = P1  ' ← Complete struct copy with string refcounting!
+```
+
+See [UDT_ASSIGNMENT_GUIDE.md](UDT_ASSIGNMENT_GUIDE.md) for full documentation.
+
+---
 
 [![Build Status](https://github.com/albanread/FBCQBE/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FBCQBE/actions)
 
@@ -24,9 +43,20 @@ FBCQBE compiles FasterBASIC programs to native machine code through the QBE (Qui
 
 ## Project Status
 
-**Latest Update (January 2025)**: Complete exception handling (TRY/CATCH/FINALLY/THROW) and dynamic array operations (ERASE/REDIM/REDIM PRESERVE) with comprehensive test coverage. String array support with read/write access and string slicing functionality. Parser correctly distinguishes between array access (`names$(0)`) and string slicing (`s$(1 TO 5)`) using lookahead detection of the TO keyword.
+**Latest Update (February 2025)**: UDT-to-UDT whole-struct assignment with proper string refcounting, nested UDT support, and memory safety. See [UDT_ASSIGNMENT_STATUS.md](UDT_ASSIGNMENT_STATUS.md) for details.
+
+**Previous Update (January 2025)**: Complete exception handling (TRY/CATCH/FINALLY/THROW) and dynamic array operations (ERASE/REDIM/REDIM PRESERVE) with comprehensive test coverage. String array support with read/write access and string slicing functionality.
 
 ### ✅ Working Features
+
+**User-Defined Types (UDTs):**
+- ✅ TYPE/END TYPE declarations
+- ✅ UDT member access (read/write)
+- ✅ **NEW: UDT-to-UDT assignment (P2 = P1)**
+- ✅ String fields with proper refcounting
+- ✅ Nested UDTs (recursive field access)
+- ✅ Arrays of UDTs
+- ✅ Memory safety and independence
 
 **Exception Handling:**
 - ✅ TRY/CATCH/FINALLY/THROW structured exception handling
