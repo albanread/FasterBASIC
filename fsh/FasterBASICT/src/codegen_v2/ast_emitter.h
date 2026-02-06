@@ -271,6 +271,17 @@ private:
     // FOR loop temporary variable addresses (limit, step, comparison flag)
     std::unordered_map<std::string, std::string> forLoopTempAddresses_;
     
+    // === Array element base address cache ===
+    // Workaround for QBE ARM64 miscompilation: when the same array element is
+    // accessed multiple times (e.g., Contacts(Idx).Name then Contacts(Idx).Phone),
+    // the QBE backend can incorrectly drop the index*element_size multiplication
+    // in the second and subsequent accesses. By caching the computed element base
+    // address in a stack slot and reloading it, we avoid re-emitting the mul+add
+    // pattern that triggers the bug.
+    //
+    // Key: "arrayName:serializedIndexExpr", Value: QBE stack alloc name holding the address
+    std::unordered_map<std::string, std::string> arrayElemBaseCache_;
+    
     // === Expression Emitters (by type) ===
     
     std::string emitBinaryExpression(const FasterBASIC::BinaryExpression* expr);
@@ -315,6 +326,17 @@ private:
     
     std::string emitArrayElementAddress(const std::string& arrayName, 
                                         const std::vector<FasterBASIC::ExpressionPtr>& indices);
+    
+    // === Array element base address cache helpers ===
+    
+    // Serialize an index expression to a string key for cache lookup.
+    // Returns empty string for complex expressions that shouldn't be cached.
+    std::string serializeIndexExpression(const FasterBASIC::Expression* expr) const;
+    
+    // Invalidate the array element base address cache.
+    // Called at the start of each statement and after any assignment that could
+    // change array contents or index variable values.
+    void clearArrayElementCache();
     
     // === Helper: recursive UDT field-by-field copy with proper string refcounting ===
     // Copies all fields from sourceAddr to targetAddr for the given UDT definition.

@@ -387,6 +387,54 @@ fixarg(Ref *pr, int sz, int t, E *e)
 	return 0;
 }
 
+/* Check whether the register written by 'prev' is referenced (read) by any
+ * instruction after 'i' in the same basic block, or by the block's branch.
+ *
+ * When we fuse prev+i (e.g. MUL+ADD → MADD), prev is never emitted.
+ * If any later instruction still reads prev->to, it would get a stale
+ * value.  This function returns 1 when fusion would be UNSAFE.
+ *
+ * Special case: if prev->to == i->to, the fused instruction writes to
+ * the same register the consumed instruction would have written, so any
+ * later reader of that register sees the fused result (which equals the
+ * consumer's result).  The MUL result is overwritten by the ADD anyway,
+ * so nothing after i could have been reading the MUL value through that
+ * register.  In that case we return 0 (safe) without scanning.
+ */
+static int
+prev_result_used_later(Ins *i, Blk *b, Ref prev_to)
+{
+	Ins *j, *end;
+
+	/* If the consumer overwrites the same register, the fused
+	 * instruction will too — no stale value is possible. */
+	if (req(i->to, prev_to))
+		return 0;
+
+	end = &b->ins[b->nins];
+
+	/* Scan every instruction after 'i' in this block. */
+	for (j = i + 1; j != end; j++) {
+		if (req(j->arg[0], prev_to))
+			return 1;
+		if (req(j->arg[1], prev_to))
+			return 1;
+		/* If j overwrites prev_to, later instructions see j's
+		 * result, not the consumed prev.  We can stop scanning
+		 * because no subsequent read of prev_to refers to prev.
+		 * (This makes the check precise rather than
+		 * over-conservative.) */
+		if (req(j->to, prev_to))
+			return 0;
+	}
+
+	/* Check the block's branch / jump argument. */
+	if (req(b->jmp.arg, prev_to))
+		return 1;
+
+	return 0;
+}
+
 /* Try to fuse multiply-add patterns into MADD/FMADD instructions.
  * Pattern: ADD dest, src1, mul_result
  *          where mul_result = MUL arg1, arg2 (single use)
@@ -395,7 +443,7 @@ fixarg(Ref *pr, int sz, int t, E *e)
  * Returns: 1 if fused, 0 if not fusible
  */
 static int
-try_madd_fusion(Ins *i, Ins *prev, E *e)
+try_madd_fusion(Ins *i, Ins *prev, E *e, Blk *b)
 {
 	Ref addend;
 	int mul_in_arg0, mul_in_arg1;
@@ -422,28 +470,27 @@ try_madd_fusion(Ins *i, Ins *prev, E *e)
 	if (!isreg(i->arg[0]) || !isreg(i->arg[1]))
 		return 0;
 
-	/* Note: We cannot check nuse at emitter stage because after register
-	 * allocation, prev->to.val is a physical register number, not a temp index.
-	 * Instead, we rely on the peephole pattern: if the MUL is immediately
-	 * followed by an ADD that uses its result, and no other instruction between
-	 * them, then the result is single-use within this basic block.
-	 * This is safe because:
-	 * 1. We only look at adjacent instructions
-	 * 2. If MUL result was needed elsewhere, register allocator would have
-	 *    inserted a copy or the instructions wouldn't be adjacent
-	 */
-
 	/* Determine the addend (the non-multiply operand) */
 	addend = mul_in_arg0 ? i->arg[1] : i->arg[0];
 
-	/* CRITICAL SAFETY CHECK: Do not fuse if addend is the same register as MUL output.
-	 * This can happen when register allocator reuses registers across control flow merges.
-	 * If addend == prev->to, the addend value may be stale from a PHI node or control merge.
-	 * This bug manifests as incorrect array accesses after WHILE loops with nested IFs.
-	 */
+	/* Do not fuse if addend is the same register as MUL output.
+	 * The MADD semantics read all sources before writing dest,
+	 * but if addend == prev->to the "addend" value is actually
+	 * the MUL result itself which was never computed. */
 	if (req(addend, prev->to)) {
 		if (getenv("DEBUG_MADD"))
 			fprintf(stderr, "MADD: Addend is same register as MUL result - unsafe to fuse\n");
+		return 0;
+	}
+
+	/* CRITICAL: After register allocation, CSE / GVN may have
+	 * arranged for multiple instructions to read the MUL result
+	 * register.  Fusion skips emission of the MUL, so any later
+	 * reader would see a stale value.  Scan forward to verify
+	 * the MUL result is truly dead after this ADD. */
+	if (prev_result_used_later(i, b, prev->to)) {
+		if (getenv("DEBUG_MADD"))
+			fprintf(stderr, "MADD: MUL result register used later - unsafe to fuse\n");
 		return 0;
 	}
 
@@ -477,7 +524,7 @@ try_madd_fusion(Ins *i, Ins *prev, E *e)
  * Returns: 1 if fused, 0 if not fusible
  */
 static int
-try_msub_fusion(Ins *i, Ins *prev, E *e)
+try_msub_fusion(Ins *i, Ins *prev, E *e, Blk *b)
 {
 	char *mnemonic;
 
@@ -511,7 +558,12 @@ try_msub_fusion(Ins *i, Ins *prev, E *e)
 		return 0;
 	}
 
-	/* Note: nuse check not valid after register allocation (see try_madd_fusion) */
+	/* Verify MUL result register is not read again after this SUB. */
+	if (prev_result_used_later(i, b, prev->to)) {
+		if (getenv("DEBUG_MADD"))
+			fprintf(stderr, "MSUB: MUL result register used later - unsafe to fuse\n");
+		return 0;
+	}
 
 	/* Select instruction mnemonic based on type */
 	if (KBASE(i->cls) == 0) {
@@ -563,10 +615,9 @@ is_shift_fusion_enabled(void)
  * Returns: 1 if fused, 0 if not fusible
  */
 static int
-try_shift_fusion(Ins *i, Ins *prev, E *e)
+try_shift_fusion(Ins *i, Ins *prev, E *e, Blk *b)
 {
 	char *shift_mnemonic = NULL;
-	char *op_prefix = "";
 	int shift_amount;
 	Ref shift_src, other_operand;
 	int shift_in_arg0, shift_in_arg1;
@@ -612,6 +663,10 @@ try_shift_fusion(Ins *i, Ins *prev, E *e)
 	if (!isreg(prev->arg[0]) || !isreg(i->arg[0]) || !isreg(i->arg[1]))
 		return 0;
 
+	/* Verify shift result register is not read again after this instruction. */
+	if (prev_result_used_later(i, b, prev->to))
+		return 0;
+
 	/* Determine the non-shift operand */
 	other_operand = shift_in_arg0 ? i->arg[1] : i->arg[0];
 	shift_src = prev->arg[0];
@@ -635,49 +690,44 @@ try_shift_fusion(Ins *i, Ins *prev, E *e)
 		return 0;
 	}
 
-	/* Determine operation prefix (for wide vs long) */
-	if (KWIDE(i->cls)) {
-		op_prefix = "W";
-	} else {
-		op_prefix = "";
-	}
-
-	/* Emit fused instruction with shifted operand */
+	/* Emit fused instruction with shifted operand.
+	 * rname() already selects w/x register names based on i->cls,
+	 * so no additional prefix is needed. */
 	switch (i->op) {
 	case Oadd:
-		fprintf(e->f, "\tadd\t%s%s, %s%s, %s%s, %s #%d\n",
-			op_prefix, rname(i->to.val, i->cls),
-			op_prefix, rname(other_operand.val, i->cls),
-			op_prefix, rname(shift_src.val, i->cls),
+		fprintf(e->f, "\tadd\t");
+		fprintf(e->f, "%s, ", rname(i->to.val, i->cls));
+		fprintf(e->f, "%s, ", rname(other_operand.val, i->cls));
+		fprintf(e->f, "%s, %s #%d\n", rname(shift_src.val, i->cls),
 			shift_mnemonic, shift_amount);
 		break;
 	case Osub:
 		/* For SUB, the shifted operand is always arg[1] */
-		fprintf(e->f, "\tsub\t%s%s, %s%s, %s%s, %s #%d\n",
-			op_prefix, rname(i->to.val, i->cls),
-			op_prefix, rname(other_operand.val, i->cls),
-			op_prefix, rname(shift_src.val, i->cls),
+		fprintf(e->f, "\tsub\t");
+		fprintf(e->f, "%s, ", rname(i->to.val, i->cls));
+		fprintf(e->f, "%s, ", rname(other_operand.val, i->cls));
+		fprintf(e->f, "%s, %s #%d\n", rname(shift_src.val, i->cls),
 			shift_mnemonic, shift_amount);
 		break;
 	case Oand:
-		fprintf(e->f, "\tand\t%s%s, %s%s, %s%s, %s #%d\n",
-			op_prefix, rname(i->to.val, i->cls),
-			op_prefix, rname(other_operand.val, i->cls),
-			op_prefix, rname(shift_src.val, i->cls),
+		fprintf(e->f, "\tand\t");
+		fprintf(e->f, "%s, ", rname(i->to.val, i->cls));
+		fprintf(e->f, "%s, ", rname(other_operand.val, i->cls));
+		fprintf(e->f, "%s, %s #%d\n", rname(shift_src.val, i->cls),
 			shift_mnemonic, shift_amount);
 		break;
 	case Oor:
-		fprintf(e->f, "\torr\t%s%s, %s%s, %s%s, %s #%d\n",
-			op_prefix, rname(i->to.val, i->cls),
-			op_prefix, rname(other_operand.val, i->cls),
-			op_prefix, rname(shift_src.val, i->cls),
+		fprintf(e->f, "\torr\t");
+		fprintf(e->f, "%s, ", rname(i->to.val, i->cls));
+		fprintf(e->f, "%s, ", rname(other_operand.val, i->cls));
+		fprintf(e->f, "%s, %s #%d\n", rname(shift_src.val, i->cls),
 			shift_mnemonic, shift_amount);
 		break;
 	case Oxor:
-		fprintf(e->f, "\teor\t%s%s, %s%s, %s%s, %s #%d\n",
-			op_prefix, rname(i->to.val, i->cls),
-			op_prefix, rname(other_operand.val, i->cls),
-			op_prefix, rname(shift_src.val, i->cls),
+		fprintf(e->f, "\teor\t");
+		fprintf(e->f, "%s, ", rname(i->to.val, i->cls));
+		fprintf(e->f, "%s, ", rname(other_operand.val, i->cls));
+		fprintf(e->f, "%s, %s #%d\n", rname(shift_src.val, i->cls),
 			shift_mnemonic, shift_amount);
 		break;
 	default:
@@ -930,12 +980,12 @@ arm64_emitfn(Fn *fn, FILE *out)
 			if (prev) {
 				/* Try MADD/MSUB fusion if previous was MUL */
 				if (is_madd_fusion_enabled() && prev->op == Omul) {
-					if (try_madd_fusion(i, prev, e)) {
+					if (try_madd_fusion(i, prev, e, b)) {
 						/* Fused! Both MUL and ADD emitted as MADD, continue */
 						prev = NULL;
 						continue;
 					}
-					if (try_msub_fusion(i, prev, e)) {
+					if (try_msub_fusion(i, prev, e, b)) {
 						/* Fused! Both MUL and SUB emitted as MSUB, continue */
 						prev = NULL;
 						continue;
@@ -945,7 +995,7 @@ arm64_emitfn(Fn *fn, FILE *out)
 				/* Try shift fusion if previous was a shift */
 				if (is_shift_fusion_enabled() && 
 				    (prev->op == Oshl || prev->op == Oshr || prev->op == Osar)) {
-					if (try_shift_fusion(i, prev, e)) {
+					if (try_shift_fusion(i, prev, e, b)) {
 						/* Fused! Both SHIFT and OP emitted as single instruction */
 						prev = NULL;
 						continue;
@@ -957,10 +1007,13 @@ arm64_emitfn(Fn *fn, FILE *out)
 				prev = NULL;
 			}
 			
-			/* Check if this is a fusible instruction - defer emission */
+			/* Check if this is a fusible instruction - defer emission.
+			 * Oacmp is deferred so that cmp rN,#0 + beq/bne
+			 * can be fused into cbz/cbnz at end of block. */
 			if ((is_madd_fusion_enabled() && i->op == Omul) ||
 			    (is_shift_fusion_enabled() && 
-			     (i->op == Oshl || i->op == Oshr || i->op == Osar))) {
+			     (i->op == Oshl || i->op == Oshr || i->op == Osar)) ||
+			    i->op == Oacmp) {
 				prev = i;
 				continue;
 			}
@@ -969,9 +1022,46 @@ arm64_emitfn(Fn *fn, FILE *out)
 			emitins(i, e);
 		}
 		
-		/* If we have a pending instruction at end of block, emit it now */
+		/* If we have a pending instruction at end of block, try
+		 * CBZ/CBNZ fusion before falling back to normal emission.
+		 *
+		 * Pattern:  cmp rN, #0  /  beq|bne label
+		 * Becomes:  cbz|cbnz rN, label
+		 *
+		 * We compute the final adjusted condition (after the
+		 * layout-driven swap / negate that the branch emitter
+		 * performs) and only fuse when it resolves to eq or ne.
+		 */
+		int use_cbz = 0;   /* 0 = normal, 1 = cbz, 2 = cbnz */
+		int cbz_reg = -1;
+		int cbz_cls = Kw;
+
 		if (prev) {
-			emitins(prev, e);
+			if (prev->op == Oacmp
+			&& isreg(prev->arg[0])
+			&& rtype(prev->arg[1]) == RCon
+			&& e->fn->con[prev->arg[1].val].type == CBits
+			&& e->fn->con[prev->arg[1].val].bits.i == 0
+			&& b->jmp.type >= Jjf
+			&& b->jmp.type <= Jjf1) {
+				int jc = b->jmp.type - Jjf;
+				int adj;
+				if (b->link == b->s2)
+					adj = jc;
+				else
+					adj = cmpneg(jc);
+				if (adj == Cieq) {
+					use_cbz = 1;
+					cbz_reg = prev->arg[0].val;
+					cbz_cls = prev->cls;
+				} else if (adj == Cine) {
+					use_cbz = 2;
+					cbz_reg = prev->arg[0].val;
+					cbz_cls = prev->cls;
+				}
+			}
+			if (!use_cbz)
+				emitins(prev, e);
 			prev = NULL;
 		}
 		lbl = 1;
@@ -1041,10 +1131,19 @@ arm64_emitfn(Fn *fn, FILE *out)
 				b->s2 = t;
 			} else
 				c = cmpneg(c);
-			fprintf(e->f,
-				"\tb%s\t%s%d\n",
-				ctoa[c], T.asloc, id0+b->s2->id
-			);
+			if (use_cbz) {
+				fprintf(e->f,
+					"\t%s\t%s, %s%d\n",
+					use_cbz == 1 ? "cbz" : "cbnz",
+					rname(cbz_reg, cbz_cls),
+					T.asloc, id0+b->s2->id
+				);
+			} else {
+				fprintf(e->f,
+					"\tb%s\t%s%d\n",
+					ctoa[c], T.asloc, id0+b->s2->id
+				);
+			}
 			goto Jmp;
 		}
 	}

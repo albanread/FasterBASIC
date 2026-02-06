@@ -1493,6 +1493,8 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
 }
 
 void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
+    // Invalidate array element cache - assignment may change index variables or array contents
+    clearArrayElementCache();
     // Check if this is UDT member assignment: udt.field = value or array(i).field = value
     if (!stmt->memberChain.empty()) {
         // Handle UDT member assignment (including nested: O.Item.Value = 99)
@@ -1930,6 +1932,8 @@ void ASTEmitter::emitPrintStatement(const PrintStatement* stmt) {
 }
 
 void ASTEmitter::emitInputStatement(const InputStatement* stmt) {
+    // Invalidate array element cache - INPUT modifies a variable
+    clearArrayElementCache();
     // TODO: Handle prompt
     
     for (const auto& varName : stmt->variables) {
@@ -1995,6 +1999,8 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
 }
 
 void ASTEmitter::emitLocalStatement(const LocalStatement* stmt) {
+    // Invalidate array element cache - LOCAL declares/initializes variables
+    clearArrayElementCache();
     // LOCAL statement: allocate stack space for local variables in SUBs/FUNCTIONs
     // Similar to DIM but specifically for function-local scope
     
@@ -2051,6 +2057,8 @@ void ASTEmitter::emitLocalStatement(const LocalStatement* stmt) {
 }
 
 void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
+    // Invalidate array element cache - DIM creates/initializes arrays and variables
+    clearArrayElementCache();
     // DIM statement: allocate arrays using runtime array_new() function
     // Note: DIM can also declare scalar variables, which we skip here
     
@@ -2227,6 +2235,8 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
 }
 
 void ASTEmitter::emitRedimStatement(const RedimStatement* stmt) {
+    // Invalidate array element cache - REDIM reallocates arrays
+    clearArrayElementCache();
     // REDIM statement: resize existing array (with or without PRESERVE)
     
     for (const auto& arrayDecl : stmt->arrays) {
@@ -2300,6 +2310,8 @@ void ASTEmitter::emitRedimStatement(const RedimStatement* stmt) {
 }
 
 void ASTEmitter::emitEraseStatement(const EraseStatement* stmt) {
+    // Invalidate array element cache - ERASE destroys arrays
+    clearArrayElementCache();
     // ERASE statement: deallocate array memory
     
     for (const std::string& arrayName : stmt->arrayNames) {
@@ -2336,6 +2348,8 @@ void ASTEmitter::emitEraseStatement(const EraseStatement* stmt) {
 }
 
 void ASTEmitter::emitCallStatement(const CallStatement* stmt) {
+    // Invalidate array element cache - SUB calls may modify anything
+    clearArrayElementCache();
     // Check if this is a method call statement (e.g., dict.CLEAR())
     if (stmt->subName == "__method_call" && stmt->methodCallExpr) {
         // Emit the method call expression and discard the result
@@ -3302,6 +3316,8 @@ std::string ASTEmitter::getQBEComparisonOp(TokenType op) {
 // === FOR Loop Helpers ===
 
 void ASTEmitter::emitForInit(const ForStatement* stmt) {
+    // Invalidate array element cache - FOR init modifies loop variable
+    clearArrayElementCache();
     // FOR loop initialization: evaluate start, limit, and step ONCE
     // All values must be treated as integers (BASIC requirement)
     
@@ -3389,6 +3405,8 @@ std::string ASTEmitter::emitForCondition(const ForStatement* stmt) {
 }
 
 void ASTEmitter::emitForIncrement(const ForStatement* stmt) {
+    // Invalidate array element cache - FOR NEXT modifies loop variable
+    clearArrayElementCache();
     // FOR loop increment: add step to loop variable
     // Step was evaluated once at init and is constant
     
@@ -3448,6 +3466,8 @@ std::string ASTEmitter::emitLoopPostCondition(const LoopStatement* stmt) {
 }
 
 void ASTEmitter::emitReadStatement(const ReadStatement* stmt) {
+    // Invalidate array element cache - READ modifies a variable
+    clearArrayElementCache();
     builder_.emitComment("READ statement");
     
     // For each variable in the READ list
@@ -3580,6 +3600,8 @@ void ASTEmitter::emitRestoreStatement(const RestoreStatement* stmt) {
 }
 
 void ASTEmitter::emitSliceAssignStatement(const SliceAssignStatement* stmt) {
+    // Invalidate array element cache - slice assignment modifies a string variable
+    clearArrayElementCache();
     if (!stmt || !stmt->start || !stmt->end || !stmt->replacement) {
         builder_.emitComment("ERROR: invalid slice assignment");
         return;
@@ -3660,6 +3682,37 @@ std::string ASTEmitter::emitArrayElementAddress(const std::string& arrayName,
     // Get array element address for UDT arrays
     // Returns a pointer to the element at the given indices
     
+    // --- Array element base address cache ---
+    // Workaround for QBE ARM64 miscompilation (GH-XXX): when the same array
+    // element is accessed repeatedly (e.g. Contacts(Idx).Name then
+    // Contacts(Idx).Phone), QBE's ARM64 backend can incorrectly drop the
+    // index*element_size multiplication on the second and subsequent accesses,
+    // especially when the index originates from a float-to-int conversion
+    // (dtosi, e.g. VAL()).  By caching the computed element base address in a
+    // stack slot and reloading it for subsequent accesses within the same
+    // statement group, we emit only one mul+add sequence and reuse the result,
+    // completely avoiding the pattern that triggers the bug.
+    
+    // Build cache key from array name + serialized index expression
+    std::string cacheKey;
+    if (indices.size() == 1) {
+        std::string indexKey = serializeIndexExpression(indices[0].get());
+        if (!indexKey.empty()) {
+            cacheKey = arrayName + ":" + indexKey;
+        }
+    }
+    
+    // Check cache: if we already computed this element address, reload it
+    if (!cacheKey.empty()) {
+        auto cacheIt = arrayElemBaseCache_.find(cacheKey);
+        if (cacheIt != arrayElemBaseCache_.end()) {
+            builder_.emitComment("Cached array element address for: " + arrayName);
+            std::string cachedAddr = builder_.newTemp();
+            builder_.emitLoad(cachedAddr, "l", cacheIt->second);
+            return cachedAddr;
+        }
+    }
+    
     builder_.emitComment("Get address of array element: " + arrayName);
     
     // Look up array symbol
@@ -3728,7 +3781,51 @@ std::string ASTEmitter::emitArrayElementAddress(const std::string& arrayName,
     std::string elemAddr = builder_.newTemp();
     builder_.emitBinary(elemAddr, "l", "add", dataPtr, byteOffset);
     
+    // Store the computed address into a stack slot for cache reuse.
+    // This prevents QBE from re-emitting the mul+add pattern when the same
+    // element is accessed again for a different field.
+    if (!cacheKey.empty()) {
+        std::string cacheSlot = builder_.newTemp();
+        builder_.emitRaw("    " + cacheSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel " + elemAddr + ", " + cacheSlot);
+        arrayElemBaseCache_[cacheKey] = cacheSlot;
+    }
+    
     return elemAddr;
+}
+
+// =============================================================================
+// serializeIndexExpression - Generate a cache key from an index expression
+// =============================================================================
+std::string ASTEmitter::serializeIndexExpression(const Expression* expr) const {
+    if (!expr) return "";
+    
+    switch (expr->getType()) {
+        case ASTNodeType::EXPR_VARIABLE: {
+            const auto* varExpr = static_cast<const VariableExpression*>(expr);
+            return "var:" + varExpr->name;
+        }
+        case ASTNodeType::EXPR_NUMBER: {
+            const auto* numExpr = static_cast<const NumberExpression*>(expr);
+            // Use integer representation for cache key when possible
+            if (numExpr->value == static_cast<int>(numExpr->value)) {
+                return "num:" + std::to_string(static_cast<int>(numExpr->value));
+            }
+            return "num:" + std::to_string(numExpr->value);
+        }
+        default:
+            // Complex expressions (function calls, binary ops, etc.) are not
+            // safe to cache because they may have side effects or different
+            // results on re-evaluation. Return empty to skip caching.
+            return "";
+    }
+}
+
+// =============================================================================
+// clearArrayElementCache - Invalidate all cached element base addresses
+// =============================================================================
+void ASTEmitter::clearArrayElementCache() {
+    arrayElemBaseCache_.clear();
 }
 
 // =============================================================================
