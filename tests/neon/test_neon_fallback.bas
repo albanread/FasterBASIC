@@ -1,0 +1,76 @@
+10 REM Test: UDTs that should NOT use NEON bulk copy
+20 REM These types are not SIMD-eligible and must fall back to
+30 REM the scalar field-by-field copy path.
+40 REM
+50 REM Case 1: Mixed types (INTEGER + DOUBLE) — different lane widths
+60 TYPE MixedPair
+70   A AS INTEGER
+80   B AS DOUBLE
+90 END TYPE
+100 DIM M1 AS MixedPair
+110 DIM M2 AS MixedPair
+120 M1.A = 42
+130 M1.B = 99.99
+140 M2 = M1
+150 IF M2.A = 42 AND M2.B > 99.98 AND M2.B < 100.0 THEN PRINT "MIXED PASS" ELSE PRINT "MIXED FAIL"
+160 REM Verify independence
+170 M2.A = 0
+180 M2.B = 0.0
+190 IF M1.A = 42 AND M1.B > 99.98 THEN PRINT "MIXED INDEP PASS" ELSE PRINT "MIXED INDEP FAIL"
+200 REM
+210 REM Case 2: UDT with STRING field — requires retain/release, cannot bulk copy
+220 TYPE NamedValue
+230   Label AS STRING
+240   Value AS INTEGER
+250 END TYPE
+260 DIM N1 AS NamedValue
+270 DIM N2 AS NamedValue
+280 N1.Label = "Hello"
+290 N1.Value = 123
+300 N2 = N1
+310 IF N2.Value = 123 THEN PRINT "STRING UDT VALUE PASS" ELSE PRINT "STRING UDT VALUE FAIL"
+320 IF N2.Label = "Hello" THEN PRINT "STRING UDT LABEL PASS" ELSE PRINT "STRING UDT LABEL FAIL"
+330 REM Verify independence — modifying N2 should not affect N1
+340 N2.Label = "World"
+350 N2.Value = 456
+360 IF N1.Label = "Hello" AND N1.Value = 123 THEN PRINT "STRING INDEP PASS" ELSE PRINT "STRING INDEP FAIL"
+370 IF N2.Label = "World" AND N2.Value = 456 THEN PRINT "STRING MODIFY PASS" ELSE PRINT "STRING MODIFY FAIL"
+380 REM
+390 REM Case 3: 2-field INTEGER UDT — only 64 bits, half register (V2S)
+400 REM This IS SIMD-classifiable but only as D-register (not full Q).
+410 REM Phase 1 only handles isFullQ, so this should use scalar path.
+420 TYPE IntPair
+430   First AS INTEGER
+440   Second AS INTEGER
+450 END TYPE
+460 DIM IP1 AS IntPair
+470 DIM IP2 AS IntPair
+480 IP1.First = 777
+490 IP1.Second = 888
+500 IP2 = IP1
+510 IF IP2.First = 777 AND IP2.Second = 888 THEN PRINT "PAIR COPY PASS" ELSE PRINT "PAIR COPY FAIL"
+520 IP2.First = 0
+530 IF IP1.First = 777 THEN PRINT "PAIR INDEP PASS" ELSE PRINT "PAIR INDEP FAIL"
+540 REM
+550 REM Case 4: 5-field INTEGER UDT — 160 bits, exceeds 128-bit Q register
+560 TYPE BigStruct
+570   A AS INTEGER
+580   B AS INTEGER
+590   C AS INTEGER
+600   D AS INTEGER
+610   E AS INTEGER
+620 END TYPE
+630 DIM BS1 AS BigStruct
+640 DIM BS2 AS BigStruct
+650 BS1.A = 1
+660 BS1.B = 2
+670 BS1.C = 3
+680 BS1.D = 4
+690 BS1.E = 5
+700 BS2 = BS1
+710 IF BS2.A = 1 AND BS2.B = 2 AND BS2.C = 3 AND BS2.D = 4 AND BS2.E = 5 THEN PRINT "BIG COPY PASS" ELSE PRINT "BIG COPY FAIL"
+720 BS2.A = 0
+730 IF BS1.A = 1 THEN PRINT "BIG INDEP PASS" ELSE PRINT "BIG INDEP FAIL"
+740 REM
+750 PRINT "All fallback (non-NEON) UDT copy tests complete."
+760 END

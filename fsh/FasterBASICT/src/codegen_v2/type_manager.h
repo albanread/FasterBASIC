@@ -4,6 +4,7 @@
 #include <string>
 #include <cstdint>
 #include "../fasterbasic_semantic.h"
+#include "../fasterbasic_ast.h"
 
 namespace fbc {
 
@@ -129,6 +130,47 @@ public:
      * @return true if STRING
      */
     bool isString(BasicType basicType) const;
+
+    // === NEON SIMD Helpers ===
+
+    /**
+     * Get the SIMD classification info for a UDT.
+     * Returns the SIMDInfo stored on the TypeSymbol (populated during
+     * semantic analysis).  If the type was not classified, returns an
+     * info with type == NONE.
+     *
+     * @param udtDef The UDT type symbol definition
+     * @return SIMDInfo descriptor
+     */
+    FasterBASIC::TypeDeclarationStatement::SIMDInfo
+    getSIMDInfo(const FasterBASIC::TypeSymbol& udtDef) const {
+        return udtDef.simdInfo;
+    }
+
+    /**
+     * Check whether a UDT contains any STRING (or UNICODE) fields,
+     * which require retain/release and cannot be bulk-copied via NEON.
+     * Also returns true if the UDT contains nested UDTs that themselves
+     * have string fields (requires the full UDT map for recursive check).
+     *
+     * @param udtDef  The UDT type symbol definition
+     * @param udtMap  Map of all UDT definitions for nested lookup
+     * @return true if any field (at any nesting depth) is a string type
+     */
+    bool hasStringFields(const FasterBASIC::TypeSymbol& udtDef,
+                         const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) const {
+        for (const auto& field : udtDef.fields) {
+            auto bt = field.typeDesc.baseType;
+            if (bt == FasterBASIC::BaseType::STRING || bt == FasterBASIC::BaseType::UNICODE)
+                return true;
+            if (bt == FasterBASIC::BaseType::USER_DEFINED) {
+                auto it = udtMap.find(field.typeDesc.udtName);
+                if (it != udtMap.end() && hasStringFields(it->second, udtMap))
+                    return true;
+            }
+        }
+        return false;
+    }
 
     // === Type Conversion Names ===
     

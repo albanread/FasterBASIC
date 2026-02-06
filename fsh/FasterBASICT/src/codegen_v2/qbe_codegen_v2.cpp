@@ -334,9 +334,20 @@ void QBECodeGeneratorV2::emitGlobalVariable(const VariableSymbol* varSymbol) {
             const auto& udtDef = udtIt->second;
             int udtSize = typeManager_->getUDTSizeRecursive(udtDef, symbolTable.types);
             
-            // Emit UDT as a zeroed byte array of the appropriate size
-            builder_->emitComment("Global UDT: " + varSymbol->name + " (type: " + varSymbol->typeName + ", size: " + std::to_string(udtSize) + " bytes)");
-            builder_->emitRaw("export data " + mangledName + " = { z " + std::to_string(udtSize) + " }");
+            // Check if SIMD-eligible for 16-byte alignment
+            auto simdInfo = typeManager_->getSIMDInfo(udtDef);
+            bool needsAlign16 = simdInfo.isValid() && simdInfo.isFullQ;
+            
+            if (needsAlign16) {
+                // Pad to 16 bytes and request alignment
+                int alignedSize = (udtSize + 15) & ~15;
+                builder_->emitComment("Global UDT (NEON-aligned): " + varSymbol->name + " (type: " + varSymbol->typeName + ", size: " + std::to_string(alignedSize) + " bytes)");
+                builder_->emitRaw("export data " + mangledName + " = align 16 { z " + std::to_string(alignedSize) + " }");
+            } else {
+                // Emit UDT as a zeroed byte array of the appropriate size
+                builder_->emitComment("Global UDT: " + varSymbol->name + " (type: " + varSymbol->typeName + ", size: " + std::to_string(udtSize) + " bytes)");
+                builder_->emitRaw("export data " + mangledName + " = { z " + std::to_string(udtSize) + " }");
+            }
             return;
         }
     }

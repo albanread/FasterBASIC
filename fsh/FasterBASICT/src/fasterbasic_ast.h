@@ -2225,9 +2225,62 @@ class TypeDeclarationStatement : public Statement {
 public:
     // SIMD type classification for ARM NEON acceleration
     enum class SIMDType {
-        NONE,   // Not SIMD-capable
-        PAIR,   // 2 consecutive doubles (Vec2D, Position, etc.)
-        QUAD    // 4 consecutive floats (Color, Vec4F, etc.)
+        NONE,    // Not SIMD-capable
+        PAIR,    // 2 consecutive doubles (Vec2D, Position, etc.) — legacy alias for V2D
+        QUAD,    // 4 consecutive floats (Color, Vec4F, etc.) — legacy alias for V4S
+
+        // Full 128-bit Q register configurations
+        V2D,     // 2 × 64-bit (DOUBLE or LONG)  — 128 bits
+        V4S,     // 4 × 32-bit (INTEGER or SINGLE) — 128 bits
+        V8H,     // 8 × 16-bit (SHORT)            — 128 bits
+        V16B,    // 16 × 8-bit (BYTE)             — 128 bits
+
+        // Half-register (64-bit D register) configurations
+        V2S,     // 2 × 32-bit — 64 bits
+        V4H,     // 4 × 16-bit — 64 bits
+        V8B,     // 8 × 8-bit  — 64 bits
+
+        // Padded configurations (3 real + 1 padding lane)
+        V4S_PAD1 // 3 × 32-bit padded to 4 lanes — 128 bits
+    };
+
+    // Descriptor carrying all SIMD classification info for a UDT
+    struct SIMDInfo {
+        SIMDType type       = SIMDType::NONE;
+        int laneCount       = 0;   // logical field count
+        int physicalLanes   = 0;   // actual NEON lanes (may be > laneCount for padded)
+        int laneBitWidth    = 0;   // bits per lane (8, 16, 32, 64)
+        int totalBytes      = 0;   // bytes occupied in a NEON register
+        bool isFullQ        = false; // true if uses full 128-bit Q register
+        bool isPadded       = false; // true if padding lane exists
+        bool isFloatingPoint = false;
+        // Base type of each lane (INTEGER, SINGLE, DOUBLE, BYTE, etc.)
+        // We use an int here to avoid circular header dependencies;
+        // the value is a BaseType cast to int.
+        int laneBaseType    = 0;   // BaseType::UNKNOWN == 0
+
+        // Helper: NEON arrangement suffix string (e.g. "4s", "2d")
+        const char* arrangement() const {
+            switch (type) {
+                case SIMDType::V4S: case SIMDType::V4S_PAD1: return "4s";
+                case SIMDType::V2D:  return "2d";
+                case SIMDType::V2S:  return "2s";
+                case SIMDType::V8H:  return "8h";
+                case SIMDType::V4H:  return "4h";
+                case SIMDType::V16B: return "16b";
+                case SIMDType::V8B:  return "8b";
+                case SIMDType::PAIR: return "2d";
+                case SIMDType::QUAD: return "4s";
+                default: return "";
+            }
+        }
+
+        // Helper: register prefix for the occupied width
+        const char* regPrefix() const {
+            return isFullQ ? "q" : "d";
+        }
+
+        bool isValid() const { return type != SIMDType::NONE; }
     };
     
     struct TypeField {
@@ -2243,9 +2296,10 @@ public:
     std::string typeName;          // Name of the type being declared
     std::vector<TypeField> fields; // Fields in the type
     SIMDType simdType;             // Detected SIMD type (set during semantic analysis)
+    SIMDInfo simdInfo;             // Full SIMD descriptor (set during semantic analysis)
     
     explicit TypeDeclarationStatement(const std::string& name) 
-        : typeName(name), simdType(SIMDType::NONE) {}
+        : typeName(name), simdType(SIMDType::NONE), simdInfo() {}
     
     void addField(const std::string& fieldName, const std::string& fieldTypeName, 
                   TokenType builtInType, bool isBuiltIn) {
@@ -2257,7 +2311,11 @@ public:
     std::string toString(int indent = 0) const override {
         std::ostringstream oss;
         oss << makeIndent(indent) << "TYPE " << typeName;
-        if (simdType == SIMDType::PAIR) {
+        if (simdInfo.isValid()) {
+            oss << " [SIMD:" << simdInfo.arrangement()
+                << " " << simdInfo.laneCount << "x" << simdInfo.laneBitWidth << "b"
+                << (simdInfo.isPadded ? " PAD" : "") << "]";
+        } else if (simdType == SIMDType::PAIR) {
             oss << " [SIMD:PAIR]";
         } else if (simdType == SIMDType::QUAD) {
             oss << " [SIMD:QUAD]";

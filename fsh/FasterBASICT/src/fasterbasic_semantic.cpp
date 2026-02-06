@@ -561,38 +561,113 @@ void SemanticAnalyzer::processTypeDeclarationStatement(const TypeDeclarationStat
     // Track field names to detect duplicates
     std::unordered_set<std::string> fieldNames;
     
-    // Detect SIMD type pattern (PAIR = 2 doubles, QUAD = 4 floats)
+    // ── Generalized SIMD type classification ──
+    // Detect all NEON-eligible UDT patterns: all fields must be the same
+    // built-in numeric type, no strings or nested UDTs, total ≤ 128 bits,
+    // lane count in {2, 3, 4, 8, 16}.
     TypeDeclarationStatement::SIMDType detectedSIMDType = TypeDeclarationStatement::SIMDType::NONE;
+    TypeDeclarationStatement::SIMDInfo detectedSIMDInfo;
     
-    if (stmt->fields.size() == 2) {
-        // Check for PAIR pattern: 2 consecutive doubles
-        if (stmt->fields[0].isBuiltIn && stmt->fields[1].isBuiltIn &&
-            stmt->fields[0].builtInType == TokenType::KEYWORD_DOUBLE &&
-            stmt->fields[1].builtInType == TokenType::KEYWORD_DOUBLE) {
-            detectedSIMDType = TypeDeclarationStatement::SIMDType::PAIR;
+    auto classifySIMD = [&]() -> TypeDeclarationStatement::SIMDInfo {
+        using SIMDType = TypeDeclarationStatement::SIMDType;
+        TypeDeclarationStatement::SIMDInfo info;
+        info.type = SIMDType::NONE;
+        
+        int nfields = (int)stmt->fields.size();
+        if (nfields < 2 || nfields > 16) return info;
+        
+        // All fields must be built-in and the same type
+        if (!stmt->fields[0].isBuiltIn) return info;
+        TokenType laneToken = stmt->fields[0].builtInType;
+        for (int fi = 1; fi < nfields; ++fi) {
+            if (!stmt->fields[fi].isBuiltIn) return info;
+            if (stmt->fields[fi].builtInType != laneToken) return info;
         }
-    } else if (stmt->fields.size() == 4) {
-        // Check for QUAD pattern: 4 consecutive floats (SINGLE)
-        if (stmt->fields[0].isBuiltIn && stmt->fields[1].isBuiltIn &&
-            stmt->fields[2].isBuiltIn && stmt->fields[3].isBuiltIn &&
-            stmt->fields[0].builtInType == TokenType::KEYWORD_SINGLE &&
-            stmt->fields[1].builtInType == TokenType::KEYWORD_SINGLE &&
-            stmt->fields[2].builtInType == TokenType::KEYWORD_SINGLE &&
-            stmt->fields[3].builtInType == TokenType::KEYWORD_SINGLE) {
-            detectedSIMDType = TypeDeclarationStatement::SIMDType::QUAD;
+        
+        // Determine lane bit width and base type
+        int bits = 0;
+        BaseType laneBase = BaseType::UNKNOWN;
+        bool isFloat = false;
+        switch (laneToken) {
+            case TokenType::KEYWORD_INTEGER:
+                bits = 32; laneBase = BaseType::INTEGER; break;
+            case TokenType::KEYWORD_SINGLE:
+                bits = 32; laneBase = BaseType::SINGLE; isFloat = true; break;
+            case TokenType::KEYWORD_DOUBLE:
+                bits = 64; laneBase = BaseType::DOUBLE; isFloat = true; break;
+            case TokenType::KEYWORD_LONG:
+                bits = 64; laneBase = BaseType::LONG; break;
+            default:
+                return info; // STRING, BYTE, SHORT etc. — not yet supported
         }
+        
+        int totalBits = nfields * bits;
+        if (totalBits > 128) return info;
+        
+        // Populate info
+        info.laneCount = nfields;
+        info.laneBitWidth = bits;
+        info.laneBaseType = static_cast<int>(laneBase);
+        info.isFloatingPoint = isFloat;
+        
+        // Classify: determine SIMDType and physical lane count
+        if (nfields == 3 && bits == 32) {
+            // 3 × 32-bit → pad to 4 lanes in a Q register
+            info.type = SIMDType::V4S_PAD1;
+            info.physicalLanes = 4;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isPadded = true;
+        } else {
+            info.physicalLanes = nfields;
+            info.totalBytes = (nfields * bits) / 8;
+            info.isFullQ = (info.totalBytes == 16);
+            info.isPadded = false;
+            
+            // Map to specific SIMDType
+            if (bits == 64 && nfields == 2) {
+                info.type = SIMDType::V2D;
+            } else if (bits == 32 && nfields == 4) {
+                info.type = SIMDType::V4S;
+            } else if (bits == 32 && nfields == 2) {
+                info.type = SIMDType::V2S;
+            } else {
+                // Other valid but uncommon configs: V8H, V16B, V4H, V8B
+                // Leave as NONE for now; add as needed
+                return info;
+            }
+        }
+        
+        return info;
+    };
+    
+    detectedSIMDInfo = classifySIMD();
+    
+    // Set legacy SIMDType for backward compatibility
+    if (detectedSIMDInfo.type == TypeDeclarationStatement::SIMDType::V2D ||
+        detectedSIMDInfo.type == TypeDeclarationStatement::SIMDType::PAIR) {
+        detectedSIMDType = TypeDeclarationStatement::SIMDType::PAIR;
+    } else if (detectedSIMDInfo.type == TypeDeclarationStatement::SIMDType::V4S ||
+               detectedSIMDInfo.type == TypeDeclarationStatement::SIMDType::QUAD) {
+        detectedSIMDType = TypeDeclarationStatement::SIMDType::QUAD;
+    } else if (detectedSIMDInfo.isValid()) {
+        // For new types (V2S, V4S_PAD1, etc.) set legacy to NONE but keep simdInfo
+        detectedSIMDType = TypeDeclarationStatement::SIMDType::NONE;
     }
     
-    // Store SIMD type in the statement (mutable cast for metadata)
+    // Store SIMD info in the statement (mutable cast for metadata)
     const_cast<TypeDeclarationStatement*>(stmt)->simdType = detectedSIMDType;
+    const_cast<TypeDeclarationStatement*>(stmt)->simdInfo = detectedSIMDInfo;
     
     // Debug output for SIMD detection
-    if (detectedSIMDType == TypeDeclarationStatement::SIMDType::PAIR) {
-        std::cout << "[SIMD] Detected PAIR type: " << stmt->typeName 
-                  << " (2 consecutive DOUBLEs - Vec2D pattern)" << std::endl;
-    } else if (detectedSIMDType == TypeDeclarationStatement::SIMDType::QUAD) {
-        std::cout << "[SIMD] Detected QUAD type: " << stmt->typeName 
-                  << " (4 consecutive FLOATs - Color pattern)" << std::endl;
+    if (detectedSIMDInfo.isValid()) {
+        std::cout << "[SIMD] Detected NEON-eligible type: " << stmt->typeName
+                  << " [" << detectedSIMDInfo.arrangement() << "]"
+                  << " (" << detectedSIMDInfo.laneCount << "×" << detectedSIMDInfo.laneBitWidth << "b"
+                  << (detectedSIMDInfo.isFullQ ? ", Q-reg" : ", D-reg")
+                  << (detectedSIMDInfo.isPadded ? ", padded" : "")
+                  << (detectedSIMDInfo.isFloatingPoint ? ", float" : ", int")
+                  << ")" << std::endl;
     }
     
     // Process each field
@@ -647,8 +722,9 @@ void SemanticAnalyzer::processTypeDeclarationStatement(const TypeDeclarationStat
         typeSymbol.fields.push_back(typeField);
     }
     
-    // Store SIMD type in the TypeSymbol for later use
+    // Store SIMD type and info in the TypeSymbol for later use
     typeSymbol.simdType = detectedSIMDType;
+    typeSymbol.simdInfo = detectedSIMDInfo;
     
     // Register the type
     m_symbolTable.types[stmt->typeName] = typeSymbol;

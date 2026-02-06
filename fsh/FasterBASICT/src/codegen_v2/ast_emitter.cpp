@@ -2031,7 +2031,25 @@ void ASTEmitter::emitLocalStatement(const LocalStatement* stmt) {
             }
         }
         
-        if (size == 4) {
+        // For SIMD-eligible UDTs that use a full Q register (128 bits),
+        // use alloc16 to guarantee 16-byte alignment for NEON ldr/str q.
+        bool needsAlign16 = false;
+        if (varType == BaseType::USER_DEFINED) {
+            const auto& symbolTable2 = semantic_.getSymbolTable();
+            auto udtIt2 = symbolTable2.types.find(varSymbol->typeName);
+            if (udtIt2 != symbolTable2.types.end()) {
+                auto simdInfo = typeManager_.getSIMDInfo(udtIt2->second);
+                if (simdInfo.isValid() && simdInfo.isFullQ) {
+                    needsAlign16 = true;
+                }
+            }
+        }
+
+        if (needsAlign16) {
+            // NEON-aligned: pad size to 16 and use alloc16
+            int64_t alignedSize = (size + 15) & ~15;
+            builder_.emitRaw("    " + mangledName + " =l alloc16 " + std::to_string(alignedSize));
+        } else if (size == 4) {
             builder_.emitRaw("    " + mangledName + " =l alloc4 4");
         } else if (size == 8) {
             builder_.emitRaw("    " + mangledName + " =l alloc8 8");
@@ -3834,6 +3852,11 @@ void ASTEmitter::clearArrayElementCache() {
 // Copies all fields from sourceAddr to targetAddr for the given UDT definition.
 // Handles string fields with retain/release and nested UDTs recursively to
 // any depth, ensuring proper memory management at every level.
+//
+// NEON fast path: if the UDT is SIMD-eligible (all same-type numeric fields,
+// total ≤ 128 bits) and has no string fields, emit a single NEON 128-bit
+// load/store pair instead of per-field scalar copies.  This is controlled by
+// the ENABLE_NEON_COPY environment variable (default: enabled).
 
 void ASTEmitter::emitUDTCopyFieldByField(
         const std::string& sourceAddr,
@@ -3841,6 +3864,36 @@ void ASTEmitter::emitUDTCopyFieldByField(
         const FasterBASIC::TypeSymbol& udtDef,
         const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) {
 
+    // ── NEON bulk copy fast path ──
+    // Check: (1) UDT is SIMD-eligible, (2) no string fields, (3) kill-switch
+    auto simdInfo = typeManager_.getSIMDInfo(udtDef);
+    if (simdInfo.isValid() && !typeManager_.hasStringFields(udtDef, udtMap)) {
+        // Check environment kill-switch (cached after first call)
+        static int neonCopyChecked = 0;
+        static int neonCopyEnabled = 1;
+        if (!neonCopyChecked) {
+            const char *env = getenv("ENABLE_NEON_COPY");
+            if (env) {
+                neonCopyEnabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+            }
+            neonCopyChecked = 1;
+        }
+
+        if (neonCopyEnabled && simdInfo.isFullQ) {
+            // Full 128-bit Q register: emit neonldr + neonstr (2 instructions)
+            builder_.emitComment("NEON bulk copy (" + udtDef.name + ", "
+                + std::string(simdInfo.arrangement()) + "): "
+                + std::to_string(simdInfo.laneCount) + "×"
+                + std::to_string(simdInfo.laneBitWidth) + "b → 2 instructions");
+            builder_.emitRaw("    neonldr " + sourceAddr);
+            builder_.emitRaw("    neonstr " + targetAddr);
+            return;
+        }
+        // Half-register (64-bit) SIMD types: fall through to scalar path
+        // for now — could use D-register loads in a future phase.
+    }
+
+    // ── Scalar field-by-field copy path ──
     int64_t offset = 0;
     for (size_t i = 0; i < udtDef.fields.size(); ++i) {
         const auto& field = udtDef.fields[i];

@@ -767,9 +767,10 @@ struct TypeSymbol {
     SourceLocation declaration;
     bool isDeclared;
     TypeDeclarationStatement::SIMDType simdType;  // SIMD type classification for ARM NEON acceleration
+    TypeDeclarationStatement::SIMDInfo simdInfo;   // Full SIMD descriptor for NEON vectorization
     
-    TypeSymbol() : isDeclared(false), simdType(TypeDeclarationStatement::SIMDType::NONE) {}
-    explicit TypeSymbol(const std::string& n) : name(n), isDeclared(true), simdType(TypeDeclarationStatement::SIMDType::NONE) {}
+    TypeSymbol() : isDeclared(false), simdType(TypeDeclarationStatement::SIMDType::NONE), simdInfo() {}
+    explicit TypeSymbol(const std::string& n) : name(n), isDeclared(true), simdType(TypeDeclarationStatement::SIMDType::NONE), simdInfo() {}
     
     std::string toString() const {
         std::ostringstream oss;

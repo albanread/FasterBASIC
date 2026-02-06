@@ -133,6 +133,27 @@ O(vastart, T(m,e,e,e, x,e,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 
 O(copy,    T(w,l,s,d, x,x,x,x), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,1) V(0)
 
+/* ARM64 NEON Vector Operations (target-specific, public for parser)
+ *
+ * These operations use reserved V registers (V28-V30) implicitly.
+ * The address arguments are normal GPR temporaries that go through
+ * register allocation. The vector registers do NOT go through regalloc.
+ *
+ * neonldr/neonstr:   128-bit vector load/store via q28
+ * neonldr2/neonstr2: 128-bit vector load/store via q29
+ * neonadd/neonsub/neonmul: vector arithmetic  v28 = v28 op v29
+ *   cls encodes arrangement: Kw=.4s  Kl=.2d  Ks=.4s(float)  Kd=.2d(float)
+ * neonaddv: horizontal sum of v28 lanes → scalar GPR result
+ */
+O(neonldr,  T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonstr,  T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonldr2, T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonstr2, T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonadd, T(x,x,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonsub, T(x,x,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonmul, T(x,x,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonaddv, T(w,l,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+
 /* Debug */
 O(dbgloc,  T(w,e,e,e, w,e,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,1) V(0)
 

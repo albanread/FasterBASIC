@@ -197,12 +197,30 @@ callable(Ref r, Fn *fn)
 	return 0;
 }
 
+static int
+isneon(int op)
+{
+	return INRANGE(op, Oneonldr, Oneonaddv);
+}
+
 static void
 sel(Ins i, Fn *fn)
 {
 	Ref *iarg;
 	Ins *i0;
 	int ck, cc;
+
+	/* Pass NEON opcodes through unchanged.
+	 * Their address arguments (GPR temporaries) still
+	 * need fixarg() so slot refs get materialized. */
+	if (isneon(i.op)) {
+		emiti(i);
+		iarg = curi->arg;
+		fixarg(&iarg[0], Kl, 0, fn);
+		if (rtype(i.arg[1]) != -1 && !req(i.arg[1], R))
+			fixarg(&iarg[1], Kl, 0, fn);
+		return;
+	}
 
 	if (INRANGE(i.op, Oalloc, Oalloc1)) {
 		i0 = curi - 1;

@@ -647,6 +647,73 @@ is_indexed_addr_enabled(void)
 	return enabled;
 }
 
+/* Check if NEON copy optimization is enabled via environment variable
+ * Returns 1 if enabled, 0 if disabled (default: enabled)
+ */
+static int
+is_neon_copy_enabled(void)
+{
+	static int checked = 0;
+	static int enabled = 1;  /* Default: enabled */
+
+	if (!checked) {
+		const char *env = getenv("ENABLE_NEON_COPY");
+		if (env) {
+			enabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+		}
+		checked = 1;
+	}
+
+	return enabled;
+}
+
+/* Check if NEON arithmetic is enabled via environment variable
+ * Returns 1 if enabled, 0 if disabled (default: enabled)
+ */
+static int
+is_neon_arith_enabled(void)
+{
+	static int checked = 0;
+	static int enabled = 1;  /* Default: enabled */
+
+	if (!checked) {
+		const char *env = getenv("ENABLE_NEON_ARITH");
+		if (env) {
+			enabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+		}
+		checked = 1;
+	}
+
+	return enabled;
+}
+
+/* Map NEON instruction class to arrangement suffix string.
+ * Kw → ".4s"  (4×32-bit integer)
+ * Kl → ".2d"  (2×64-bit integer)
+ * Ks → ".4s"  (4×32-bit float — same encoding)
+ * Kd → ".2d"  (2×64-bit float)
+ */
+static char *
+neon_arrangement(int cls)
+{
+	switch (cls) {
+	case Kw: return "4s";
+	case Ks: return "4s";
+	case Kl: return "2d";
+	case Kd: return "2d";
+	default: return "4s";
+	}
+}
+
+/* Determine if NEON arrangement uses float instructions.
+ * Ks and Kd use fadd/fsub/fmul, Kw and Kl use add/sub/mul.
+ */
+static int
+neon_is_float(int cls)
+{
+	return cls == Ks || cls == Kd;
+}
+
 /* Try to fuse shift + arithmetic patterns into single instructions with shifted operands.
  * ARM64 supports shifted operands in many instructions: ADD, SUB, AND, OR, EOR, etc.
  * Pattern: SHIFT dest, src, #imm
@@ -1130,6 +1197,7 @@ emitins(Ins *i, E *e)
 	int o, t;
 	Ref r;
 	Con *c;
+	char *arr;
 
 	switch (i->op) {
 	default:
@@ -1238,6 +1306,113 @@ emitins(Ins *i, E *e)
 		break;
 	case Odbgloc:
 		emitdbgloc(i->arg[0].val, i->arg[1].val, e->f);
+		break;
+
+	/* ===== ARM64 NEON Vector Operations ===== */
+
+	case Oneonldr:
+		/* Load 128 bits from [arg0] into q28 */
+		if (!is_neon_copy_enabled()) {
+			/* Fallback: should not reach here if frontend
+			 * checks the kill-switch, but be safe */
+			die("neonldr emitted but NEON copy disabled");
+		}
+		assert(isreg(i->arg[0]));
+		fprintf(e->f, "\tldr\tq28, [%s]\n",
+			rname(i->arg[0].val, Kl));
+		break;
+
+	case Oneonstr:
+		/* Store 128 bits from q28 to [arg0] */
+		if (!is_neon_copy_enabled()) {
+			die("neonstr emitted but NEON copy disabled");
+		}
+		assert(isreg(i->arg[0]));
+		fprintf(e->f, "\tstr\tq28, [%s]\n",
+			rname(i->arg[0].val, Kl));
+		break;
+
+	case Oneonldr2:
+		/* Load 128 bits from [arg0] into q29 */
+		if (!is_neon_copy_enabled()) {
+			die("neonldr2 emitted but NEON copy disabled");
+		}
+		assert(isreg(i->arg[0]));
+		fprintf(e->f, "\tldr\tq29, [%s]\n",
+			rname(i->arg[0].val, Kl));
+		break;
+
+	case Oneonstr2:
+		/* Store 128 bits from q29 to [arg0] */
+		if (!is_neon_copy_enabled()) {
+			die("neonstr2 emitted but NEON copy disabled");
+		}
+		assert(isreg(i->arg[0]));
+		fprintf(e->f, "\tstr\tq29, [%s]\n",
+			rname(i->arg[0].val, Kl));
+		break;
+
+	case Oneonadd:
+		/* Vector add: v28.arr = v28.arr + v29.arr */
+		if (!is_neon_arith_enabled()) {
+			die("neonadd emitted but NEON arith disabled");
+		}
+		arr = neon_arrangement(i->cls);
+		if (neon_is_float(i->cls))
+			fprintf(e->f, "\tfadd\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tadd\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		break;
+
+	case Oneonsub:
+		/* Vector sub: v28.arr = v28.arr - v29.arr */
+		if (!is_neon_arith_enabled()) {
+			die("neonsub emitted but NEON arith disabled");
+		}
+		arr = neon_arrangement(i->cls);
+		if (neon_is_float(i->cls))
+			fprintf(e->f, "\tfsub\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tsub\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		break;
+
+	case Oneonmul:
+		/* Vector mul: v28.arr = v28.arr * v29.arr */
+		if (!is_neon_arith_enabled()) {
+			die("neonmul emitted but NEON arith disabled");
+		}
+		arr = neon_arrangement(i->cls);
+		if (neon_is_float(i->cls))
+			fprintf(e->f, "\tfmul\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tmul\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		break;
+
+	case Oneonaddv:
+		/* Horizontal sum: reduce v28 lanes to scalar in dest GPR.
+		 * For .4s: addv s28, v28.4s  then  fmov wDest, s28
+		 * For .2d: addp d28, v28.2d  then  fmov xDest, d28
+		 */
+		if (!is_neon_arith_enabled()) {
+			die("neonaddv emitted but NEON arith disabled");
+		}
+		assert(isreg(i->to));
+		if (i->cls == Kw) {
+			fprintf(e->f, "\taddv\ts28, v28.4s\n");
+			fprintf(e->f, "\tfmov\t%s, s28\n",
+				rname(i->to.val, Kw));
+		} else {
+			/* 2d: use addp for pairwise add */
+			fprintf(e->f, "\taddp\td28, v28.2d\n");
+			fprintf(e->f, "\tfmov\t%s, d28\n",
+				rname(i->to.val, Kl));
+		}
 		break;
 	}
 }

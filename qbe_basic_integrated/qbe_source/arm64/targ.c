@@ -6,7 +6,8 @@ int arm64_rsave[] = {
 	IP0, IP1, R18, LR,
 	V0,  V1,  V2,  V3,  V4,  V5,  V6,  V7,
 	V16, V17, V18, V19, V20, V21, V22, V23,
-	V24, V25, V26, V27, V28, V29, V30,
+	V24, V25, V26, V27,
+	/* V28, V29, V30 reserved for NEON scratch */
 	-1
 };
 int arm64_rclob[] = {
