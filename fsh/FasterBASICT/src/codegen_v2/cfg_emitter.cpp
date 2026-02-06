@@ -2,10 +2,17 @@
 #include "type_manager.h"
 #include <algorithm>
 #include <queue>
+#include <set>
+#include <cstdlib>
+#include <cerrno>
+#include <climits>
 
 namespace fbc {
 
 using namespace FasterBASIC;
+
+// Static sentinel for getOutEdgesIndexed when blockId not in index
+const std::vector<CFGEdge> CFGEmitter::emptyEdgeVec_;
 
 CFGEmitter::CFGEmitter(QBEBuilder& builder, TypeManager& typeManager,
                        SymbolMapper& symbolMapper, ASTEmitter& astEmitter)
@@ -14,10 +21,81 @@ CFGEmitter::CFGEmitter(QBEBuilder& builder, TypeManager& typeManager,
     , symbolMapper_(symbolMapper)
     , astEmitter_(astEmitter)
     , currentFunction_("")
+    , currentCFG_(nullptr)
 {
 }
 
-// === CFG Emission ===
+// =============================================================================
+// Parsing Helpers
+// =============================================================================
+
+bool CFGEmitter::tryParseInt(const std::string& s, int& out) {
+    if (s.empty()) return false;
+    const char* begin = s.c_str();
+    char* end = nullptr;
+    errno = 0;
+    long val = std::strtol(begin, &end, 10);
+    if (end == begin || *end != '\0') return false;          // not fully consumed
+    if (errno == ERANGE || val < INT_MIN || val > INT_MAX) return false;
+    out = static_cast<int>(val);
+    return true;
+}
+
+// =============================================================================
+// Edge Index
+// =============================================================================
+
+void CFGEmitter::buildEdgeIndex(const ControlFlowGraph* cfg) {
+    outEdgeIndex_.clear();
+    if (!cfg) return;
+
+    // Pre-size buckets for every block so lookups never miss
+    for (const auto& block : cfg->blocks) {
+        if (block) {
+            outEdgeIndex_[block->id];  // insert empty vector
+        }
+    }
+
+    for (const auto& edge : cfg->edges) {
+        outEdgeIndex_[edge.sourceBlock].push_back(edge);
+    }
+}
+
+const std::vector<CFGEdge>& CFGEmitter::getOutEdgesIndexed(int blockId) const {
+    auto it = outEdgeIndex_.find(blockId);
+    if (it != outEdgeIndex_.end()) {
+        return it->second;
+    }
+    return emptyEdgeVec_;
+}
+
+// Legacy wrapper — delegates to the index when available, falls back to
+// linear scan only if the index hasn't been built (shouldn't happen in
+// normal emission but keeps old call-sites safe).
+std::vector<CFGEdge> CFGEmitter::getOutEdges(const BasicBlock* block,
+                                              const ControlFlowGraph* cfg) {
+    if (!block) return {};
+
+    if (!outEdgeIndex_.empty()) {
+        // Return a *copy* — callers may mutate the result
+        const auto& ref = getOutEdgesIndexed(block->id);
+        return ref;
+    }
+
+    // Fallback: linear scan (should not be reached during normal emission)
+    std::vector<CFGEdge> result;
+    if (!cfg) return result;
+    for (const auto& edge : cfg->edges) {
+        if (edge.sourceBlock == block->id) {
+            result.push_back(edge);
+        }
+    }
+    return result;
+}
+
+// =============================================================================
+// CFG Emission
+// =============================================================================
 
 void CFGEmitter::emitCFG(const ControlFlowGraph* cfg, const std::string& functionName) {
     if (!cfg) {
@@ -26,12 +104,17 @@ void CFGEmitter::emitCFG(const ControlFlowGraph* cfg, const std::string& functio
     }
     
     enterFunction(functionName);
+    currentCFG_ = cfg;
     
     builder_.emitComment("CFG: " + (functionName.empty() ? "main" : functionName));
     builder_.emitComment("Blocks: " + std::to_string(cfg->blocks.size()));
     builder_.emitBlankLine();
     
-    // Compute reachability
+    // Build O(1) edge lookup index — used by every subsequent getOutEdges /
+    // getOutEdgesIndexed call for this CFG.
+    buildEdgeIndex(cfg);
+
+    // Compute reachability (now cheap thanks to the edge index)
     computeReachability(cfg);
     
     // Get block emission order
@@ -49,6 +132,7 @@ void CFGEmitter::emitCFG(const ControlFlowGraph* cfg, const std::string& functio
         }
     }
     
+    currentCFG_ = nullptr;
     exitFunction();
 }
 
@@ -63,10 +147,13 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
     // Emit label for this block
     std::string label = getBlockLabel(blockId);
     
-    // Add comment about block type
+    // Add comment about block type (annotate unreachable blocks)
     std::string blockInfo = "Block " + std::to_string(blockId);
     if (!block->label.empty()) {
         blockInfo += " (label: " + block->label + ")";
+    }
+    if (!isBlockReachable(blockId, cfg)) {
+        blockInfo += " [UNREACHABLE]";
     }
     
     builder_.emitComment(blockInfo);
@@ -78,6 +165,14 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         
         // Get function parameters from CFG (these are the actual QBE parameter names)
         std::vector<std::string> cfgParams = cfg->parameters;
+
+        // Sort parameters longest-first so that a parameter named "X_Y"
+        // is tried before one named "X" when prefix-matching symbol names.
+        // This prevents "X_Y_DOUBLE" from incorrectly matching "X".
+        std::sort(cfgParams.begin(), cfgParams.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return a.length() > b.length();
+                  });
         
         for (const auto& pair : symbolTable.variables) {
             const auto& varSymbol = pair.second;
@@ -113,7 +208,6 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                 
                 // For UDT types, calculate actual struct size from field definitions (including nested UDTs)
                 if (varType == BaseType::USER_DEFINED) {
-                    const auto& symbolTable = astEmitter_.getSymbolTable();
                     auto udtIt = symbolTable.types.find(varSymbol.typeName);
                     if (udtIt != symbolTable.types.end()) {
                         size = typeManager_.getUDTSizeRecursive(udtIt->second, symbolTable.types);
@@ -131,16 +225,16 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                 // Check if this variable is a function parameter
                 // Parameters in symbol table are normalized (e.g., X_DOUBLE)
                 // CFG parameters are bare names (e.g., X)
+                // cfgParams is already sorted longest-first so the most
+                // specific parameter wins.
                 bool isParameter = false;
                 std::string qbeParamName;
                 for (const auto& cfgParam : cfgParams) {
-                    // Check if varSymbol.name starts with the CFG parameter name
-                    // e.g., varSymbol.name="X_DOUBLE" should match cfgParam="X"
                     if (varSymbol.name.find(cfgParam) == 0 && 
                         (varSymbol.name.length() == cfgParam.length() || 
                          varSymbol.name[cfgParam.length()] == '_')) {
                         isParameter = true;
-                        qbeParamName = cfgParam;  // Use the CFG parameter name (what QBE uses)
+                        qbeParamName = cfgParam;
                         break;
                     }
                 }
@@ -154,9 +248,11 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                     } else if (size == 4) {
                         builder_.emitRaw("    storew " + qbeParam + ", " + mangledName);
                     } else if (size == 8) {
-                        if (typeManager_.isString(varType)) {
+                        if (typeManager_.isString(varType) || typeManager_.isIntegral(varType)) {
+                            // Strings, LONG, ULONG — store as 64-bit integer / pointer
                             builder_.emitRaw("    storel " + qbeParam + ", " + mangledName);
                         } else {
+                            // DOUBLE — store as 64-bit float
                             builder_.emitRaw("    stored " + qbeParam + ", " + mangledName);
                         }
                     }
@@ -165,8 +261,9 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                     if (typeManager_.isString(varType)) {
                         // Strings initialized to null pointer
                         builder_.emitRaw("    storel 0, " + mangledName);
-                    } else if (varType == BaseType::USER_DEFINED && size > 8) {
-                        // UDT types: zero-initialize all bytes using memset
+                    } else if (varType == BaseType::USER_DEFINED) {
+                        // UDT types: always zero-initialize all bytes using memset
+                        // (covers any field size combination including BYTE/SHORT fields)
                         builder_.emitComment("Zero-initialize UDT (" + std::to_string(size) + " bytes)");
                         builder_.emitRaw("    call $memset(l " + mangledName + ", w 0, l " + std::to_string(size) + ")");
                     } else if (size == 4) {
@@ -267,9 +364,9 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
     emittedLabels_.insert(blockId);
 }
 
-// === Edge Handling ===
-
-// === Decomposed Terminator Helpers ===
+// =============================================================================
+// Decomposed Terminator Helpers
+// =============================================================================
 
 void CFGEmitter::scanControlFlowStatements(
     const BasicBlock* block,
@@ -418,12 +515,12 @@ void CFGEmitter::emitGosubReturnEdge(const BasicBlock* block,
         std::sort(returnBlocks.begin(), returnBlocks.end());
 
         for (size_t i = 0; i < returnBlocks.size(); ++i) {
-            int blockId = returnBlocks[i];
+            int blkId = returnBlocks[i];
             std::string isMatch = builder_.newTemp();
             builder_.emitCompare(isMatch, "w", "eq", returnBlockIdTemp,
-                                std::to_string(blockId));
+                                std::to_string(blkId));
 
-            std::string targetLabel = getBlockLabel(blockId);
+            std::string targetLabel = getBlockLabel(blkId);
             bool isLast = (i + 1 == returnBlocks.size());
 
             if (isLast) {
@@ -529,8 +626,25 @@ void CFGEmitter::emitSimpleEdgeTerminator(
         if (defaultTarget == -1 && !targets.empty()) {
             defaultTarget = targets.back();
         }
-        // TODO: Get selector value from statement
-        std::string selector = "1";  // Placeholder
+
+        // Try to find a SELECT CASE statement in the block to use as the
+        // selector expression.  Previously this was a hard-coded "1"
+        // placeholder that always jumped to case 1.
+        std::string selector;
+        for (const Statement* stmt : block->statements) {
+            if (stmt && stmt->getType() == ASTNodeType::STMT_CASE) {
+                const CaseStatement* caseStmt = static_cast<const CaseStatement*>(stmt);
+                if (caseStmt->caseExpression) {
+                    selector = emitSelectorWord(caseStmt->caseExpression.get());
+                    break;
+                }
+            }
+        }
+        if (selector.empty()) {
+            builder_.emitComment("WARNING: multiway without selector statement – defaulting to 1");
+            selector = "1";
+        }
+
         emitMultiway(selector, targets, defaultTarget);
         return;
     }
@@ -540,7 +654,9 @@ void CFGEmitter::emitSimpleEdgeTerminator(
     if (!outEdges.empty()) emitFallthrough(outEdges[0].targetBlock);
 }
 
-// === Main Terminator (decomposed) ===
+// =============================================================================
+// Main Terminator (decomposed)
+// =============================================================================
 
 void CFGEmitter::emitBlockTerminator(const BasicBlock* block, const ControlFlowGraph* cfg) {
     std::vector<CFGEdge> outEdges = getOutEdges(block, cfg);
@@ -625,7 +741,9 @@ void CFGEmitter::emitReturn(const std::string& returnValue) {
     builder_.emitReturn(returnValue);
 }
 
-// === Block Ordering ===
+// =============================================================================
+// Block Ordering
+// =============================================================================
 
 std::vector<int> CFGEmitter::getEmissionOrder(const ControlFlowGraph* cfg) {
     std::vector<int> order;
@@ -634,9 +752,11 @@ std::vector<int> CFGEmitter::getEmissionOrder(const ControlFlowGraph* cfg) {
         return order;
     }
     
-    // Simple strategy: emit in block ID order
-    // This ensures we emit all blocks, including UNREACHABLE ones
-    // (needed for GOSUB/ON GOTO targets)
+    // Emit all blocks in ID order.
+    // We must include UNREACHABLE blocks as well because GOSUB / ON GOTO
+    // targets are resolved via edges that the reachability DFS may not
+    // traverse (e.g. RETURN edges).  Unreachable blocks are annotated
+    // in the emitted IL with a comment so they're easy to spot.
     for (size_t i = 0; i < cfg->blocks.size(); ++i) {
         if (cfg->blocks[i]) {
             order.push_back(cfg->blocks[i]->id);
@@ -646,16 +766,19 @@ std::vector<int> CFGEmitter::getEmissionOrder(const ControlFlowGraph* cfg) {
     return order;
 }
 
-bool CFGEmitter::isBlockReachable(int blockId, const ControlFlowGraph* cfg) {
-    if (reachabilityCache_.find(blockId) != reachabilityCache_.end()) {
-        return reachabilityCache_[blockId];
+bool CFGEmitter::isBlockReachable(int blockId, const ControlFlowGraph* /*cfg*/) {
+    auto it = reachabilityCache_.find(blockId);
+    if (it != reachabilityCache_.end()) {
+        return it->second;
     }
     
     // If not in cache, assume reachable (conservative)
     return true;
 }
 
-// === Label Management ===
+// =============================================================================
+// Label Management
+// =============================================================================
 
 std::string CFGEmitter::getBlockLabel(int blockId) {
     return symbolMapper_.getBlockLabel(blockId);
@@ -669,9 +792,11 @@ bool CFGEmitter::isLabelEmitted(int blockId) {
     return emittedLabels_.find(blockId) != emittedLabels_.end();
 }
 
-// === Special Block Types ===
+// =============================================================================
+// Special Block Types
+// =============================================================================
 
-bool CFGEmitter::isLoopHeader(const BasicBlock* block, const ControlFlowGraph* cfg) {
+bool CFGEmitter::isLoopHeader(const BasicBlock* block, const ControlFlowGraph* /*cfg*/) {
     if (!block) return false;
     return block->isLoopHeader;
 }
@@ -755,8 +880,7 @@ const ForStatement* CFGEmitter::findForStatementInLoop(const BasicBlock* block, 
 bool CFGEmitter::isExitBlock(const BasicBlock* block, const ControlFlowGraph* cfg) {
     if (!block) return false;
     
-    // Check if block has no successors
-    std::vector<CFGEdge> outEdges = getOutEdges(block, cfg);
+    const auto& outEdges = getOutEdgesIndexed(block->id);
     
     if (outEdges.empty()) {
         return true;
@@ -772,13 +896,16 @@ bool CFGEmitter::isExitBlock(const BasicBlock* block, const ControlFlowGraph* cf
     return true;
 }
 
-// === Context Management ===
+// =============================================================================
+// Context Management
+// =============================================================================
 
 void CFGEmitter::enterFunction(const std::string& functionName) {
     currentFunction_ = functionName;
     emittedLabels_.clear();
     requiredLabels_.clear();
     reachabilityCache_.clear();
+    outEdgeIndex_.clear();
 }
 
 void CFGEmitter::exitFunction() {
@@ -790,9 +917,13 @@ void CFGEmitter::reset() {
     emittedLabels_.clear();
     requiredLabels_.clear();
     reachabilityCache_.clear();
+    outEdgeIndex_.clear();
+    currentCFG_ = nullptr;
 }
 
-// === Helper Methods ===
+// =============================================================================
+// Helper Methods
+// =============================================================================
 
 void CFGEmitter::emitBlockStatements(const BasicBlock* block) {
     if (!block) return;
@@ -803,7 +934,8 @@ void CFGEmitter::emitBlockStatements(const BasicBlock* block) {
             ASTNodeType stmtType = stmt->getType();
             if (stmtType == ASTNodeType::STMT_RETURN ||
                 stmtType == ASTNodeType::STMT_ON_GOTO ||
-                stmtType == ASTNodeType::STMT_ON_GOSUB) {
+                stmtType == ASTNodeType::STMT_ON_GOSUB ||
+                stmtType == ASTNodeType::STMT_ON_CALL) {
                 continue;
             }
             astEmitter_.emitStatement(stmt);
@@ -831,24 +963,6 @@ const ForStatement* CFGEmitter::findForStatementForHeader(const BasicBlock* head
     return nullptr;
 }
 
-std::vector<CFGEdge> CFGEmitter::getOutEdges(const BasicBlock* block, 
-                                              const ControlFlowGraph* cfg) {
-    std::vector<CFGEdge> result;
-    
-    if (!block || !cfg) {
-        return result;
-    }
-    
-    // Find all edges where sourceBlock == block->id
-    for (const auto& edge : cfg->edges) {
-        if (edge.sourceBlock == block->id) {
-            result.push_back(edge);
-        }
-    }
-    
-    return result;
-}
-
 void CFGEmitter::computeReachability(const ControlFlowGraph* cfg) {
     if (!cfg) return;
     
@@ -861,33 +975,24 @@ void CFGEmitter::computeReachability(const ControlFlowGraph* cfg) {
         }
     }
     
-    // DFS from entry block
+    // DFS from entry block (uses the pre-built edge index)
     std::unordered_set<int> visited;
-    dfsReachability(cfg->entryBlock, cfg, visited);
+    dfsReachability(cfg->entryBlock, visited);
 }
 
-void CFGEmitter::dfsReachability(int blockId, 
-                                 const ControlFlowGraph* cfg,
+void CFGEmitter::dfsReachability(int blockId,
                                  std::unordered_set<int>& visited) {
-    if (visited.find(blockId) != visited.end()) {
+    if (visited.count(blockId)) {
         return;  // Already visited
     }
     
     visited.insert(blockId);
     reachabilityCache_[blockId] = true;
     
-    // Find the block
-    const BasicBlock* block = nullptr;
-    if (blockId >= 0 && blockId < static_cast<int>(cfg->blocks.size())) {
-        block = cfg->blocks[blockId].get();
-    }
-    
-    if (!block) return;
-    
-    // Visit all successors
-    std::vector<CFGEdge> outEdges = getOutEdges(block, cfg);
+    // Use the pre-built edge index for O(1) lookup
+    const auto& outEdges = getOutEdgesIndexed(blockId);
     for (const auto& edge : outEdges) {
-        dfsReachability(edge.targetBlock, cfg, visited);
+        dfsReachability(edge.targetBlock, visited);
     }
 }
 
@@ -996,8 +1101,12 @@ void CFGEmitter::emitOnGotoTerminator(const OnGotoStatement* stmt,
     
     for (const auto& edge : outEdges) {
         if (edge.label.length() >= 5 && edge.label.substr(0, 5) == "case_") {
-            // Extract case number
-            int caseNum = std::stoi(edge.label.substr(5));
+            int caseNum = 0;
+            std::string numPart = edge.label.substr(5);
+            if (!tryParseInt(numPart, caseNum) || caseNum < 1) {
+                builder_.emitComment("WARNING: malformed case label '" + edge.label + "' – skipped");
+                continue;
+            }
             // Ensure vector is large enough
             if (caseNum > (int)caseTargets.size()) {
                 caseTargets.resize(caseNum, -1);
@@ -1060,9 +1169,13 @@ void CFGEmitter::emitOnGosubTerminator(const OnGosubStatement* stmt,
     int returnPoint = -1;
     
     for (const auto& edge : outEdges) {
-        if (edge.label.substr(0, 5) == "call_") {
-            // Extract case number
-            int caseNum = std::stoi(edge.label.substr(5));
+        if (edge.label.length() >= 5 && edge.label.substr(0, 5) == "call_") {
+            int caseNum = 0;
+            std::string numPart = edge.label.substr(5);
+            if (!tryParseInt(numPart, caseNum) || caseNum < 1) {
+                builder_.emitComment("WARNING: malformed call label '" + edge.label + "' – skipped");
+                continue;
+            }
             // Ensure vector is large enough
             if (caseNum > (int)callTargets.size()) {
                 callTargets.resize(caseNum, -1);
@@ -1136,13 +1249,18 @@ void CFGEmitter::emitOnCallTerminator(const OnCallStatement* stmt,
     int continuePoint = -1;
     
     for (const auto& edge : outEdges) {
-        if (edge.label.substr(0, 9) == "call_sub:") {
+        if (edge.label.length() >= 9 && edge.label.substr(0, 9) == "call_sub:") {
             // Extract SUB name and case number from label "call_sub:<name>:case_N"
             std::string remaining = edge.label.substr(9);
             size_t casePos = remaining.find(":case_");
             if (casePos != std::string::npos) {
                 std::string subName = remaining.substr(0, casePos);
-                int caseNum = std::stoi(remaining.substr(casePos + 6));
+                std::string numPart = remaining.substr(casePos + 6);
+                int caseNum = 0;
+                if (!tryParseInt(numPart, caseNum) || caseNum < 1) {
+                    builder_.emitComment("WARNING: malformed call_sub label '" + edge.label + "' – skipped");
+                    continue;
+                }
                 
                 // Ensure vector is large enough
                 if (caseNum > (int)subNames.size()) {
@@ -1151,7 +1269,8 @@ void CFGEmitter::emitOnCallTerminator(const OnCallStatement* stmt,
                 // Store SUB name (1-indexed to 0-indexed)
                 subNames[caseNum - 1] = subName;
             }
-            continuePoint = edge.targetBlock;
+            // Note: continuePoint is NOT set here — only the "call_default"
+            // edge carries the correct continuation block.
         } else if (edge.label == "call_default") {
             continuePoint = edge.targetBlock;
         }

@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 #include "../fasterbasic_cfg.h"
 #include "qbe_builder.h"
 #include "type_manager.h"
@@ -101,7 +102,7 @@ public:
     /**
      * Check if a block is reachable
      * @param blockId Block ID
-     * @param cfg CFG
+     * @param cfg CFG (unused — kept for API compatibility; uses cached data)
      * @return true if reachable from entry
      */
     bool isBlockReachable(int blockId, const FasterBASIC::ControlFlowGraph* cfg);
@@ -186,6 +187,18 @@ public:
      */
     void reset();
 
+    // === Edge Index (O(1) out-edge lookup) ===
+
+    /**
+     * Get all out-edges for a block using the precomputed index.
+     * Falls back to a linear scan when no index has been built (should
+     * not happen during normal emission).
+     *
+     * @param blockId Block ID
+     * @return Reference to the vector of out-edges (empty vector if none)
+     */
+    const std::vector<FasterBASIC::CFGEdge>& getOutEdgesIndexed(int blockId) const;
+
 private:
     QBEBuilder& builder_;
     TypeManager& typeManager_;
@@ -195,6 +208,10 @@ private:
     // Current function context
     std::string currentFunction_;
     
+    // Pointer to the CFG currently being emitted (valid between
+    // enterFunction / exitFunction pairs inside emitCFG).
+    const FasterBASIC::ControlFlowGraph* currentCFG_ = nullptr;
+
     // Labels that have been emitted
     std::unordered_set<int> emittedLabels_;
     
@@ -206,8 +223,32 @@ private:
     
     // Current loop condition (for FOR/WHILE headers)
     std::string currentLoopCondition_;
-    
+
+    // Pre-built index: blockId → vector of out-edges.
+    // Built once per CFG in buildEdgeIndex() and used by every
+    // getOutEdgesIndexed() call, turning O(E)-per-lookup into O(1).
+    std::unordered_map<int, std::vector<FasterBASIC::CFGEdge>> outEdgeIndex_;
+
+    // Sentinel empty vector returned by getOutEdgesIndexed when a block
+    // has no out-edges in the index.
+    static const std::vector<FasterBASIC::CFGEdge> emptyEdgeVec_;
+
     // === Helper Methods ===
+
+    /**
+     * Build the out-edge index for the given CFG.
+     * Must be called once before any getOutEdgesIndexed() lookups.
+     *
+     * @param cfg The control flow graph to index
+     */
+    void buildEdgeIndex(const FasterBASIC::ControlFlowGraph* cfg);
+
+    /**
+     * Legacy wrapper — returns a copy of the out-edges for a block.
+     * Prefer getOutEdgesIndexed() for new code.
+     */
+    std::vector<FasterBASIC::CFGEdge> getOutEdges(const FasterBASIC::BasicBlock* block,
+                                                   const FasterBASIC::ControlFlowGraph* cfg);
     
     /**
      * Emit statements in a block
@@ -216,28 +257,19 @@ private:
     void emitBlockStatements(const FasterBASIC::BasicBlock* block);
     
     /**
-     * Get all out-edges from a block
-     * @param block Block
-     * @param cfg CFG
-     * @return List of out-edges
-     */
-    std::vector<FasterBASIC::CFGEdge> getOutEdges(const FasterBASIC::BasicBlock* block,
-                                                   const FasterBASIC::ControlFlowGraph* cfg);
-    
-    /**
      * Compute reachability from entry block
      * @param cfg CFG to analyze
      */
     void computeReachability(const FasterBASIC::ControlFlowGraph* cfg);
     
     /**
-     * Perform depth-first search for reachability
+     * Perform depth-first search for reachability.
+     * Uses the pre-built edge index (must call buildEdgeIndex first).
+     *
      * @param blockId Current block
-     * @param cfg CFG
      * @param visited Set of visited blocks
      */
-    void dfsReachability(int blockId, 
-                        const FasterBASIC::ControlFlowGraph* cfg,
+    void dfsReachability(int blockId,
                         std::unordered_set<int>& visited);
     
     /**
@@ -342,6 +374,18 @@ private:
     void emitOnCallTerminator(const FasterBASIC::OnCallStatement* stmt,
                              const FasterBASIC::BasicBlock* block,
                              const FasterBASIC::ControlFlowGraph* cfg);
+
+    // === Parsing Helpers ===
+
+    /**
+     * Safely parse an integer from a string.
+     * Unlike std::stoi this never throws; returns false on failure.
+     *
+     * @param s   String to parse
+     * @param out Receives the parsed value on success
+     * @return true if the entire string was a valid integer
+     */
+    static bool tryParseInt(const std::string& s, int& out);
 };
 
 } // namespace fbc
