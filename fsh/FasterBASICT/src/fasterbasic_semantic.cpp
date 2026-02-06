@@ -755,7 +755,7 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
                           "Unknown type '" + paramTypeName + "' in parameter " + stmt.parameters[i],
                           stmt.location);
                 }
-                // Keep paramTypeName for user-defined types
+                paramType = VariableType::USER_DEFINED;
             }
         } else if (i < stmt.parameterTypes.size()) {
             // Has type suffix
@@ -767,7 +767,13 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         }
         debugFile.close();
         
-        sym.parameterTypeDescs.push_back(legacyTypeToDescriptor(paramType));
+        // Build TypeDescriptor for this parameter
+        TypeDescriptor paramTypeDesc = legacyTypeToDescriptor(paramType);
+        if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+            paramTypeDesc.udtName = paramTypeName;
+            paramTypeDesc.udtTypeId = m_symbolTable.allocateTypeId(paramTypeName);
+        }
+        sym.parameterTypeDescs.push_back(paramTypeDesc);
     }
     
     // Process return type
@@ -832,6 +838,18 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         
         VariableSymbol paramVar(normalizedParamName, paramTypeDesc, funcScope, true);
         paramVar.firstUse = stmt.location;
+        // For UDT parameters, set typeName so codegen can look up the UDT definition
+        if (i < stmt.parameterAsTypes.size() && !stmt.parameterAsTypes[i].empty()) {
+            std::string pTypeName = stmt.parameterAsTypes[i];
+            std::string upperPType = pTypeName;
+            std::transform(upperPType.begin(), upperPType.end(), upperPType.begin(), ::toupper);
+            // Only set typeName for user-defined types (not built-in keywords)
+            if (upperPType != "INTEGER" && upperPType != "INT" && upperPType != "DOUBLE" &&
+                upperPType != "SINGLE" && upperPType != "FLOAT" && upperPType != "STRING" &&
+                upperPType != "LONG") {
+                paramVar.typeName = pTypeName;
+            }
+        }
         m_symbolTable.insertVariable(normalizedParamName, paramVar);
     }
     
@@ -893,7 +911,7 @@ void SemanticAnalyzer::processSubStatement(const SubStatement& stmt) {
                           "Unknown type '" + paramTypeName + "' in parameter " + stmt.parameters[i],
                           stmt.location);
                 }
-                // Keep paramTypeName for user-defined types
+                paramType = VariableType::USER_DEFINED;
             }
         } else if (i < stmt.parameterTypes.size()) {
             // Has type suffix
@@ -902,14 +920,23 @@ void SemanticAnalyzer::processSubStatement(const SubStatement& stmt) {
             paramType = VariableType::DOUBLE;  // Default type (DOUBLE, not FLOAT)
         }
         
-        sym.parameterTypeDescs.push_back(legacyTypeToDescriptor(paramType));
+        // Build TypeDescriptor for this parameter
+        TypeDescriptor paramTypeDesc = legacyTypeToDescriptor(paramType);
+        if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+            paramTypeDesc.udtName = paramTypeName;
+            paramTypeDesc.udtTypeId = m_symbolTable.allocateTypeId(paramTypeName);
+        }
+        sym.parameterTypeDescs.push_back(paramTypeDesc);
         
         // Add parameter as a variable in the symbol table so it can be looked up
         // Create parameter with function scope
         Scope funcScope = Scope::makeFunction(stmt.subName);
-        TypeDescriptor paramTypeDesc = legacyTypeToDescriptor(paramType);
         VariableSymbol paramVar(stmt.parameters[i], paramTypeDesc, funcScope, true);
         paramVar.firstUse = stmt.location;
+        // For UDT parameters, set typeName so codegen can look up the UDT definition
+        if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+            paramVar.typeName = paramTypeName;
+        }
         m_symbolTable.insertVariable(stmt.parameters[i], paramVar);
     }
     
@@ -1643,6 +1670,10 @@ void SemanticAnalyzer::validateStatement(const Statement& stmt) {
                 varSym.firstUse = stmt.location;
                 varSym.isGlobal = false;
                 varSym.typeDesc = typeDesc;
+                // For UDT types, set typeName so codegen and validation can look up the UDT definition
+                if (typeDesc.baseType == BaseType::USER_DEFINED && !typeDesc.udtName.empty()) {
+                    varSym.typeName = typeDesc.udtName;
+                }
                 
                 // Store with scope-aware insertion (using normalized name)
                 m_symbolTable.insertVariable(normalizedName, varSym);
@@ -1917,6 +1948,10 @@ void SemanticAnalyzer::validateLetStatement(const LetStatement& stmt) {
             }
             
             baseTypeName = varSym->typeName;
+            // Fall back to typeDesc.udtName if typeName is empty (e.g., for LOCAL or parameter UDT vars)
+            if (baseTypeName.empty()) {
+                baseTypeName = varSym->typeDesc.udtName;
+            }
         }
         
         // Look up the UDT type
@@ -2913,15 +2948,61 @@ VariableType SemanticAnalyzer::inferMemberAccessType(const MemberAccessExpressio
         // Recursively get the type of the nested member
         VariableType nestedType = inferMemberAccessType(*static_cast<const MemberAccessExpression*>(expr.object.get()));
         
-        // If the nested member is a UDT, we need to get its type name
-        // For now, we'll handle this by looking up the field in the parent type
-        // This is complex, so we return the nested type for now
+        // If the nested member is a UDT, we need to resolve the actual field type
+        // by traversing the member access chain from the root variable
         if (nestedType == VariableType::USER_DEFINED) {
-            // TODO: Handle nested UDT member access properly
-            // For now, continue with type lookup attempt
+            // Walk the nested member access chain to find the root variable and
+            // collect intermediate member names
+            std::vector<std::string> chainNames;
+            const Expression* cur = expr.object.get();
+            while (cur->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+                const auto* ma = static_cast<const MemberAccessExpression*>(cur);
+                chainNames.push_back(ma->memberName);
+                cur = ma->object.get();
+            }
+            std::reverse(chainNames.begin(), chainNames.end());
+
+            // Determine root UDT type name
+            std::string rootUDT;
+            if (cur->getType() == ASTNodeType::EXPR_VARIABLE) {
+                const auto* rootVar = static_cast<const VariableExpression*>(cur);
+                VariableSymbol* rootSym = lookupVariable(rootVar->name);
+                if (rootSym && rootSym->typeDesc.baseType == BaseType::USER_DEFINED) {
+                    rootUDT = rootSym->typeName;
+                }
+            } else if (cur->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+                const auto* arrExpr = static_cast<const ArrayAccessExpression*>(cur);
+                ArraySymbol* arrSym = lookupArray(arrExpr->name);
+                if (arrSym && arrSym->elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+                    rootUDT = arrSym->asTypeName;
+                }
+            }
+
+            if (!rootUDT.empty()) {
+                // Traverse the chain to find the UDT type of the intermediate result
+                std::string currentUDT = rootUDT;
+                for (const auto& name : chainNames) {
+                    TypeSymbol* ts = lookupType(currentUDT);
+                    if (!ts) break;
+                    const TypeSymbol::Field* fld = ts->findField(name);
+                    if (!fld || fld->typeDesc.baseType != BaseType::USER_DEFINED) {
+                        currentUDT.clear();
+                        break;
+                    }
+                    currentUDT = fld->typeDesc.udtName;
+                }
+                if (!currentUDT.empty()) {
+                    baseTypeName = currentUDT;
+                    // Fall through to look up expr.memberName in baseTypeName below
+                } else {
+                    return nestedType;
+                }
+            } else {
+                return nestedType;
+            }
+        } else {
             return nestedType;
         }
-        return nestedType;
     } else {
         return VariableType::UNKNOWN;
     }
@@ -2997,10 +3078,16 @@ VariableType SemanticAnalyzer::inferVariableType(const VariableExpression& expr)
     if (m_currentFunctionScope.inFunction) {
         validateVariableInFunction(expr.name, expr.location);
         
-        // For LOCAL variables and parameters, infer type from name
-        // (they're not in the symbol table)
+        // For LOCAL variables and parameters, look up actual type from symbol table first.
+        // Fall back to name-based inference only if not found (shouldn't happen).
         if (m_currentFunctionScope.parameters.count(expr.name) ||
             m_currentFunctionScope.localVariables.count(expr.name)) {
+            // Try to find the variable in the symbol table with proper scope
+            const VariableSymbol* paramSym = lookupVariableScoped(expr.name, m_currentFunctionScope.functionName);
+            if (paramSym) {
+                return descriptorToLegacyType(paramSym->typeDesc);
+            }
+            // Fall back to name-based inference
             return inferTypeFromName(expr.name);
         }
         
@@ -5084,6 +5171,12 @@ TypeDescriptor SemanticAnalyzer::inferVariableTypeD(const VariableExpression& ex
     if (m_currentFunctionScope.inFunction) {
         if (m_currentFunctionScope.parameters.count(expr.name) ||
             m_currentFunctionScope.localVariables.count(expr.name)) {
+            // Try to find the variable in the symbol table with proper scope
+            const VariableSymbol* paramSym = lookupVariableScoped(expr.name, m_currentFunctionScope.functionName);
+            if (paramSym) {
+                return paramSym->typeDesc;
+            }
+            // Fall back to name-based inference
             return inferTypeFromNameD(expr.name);
         }
     }
@@ -5186,6 +5279,15 @@ TypeDescriptor SemanticAnalyzer::inferMemberAccessTypeD(const MemberAccessExpres
             baseType.baseType = BaseType::USER_DEFINED;
             baseType.udtName = baseTypeName;
             baseType.udtTypeId = m_symbolTable.getTypeId(baseTypeName);
+        }
+    } else if (expr.object->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+        // Nested member access (e.g., O.Item.Value)
+        // Recursively get the type of the base member access
+        TypeDescriptor nestedDesc = inferMemberAccessTypeD(
+            static_cast<const MemberAccessExpression&>(*expr.object));
+        if (nestedDesc.baseType == BaseType::USER_DEFINED && !nestedDesc.udtName.empty()) {
+            baseTypeName = nestedDesc.udtName;
+            baseType = nestedDesc;
         }
     }
     

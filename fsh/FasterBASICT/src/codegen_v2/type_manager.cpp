@@ -91,11 +91,53 @@ int TypeManager::getTypeSize(BasicType basicType) const {
     }
 }
 
+int TypeManager::getTypeAlignment(BasicType basicType) const {
+    switch (basicType) {
+        case BasicType::BYTE:
+        case BasicType::UBYTE:
+            return 1;
+
+        case BasicType::SHORT:
+        case BasicType::USHORT:
+            return 2;
+
+        case BasicType::INTEGER:
+        case BasicType::UINTEGER:
+        case BasicType::SINGLE:
+            return 4;
+
+        case BasicType::LONG:
+        case BasicType::ULONG:
+        case BasicType::DOUBLE:
+        case BasicType::STRING:
+        case BasicType::UNICODE:
+        case BasicType::USER_DEFINED:
+        case BasicType::OBJECT:
+            return 8;
+
+        case BasicType::VOID:
+        case BasicType::UNKNOWN:
+        default:
+            return 4;
+    }
+}
+
 int TypeManager::getUDTSize(const FasterBASIC::TypeSymbol& udtDef) const {
     int totalSize = 0;
+    int maxAlignment = 1;
     for (const auto& field : udtDef.fields) {
-        totalSize += getTypeSize(field.typeDesc.baseType);
+        int fieldAlign = getTypeAlignment(field.typeDesc.baseType);
+        int fieldSize  = getTypeSize(field.typeDesc.baseType);
+        // Track the largest field alignment for trailing padding
+        if (fieldAlign > maxAlignment) maxAlignment = fieldAlign;
+        // Pad current offset to the field's natural alignment
+        int padding = (fieldAlign - (totalSize % fieldAlign)) % fieldAlign;
+        totalSize += padding + fieldSize;
     }
+    // Add trailing padding so the struct size is a multiple of the
+    // largest field alignment (required for arrays of this UDT)
+    int trailingPad = (maxAlignment - (totalSize % maxAlignment)) % maxAlignment;
+    totalSize += trailingPad;
     return totalSize;
 }
 
@@ -272,6 +314,35 @@ std::string TypeManager::getQBETypeName(const std::string& qbeType) const {
     if (qbeType == "b") return "b (byte)";
     if (qbeType == "h") return "h (half-word)";
     return qbeType + " (unknown)";
+}
+
+// === Return Variable Name Helpers ===
+
+std::string TypeManager::getReturnVariableSuffix(BasicType returnType) const {
+    switch (returnType) {
+        case BasicType::BYTE:       return "_BYTE";
+        case BasicType::UBYTE:      return "_BYTE";
+        case BasicType::SHORT:      return "_SHORT";
+        case BasicType::USHORT:     return "_SHORT";
+        case BasicType::INTEGER:    return "_INT";
+        case BasicType::UINTEGER:   return "_INT";
+        case BasicType::LONG:       return "_LONG";
+        case BasicType::ULONG:      return "_LONG";
+        case BasicType::SINGLE:     return "_FLOAT";
+        case BasicType::DOUBLE:     return "_DOUBLE";
+        case BasicType::STRING:
+        case BasicType::UNICODE:    return "_STRING";
+        default:                    return "";
+    }
+}
+
+std::string TypeManager::getReturnVariableName(const std::string& funcName,
+                                               BasicType returnType) const {
+    std::string suffix = getReturnVariableSuffix(returnType);
+    if (suffix.empty()) {
+        return funcName;  // VOID / UNKNOWN – bare name
+    }
+    return funcName + suffix;
 }
 
 std::string TypeManager::getDefaultValue(BasicType basicType) const {

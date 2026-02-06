@@ -1,6 +1,7 @@
 #include "all.h"
 #include "config.h"
 #include <ctype.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <libgen.h>
 #include <sys/stat.h>

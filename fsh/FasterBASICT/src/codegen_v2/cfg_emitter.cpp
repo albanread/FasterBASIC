@@ -1,4 +1,5 @@
 #include "cfg_emitter.h"
+#include "type_manager.h"
 #include <algorithm>
 #include <queue>
 
@@ -147,7 +148,10 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                 if (isParameter) {
                     // This is a parameter - store the QBE parameter value
                     std::string qbeParam = "%" + qbeParamName;
-                    if (size == 4) {
+                    if (varType == BaseType::USER_DEFINED) {
+                        // UDT parameter passed by pointer - store the pointer (long)
+                        builder_.emitRaw("    storel " + qbeParam + ", " + mangledName);
+                    } else if (size == 4) {
                         builder_.emitRaw("    storew " + qbeParam + ", " + mangledName);
                     } else if (size == 8) {
                         if (typeManager_.isString(varType)) {
@@ -161,6 +165,10 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                     if (typeManager_.isString(varType)) {
                         // Strings initialized to null pointer
                         builder_.emitRaw("    storel 0, " + mangledName);
+                    } else if (varType == BaseType::USER_DEFINED && size > 8) {
+                        // UDT types: zero-initialize all bytes using memset
+                        builder_.emitComment("Zero-initialize UDT (" + std::to_string(size) + " bytes)");
+                        builder_.emitRaw("    call $memset(l " + mangledName + ", w 0, l " + std::to_string(size) + ")");
                     } else if (size == 4) {
                         builder_.emitRaw("    storew 0, " + mangledName);
                     } else if (size == 8) {
@@ -261,308 +269,193 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
 
 // === Edge Handling ===
 
-void CFGEmitter::emitBlockTerminator(const BasicBlock* block, const ControlFlowGraph* cfg) {
-    std::vector<CFGEdge> outEdges = getOutEdges(block, cfg);
-    
-    builder_.emitComment("DEBUG: emitBlockTerminator for block " + std::to_string(block->id) + 
-                        " with " + std::to_string(block->statements.size()) + " statements");
-    
-    // Check for control flow statements that need special handling
-    const ReturnStatement* returnStmt = nullptr;
-    const OnGotoStatement* onGotoStmt = nullptr;
-    const OnGosubStatement* onGosubStmt = nullptr;
-    const OnCallStatement* onCallStmt = nullptr;
-    
+// === Decomposed Terminator Helpers ===
+
+void CFGEmitter::scanControlFlowStatements(
+    const BasicBlock* block,
+    const ReturnStatement*& outReturn,
+    const OnGotoStatement*& outOnGoto,
+    const OnGosubStatement*& outOnGosub,
+    const OnCallStatement*& outOnCall)
+{
+    outReturn = nullptr;
+    outOnGoto = nullptr;
+    outOnGosub = nullptr;
+    outOnCall = nullptr;
+
     for (const Statement* stmt : block->statements) {
         if (!stmt) continue;
-        
         ASTNodeType stmtType = stmt->getType();
-        builder_.emitComment("  Statement type: " + std::to_string(static_cast<int>(stmtType)));
-        
+
         if (stmtType == ASTNodeType::STMT_RETURN) {
-            returnStmt = static_cast<const ReturnStatement*>(stmt);
-            builder_.emitComment("  Found RETURN statement");
+            outReturn = static_cast<const ReturnStatement*>(stmt);
         } else if (stmtType == ASTNodeType::STMT_ON_GOTO) {
-            onGotoStmt = static_cast<const OnGotoStatement*>(stmt);
-            builder_.emitComment("  Found ON GOTO statement");
+            outOnGoto = static_cast<const OnGotoStatement*>(stmt);
         } else if (stmtType == ASTNodeType::STMT_ON_GOSUB) {
-            onGosubStmt = static_cast<const OnGosubStatement*>(stmt);
-            builder_.emitComment("  Found ON GOSUB statement");
+            outOnGosub = static_cast<const OnGosubStatement*>(stmt);
         } else if (stmtType == ASTNodeType::STMT_ON_CALL) {
-            onCallStmt = static_cast<const OnCallStatement*>(stmt);
-            builder_.emitComment("  Found ON CALL statement");
+            outOnCall = static_cast<const OnCallStatement*>(stmt);
         }
     }
-    
-    // Handle ON GOTO first
-    if (onGotoStmt) {
-        emitOnGotoTerminator(onGotoStmt, block, cfg);
-        return;
+}
+
+void CFGEmitter::emitReturnStatementValue(const ReturnStatement* returnStmt) {
+    if (!returnStmt || !returnStmt->returnValue) return;
+
+    // FUNCTION return – evaluate expression and store in the implicit return variable
+    std::string value = astEmitter_.emitExpression(returnStmt->returnValue.get());
+
+    const auto& symbolTable = astEmitter_.getSymbolTable();
+    auto funcIt = symbolTable.functions.find(currentFunction_);
+    if (funcIt != symbolTable.functions.end()) {
+        BaseType returnType = funcIt->second.returnTypeDesc.baseType;
+        std::string returnVarName = typeManager_.getReturnVariableName(currentFunction_, returnType);
+        astEmitter_.storeVariable(returnVarName, value);
     }
-    
-    // Handle ON GOSUB
-    if (onGosubStmt) {
-        emitOnGosubTerminator(onGosubStmt, block, cfg);
-        return;
-    }
-    
-    // Handle ON CALL
-    if (onCallStmt) {
-        emitOnCallTerminator(onCallStmt, block, cfg);
-        return;
-    }
-    
-    // If this block has a RETURN statement, process it here
-    if (returnStmt) {
-        if (returnStmt->returnValue) {
-            // FUNCTION return - evaluate expression and store in return variable
-            std::string value = astEmitter_.emitExpression(returnStmt->returnValue.get());
-            
-            const auto& symbolTable = astEmitter_.getSymbolTable();
-            auto funcIt = symbolTable.functions.find(currentFunction_);
-            if (funcIt != symbolTable.functions.end()) {
-                const auto& funcSymbol = funcIt->second;
-                BaseType returnType = funcSymbol.returnTypeDesc.baseType;
-                
-                // Get normalized return variable name
-                std::string returnVarName = currentFunction_ + "_DOUBLE"; // Default
-                switch (returnType) {
-                    case BaseType::INTEGER:
-                        returnVarName = currentFunction_ + "_INT";
-                        break;
-                    case BaseType::LONG:
-                        returnVarName = currentFunction_ + "_LONG";
-                        break;
-                    case BaseType::SHORT:
-                        returnVarName = currentFunction_ + "_SHORT";
-                        break;
-                    case BaseType::BYTE:
-                        returnVarName = currentFunction_ + "_BYTE";
-                        break;
-                    case BaseType::SINGLE:
-                        returnVarName = currentFunction_ + "_FLOAT";
-                        break;
-                    case BaseType::DOUBLE:
-                        returnVarName = currentFunction_ + "_DOUBLE";
-                        break;
-                    case BaseType::STRING:
-                    case BaseType::UNICODE:
-                        returnVarName = currentFunction_ + "_STRING";
-                        break;
-                    default:
-                        returnVarName = currentFunction_;
-                        break;
-                }
-                
-                // Store the value in the return variable
-                astEmitter_.storeVariable(returnVarName, value);
-            }
-        }
-        
-        // Now emit the jump to exit block (handled by normal edge processing below)
-        // Don't return here - let the normal edge processing handle the jump
-    }
-    
-    if (outEdges.empty()) {
-        // No out-edges - this is an exit block
-        // If we're in main, just return 0; otherwise, return the function return variable
-        if (currentFunction_.empty() || currentFunction_ == "main") {
-            builder_.emitComment("Implicit return 0");
-            builder_.emitReturn("0");
-        } else {
-            // Load and return the function return variable
-            const auto& symbolTable = astEmitter_.getSymbolTable();
-            auto funcIt = symbolTable.functions.find(currentFunction_);
-            if (funcIt != symbolTable.functions.end()) {
-                const auto& funcSymbol = funcIt->second;
-                BaseType returnType = funcSymbol.returnTypeDesc.baseType;
-                
-                // SUBs have VOID return type and should just return without a value
-                if (returnType == BaseType::VOID) {
-                    builder_.emitComment("SUB exit - no return value");
-                    builder_.emitReturn();
-                    return;
-                }
-                
-                std::string qbeType = typeManager_.getQBEType(returnType);
-                
-                // Get normalized return variable name
-                std::string returnVarName = currentFunction_ + "_DOUBLE"; // Default
-                switch (returnType) {
-                    case BaseType::INTEGER:
-                        returnVarName = currentFunction_ + "_INT";
-                        break;
-                    case BaseType::LONG:
-                        returnVarName = currentFunction_ + "_LONG";
-                        break;
-                    case BaseType::SHORT:
-                        returnVarName = currentFunction_ + "_SHORT";
-                        break;
-                    case BaseType::BYTE:
-                        returnVarName = currentFunction_ + "_BYTE";
-                        break;
-                    case BaseType::SINGLE:
-                        returnVarName = currentFunction_ + "_FLOAT";
-                        break;
-                    case BaseType::DOUBLE:
-                        returnVarName = currentFunction_ + "_DOUBLE";
-                        break;
-                    case BaseType::STRING:
-                    case BaseType::UNICODE:
-                        returnVarName = currentFunction_ + "_STRING";
-                        break;
-                    default:
-                        returnVarName = currentFunction_;
-                        break;
-                }
-                
-                std::string mangledName = symbolMapper_.mangleVariableName(returnVarName, false);
-                std::string retTemp = builder_.newTemp();
-                
-                builder_.emitLoad(retTemp, qbeType, mangledName);
-                builder_.emitReturn(retTemp);
-            } else {
-                builder_.emitComment("WARNING: block with no out-edges (missing return?)");
-                builder_.emitReturn();
-            }
-        }
-        return;
-    }
-    
-    // Analyze edge types - check if any edge is CALL or RETURN first
-    bool hasCallEdge = false;
-    bool hasReturnEdge = false;
-    
-    for (const auto& edge : outEdges) {
-        if (edge.type == EdgeType::CALL) {
-            hasCallEdge = true;
-        } else if (edge.type == EdgeType::RETURN) {
-            hasReturnEdge = true;
-        }
-    }
-    
-    // Handle GOSUB (CALL edge) first, as it requires special handling
-    if (hasCallEdge) {
-        // Subroutine call (GOSUB)
-        // Need to find both the call target and the return point
-        // outEdges should have 2 edges: CALL to subroutine, FALLTHROUGH to return point
-        
-        if (outEdges.size() < 2) {
-            builder_.emitComment("ERROR: GOSUB should have 2 out-edges (call + return point)");
-            return;
-        }
-        
-        // Find the call target and return point
-        int callTarget = -1;
-        int returnPoint = -1;
-        
-        for (const auto& edge : outEdges) {
-            if (edge.type == EdgeType::CALL) {
-                callTarget = edge.targetBlock;
-            } else if (edge.type == EdgeType::FALLTHROUGH || edge.type == EdgeType::JUMP) {
-                returnPoint = edge.targetBlock;
-            }
-        }
-        
-        if (callTarget < 0 || returnPoint < 0) {
-            builder_.emitComment("ERROR: Could not find GOSUB call target or return point");
-            return;
-        }
-        
-        builder_.emitComment("GOSUB: push return point, jump to subroutine");
-        
-        // Push return block ID onto the return stack (using shared helper)
-        emitPushReturnBlock(returnPoint);
-        
-        // Jump to subroutine
-        emitFallthrough(callTarget);
-        return;
-    }
-    
-    if (hasReturnEdge) {
-        // RETURN from GOSUB - pop return address and dispatch
-        builder_.emitComment("RETURN from GOSUB - sparse dispatch");
-        
-        // 1. Load current stack pointer
-        std::string spTemp = builder_.newTemp();
-        builder_.emitRaw("    " + spTemp + " =w loadw $gosub_return_sp\n");
-        
-        // 2. Decrement stack pointer
-        std::string newSp = builder_.newTemp();
-        builder_.emitRaw("    " + newSp + " =w sub " + spTemp + ", 1\n");
-        builder_.emitRaw("    storew " + newSp + ", $gosub_return_sp\n");
-        
-        // 3. Convert new SP to long for address calculation
-        std::string newSpLong = builder_.newTemp();
-        builder_.emitRaw("    " + newSpLong + " =l extsw " + newSp + "\n");
-        
-        // 4. Calculate byte offset: SP * 4
-        std::string byteOffset = builder_.newTemp();
-        builder_.emitRaw("    " + byteOffset + " =l mul " + newSpLong + ", 4\n");
-        
-        // 5. Calculate stack address
-        std::string stackAddr = builder_.newTemp();
-        builder_.emitRaw("    " + stackAddr + " =l add $gosub_return_stack, " + byteOffset + "\n");
-        
-        // 6. Load return block ID
-        std::string returnBlockIdTemp = builder_.newTemp();
-        builder_.emitRaw("    " + returnBlockIdTemp + " =w loadw " + stackAddr + "\n");
-        
-        // 7. Sparse dispatch - only check blocks that are GOSUB return points
-        if (cfg && !cfg->gosubReturnBlocks.empty()) {
-            builder_.emitComment("Sparse RETURN dispatch - checking " + 
-                               std::to_string(cfg->gosubReturnBlocks.size()) + 
-                               " return points");
-            
-            // Convert set to sorted vector for deterministic output
-            std::vector<int> returnBlocks(cfg->gosubReturnBlocks.begin(), 
-                                         cfg->gosubReturnBlocks.end());
-            std::sort(returnBlocks.begin(), returnBlocks.end());
-            
-            // Generate comparison chain
-            for (size_t i = 0; i < returnBlocks.size(); ++i) {
-                int blockId = returnBlocks[i];
-                std::string isMatch = builder_.newTemp();
-                builder_.emitRaw("    " + isMatch + " =w ceqw " + returnBlockIdTemp + 
-                               ", " + std::to_string(blockId) + "\n");
-                
-                std::string targetLabel = getBlockLabel(blockId);
-                bool isLast = (i + 1 == returnBlocks.size());
-                
-                if (isLast) {
-                    // Last comparison - if it doesn't match, fall through to error
-                    builder_.emitRaw("    jnz " + isMatch + ", @" + targetLabel + ", @return_error_" + 
-                                   std::to_string(block->id) + "\n");
-                } else {
-                    // Not last - jump to target or next comparison
-                    std::string nextCheckLabel = "return_check_" + std::to_string(block->id) + 
-                                               "_" + std::to_string(i + 1);
-                    builder_.emitRaw("    jnz " + isMatch + ", @" + targetLabel + ", @" + 
-                                   nextCheckLabel + "\n");
-                    builder_.emitLabel(nextCheckLabel);
-                }
-            }
-            
-            // Error case: return block ID not found
-            builder_.emitLabel("return_error_" + std::to_string(block->id));
-            builder_.emitComment("RETURN error: invalid return address");
-        } else {
-            builder_.emitComment("WARNING: No GOSUB return blocks found");
-        }
-        
-        // Fall through to program exit on error
-        builder_.emitComment("RETURN stack error - exiting program");
+}
+
+void CFGEmitter::emitExitBlockTerminator() {
+    if (currentFunction_.empty() || currentFunction_ == "main") {
+        builder_.emitComment("Implicit return 0");
         builder_.emitReturn("0");
         return;
     }
-    
-    // Get the primary edge type for remaining cases
+
+    // Load and return the function's implicit return variable
+    const auto& symbolTable = astEmitter_.getSymbolTable();
+    auto funcIt = symbolTable.functions.find(currentFunction_);
+    if (funcIt == symbolTable.functions.end()) {
+        builder_.emitComment("WARNING: block with no out-edges (missing return?)");
+        builder_.emitReturn();
+        return;
+    }
+
+    const auto& funcSymbol = funcIt->second;
+    BaseType returnType = funcSymbol.returnTypeDesc.baseType;
+
+    // SUBs have VOID return type – just return without a value
+    if (returnType == BaseType::VOID) {
+        builder_.emitComment("SUB exit - no return value");
+        builder_.emitReturn();
+        return;
+    }
+
+    std::string qbeType = typeManager_.getQBEType(returnType);
+    std::string returnVarName = typeManager_.getReturnVariableName(currentFunction_, returnType);
+    std::string mangledName = symbolMapper_.mangleVariableName(returnVarName, false);
+    std::string retTemp = builder_.newTemp();
+
+    builder_.emitLoad(retTemp, qbeType, mangledName);
+    builder_.emitReturn(retTemp);
+}
+
+void CFGEmitter::emitGosubCallEdge(const std::vector<CFGEdge>& outEdges,
+                                    const BasicBlock* block) {
+    if (outEdges.size() < 2) {
+        builder_.emitComment("ERROR: GOSUB should have 2 out-edges (call + return point)");
+        return;
+    }
+
+    int callTarget = -1;
+    int returnPoint = -1;
+
+    for (const auto& edge : outEdges) {
+        if (edge.type == EdgeType::CALL) {
+            callTarget = edge.targetBlock;
+        } else if (edge.type == EdgeType::FALLTHROUGH || edge.type == EdgeType::JUMP) {
+            returnPoint = edge.targetBlock;
+        }
+    }
+
+    if (callTarget < 0 || returnPoint < 0) {
+        builder_.emitComment("ERROR: Could not find GOSUB call target or return point");
+        return;
+    }
+
+    builder_.emitComment("GOSUB: push return point, jump to subroutine");
+    emitPushReturnBlock(returnPoint);
+    emitFallthrough(callTarget);
+}
+
+void CFGEmitter::emitGosubReturnEdge(const BasicBlock* block,
+                                      const ControlFlowGraph* cfg) {
+    builder_.emitComment("RETURN from GOSUB - sparse dispatch");
+
+    // 1. Load current stack pointer
+    std::string spTemp = builder_.newTemp();
+    builder_.emitLoad(spTemp, "w", "$gosub_return_sp");
+
+    // 2. Decrement stack pointer
+    std::string newSp = builder_.newTemp();
+    builder_.emitBinary(newSp, "w", "sub", spTemp, "1");
+    builder_.emitStore("w", newSp, "$gosub_return_sp");
+
+    // 3. Convert new SP to long for address calculation
+    std::string newSpLong = builder_.newTemp();
+    builder_.emitExtend(newSpLong, "l", "extsw", newSp);
+
+    // 4. Calculate byte offset: SP * GOSUB_ENTRY_BYTES
+    std::string byteOffset = builder_.newTemp();
+    builder_.emitBinary(byteOffset, "l", "mul", newSpLong,
+                        std::to_string(GOSUB_ENTRY_BYTES));
+
+    // 5. Calculate stack address
+    std::string stackAddr = builder_.newTemp();
+    builder_.emitBinary(stackAddr, "l", "add", "$gosub_return_stack", byteOffset);
+
+    // 6. Load return block ID
+    std::string returnBlockIdTemp = builder_.newTemp();
+    builder_.emitLoad(returnBlockIdTemp, "w", stackAddr);
+
+    // 7. Sparse dispatch – compare against known GOSUB return points
+    if (cfg && !cfg->gosubReturnBlocks.empty()) {
+        builder_.emitComment("Sparse RETURN dispatch - checking " +
+                            std::to_string(cfg->gosubReturnBlocks.size()) +
+                            " return points");
+
+        std::vector<int> returnBlocks(cfg->gosubReturnBlocks.begin(),
+                                      cfg->gosubReturnBlocks.end());
+        std::sort(returnBlocks.begin(), returnBlocks.end());
+
+        for (size_t i = 0; i < returnBlocks.size(); ++i) {
+            int blockId = returnBlocks[i];
+            std::string isMatch = builder_.newTemp();
+            builder_.emitCompare(isMatch, "w", "eq", returnBlockIdTemp,
+                                std::to_string(blockId));
+
+            std::string targetLabel = getBlockLabel(blockId);
+            bool isLast = (i + 1 == returnBlocks.size());
+
+            if (isLast) {
+                std::string errorLabel = "return_error_" + std::to_string(block->id);
+                builder_.emitBranch(isMatch, targetLabel, errorLabel);
+            } else {
+                std::string nextCheckLabel = "return_check_" + std::to_string(block->id) +
+                                            "_" + std::to_string(i + 1);
+                builder_.emitBranch(isMatch, targetLabel, nextCheckLabel);
+                builder_.emitLabel(nextCheckLabel);
+            }
+        }
+
+        builder_.emitLabel("return_error_" + std::to_string(block->id));
+        builder_.emitComment("RETURN error: invalid return address");
+    } else {
+        builder_.emitComment("WARNING: No GOSUB return blocks found");
+    }
+
+    builder_.emitComment("RETURN stack error - exiting program");
+    builder_.emitReturn("0");
+}
+
+void CFGEmitter::emitSimpleEdgeTerminator(
+    const BasicBlock* block,
+    const std::vector<CFGEdge>& outEdges,
+    const ReturnStatement* returnStmt)
+{
     EdgeType edgeType = outEdges[0].type;
-    
+
     if (edgeType == EdgeType::FALLTHROUGH || edgeType == EdgeType::JUMP) {
-        // Simple fallthrough/jump - unconditional jump
         if (outEdges.size() == 1) {
-            // Add comment about what kind of edge this is
             if (returnStmt) {
                 builder_.emitComment("RETURN statement - jump to exit");
             } else {
@@ -575,74 +468,57 @@ void CFGEmitter::emitBlockTerminator(const BasicBlock* block, const ControlFlowG
         }
         return;
     }
-    
+
     if (edgeType == EdgeType::CONDITIONAL_TRUE || edgeType == EdgeType::CONDITIONAL_FALSE) {
-        // Conditional branch (IF, WHILE, etc.)
         if (outEdges.size() == 2) {
             builder_.emitComment("Conditional edge");
-            
-            // Check if we have a stored loop condition first (for FOR/WHILE headers)
+
             std::string condition;
             if (!currentLoopCondition_.empty()) {
                 condition = currentLoopCondition_;
-                currentLoopCondition_.clear();  // Clear after use
+                currentLoopCondition_.clear();
             } else if (!block->statements.empty()) {
-                // Find the last statement - should be an IF or loop condition
                 const Statement* lastStmt = block->statements.back();
                 if (lastStmt && lastStmt->getType() == ASTNodeType::STMT_IF) {
                     const IfStatement* ifStmt = static_cast<const IfStatement*>(lastStmt);
                     condition = astEmitter_.emitIfCondition(ifStmt);
                 } else {
-                    // Generic condition - assume it's already evaluated
                     builder_.emitComment("WARNING: conditional without IF statement");
-                    condition = "1";  // Default to true
+                    condition = "1";
                 }
             } else {
-                condition = "1";  // Default to true
+                condition = "1";
             }
-            
-            // Determine which edge is true and which is false
+
             int trueTarget = -1;
             int falseTarget = -1;
-            
             for (const auto& edge : outEdges) {
-                if (edge.type == EdgeType::CONDITIONAL_TRUE) {
-                    trueTarget = edge.targetBlock;
-                } else if (edge.type == EdgeType::CONDITIONAL_FALSE) {
-                    falseTarget = edge.targetBlock;
-                }
+                if (edge.type == EdgeType::CONDITIONAL_TRUE)  trueTarget  = edge.targetBlock;
+                if (edge.type == EdgeType::CONDITIONAL_FALSE) falseTarget = edge.targetBlock;
             }
-            
-            // If not explicitly labeled, use order
-            if (trueTarget == -1) trueTarget = outEdges[0].targetBlock;
+            if (trueTarget  == -1) trueTarget  = outEdges[0].targetBlock;
             if (falseTarget == -1) falseTarget = outEdges[1].targetBlock;
-            
+
             emitConditional(condition, trueTarget, falseTarget);
         } else {
             builder_.emitComment("ERROR: conditional with != 2 edges");
-            if (!outEdges.empty()) {
-                emitFallthrough(outEdges[0].targetBlock);
-            }
+            if (!outEdges.empty()) emitFallthrough(outEdges[0].targetBlock);
         }
         return;
     }
-    
+
     if (edgeType == EdgeType::EXCEPTION) {
-        // Exception handling edge
         builder_.emitComment("Exception edge");
-        if (!outEdges.empty()) {
-            emitFallthrough(outEdges[0].targetBlock);
-        }
+        if (!outEdges.empty()) emitFallthrough(outEdges[0].targetBlock);
         return;
     }
-    
-    // Multiple edges without clear type - treat as multiway
+
+    // Multiple edges without clear type – treat as multiway
     if (outEdges.size() > 2) {
         builder_.emitComment("Multiway edge (" + std::to_string(outEdges.size()) + " targets)");
-        
+
         std::vector<int> targets;
         int defaultTarget = -1;
-        
         for (const auto& edge : outEdges) {
             if (edge.label == "default" || edge.label == "otherwise") {
                 defaultTarget = edge.targetBlock;
@@ -650,24 +526,61 @@ void CFGEmitter::emitBlockTerminator(const BasicBlock* block, const ControlFlowG
                 targets.push_back(edge.targetBlock);
             }
         }
-        
-        // If no default, use the last target
         if (defaultTarget == -1 && !targets.empty()) {
             defaultTarget = targets.back();
         }
-        
         // TODO: Get selector value from statement
         std::string selector = "1";  // Placeholder
-        
         emitMultiway(selector, targets, defaultTarget);
         return;
     }
-    
-    // Unknown edge type - fallthrough to first edge
+
+    // Unknown edge type – fallthrough to first edge
     builder_.emitComment("WARNING: unknown edge type, using fallthrough");
-    if (!outEdges.empty()) {
-        emitFallthrough(outEdges[0].targetBlock);
+    if (!outEdges.empty()) emitFallthrough(outEdges[0].targetBlock);
+}
+
+// === Main Terminator (decomposed) ===
+
+void CFGEmitter::emitBlockTerminator(const BasicBlock* block, const ControlFlowGraph* cfg) {
+    std::vector<CFGEdge> outEdges = getOutEdges(block, cfg);
+
+    // 1. Scan the block for control-flow-relevant statements
+    const ReturnStatement* returnStmt = nullptr;
+    const OnGotoStatement* onGotoStmt = nullptr;
+    const OnGosubStatement* onGosubStmt = nullptr;
+    const OnCallStatement* onCallStmt = nullptr;
+    scanControlFlowStatements(block, returnStmt, onGotoStmt, onGosubStmt, onCallStmt);
+
+    // 2. ON GOTO / ON GOSUB / ON CALL take priority
+    if (onGotoStmt)  { emitOnGotoTerminator(onGotoStmt, block, cfg);   return; }
+    if (onGosubStmt) { emitOnGosubTerminator(onGosubStmt, block, cfg); return; }
+    if (onCallStmt)  { emitOnCallTerminator(onCallStmt, block, cfg);   return; }
+
+    // 3. Process RETURN statement value (store into implicit return var)
+    if (returnStmt) {
+        emitReturnStatementValue(returnStmt);
     }
+
+    // 4. Exit block (no out-edges)
+    if (outEdges.empty()) {
+        emitExitBlockTerminator();
+        return;
+    }
+
+    // 5. Check for CALL / RETURN edges (GOSUB pattern)
+    bool hasCallEdge = false;
+    bool hasReturnEdge = false;
+    for (const auto& edge : outEdges) {
+        if (edge.type == EdgeType::CALL)   hasCallEdge   = true;
+        if (edge.type == EdgeType::RETURN) hasReturnEdge = true;
+    }
+
+    if (hasCallEdge)   { emitGosubCallEdge(outEdges, block);    return; }
+    if (hasReturnEdge) { emitGosubReturnEdge(block, cfg);       return; }
+
+    // 6. Simple edges (fallthrough, conditional, exception, multiway)
+    emitSimpleEdgeTerminator(block, outEdges, returnStmt);
 }
 
 void CFGEmitter::emitFallthrough(int targetBlockId) {
@@ -998,21 +911,19 @@ std::string CFGEmitter::getEdgeTypeName(EdgeType edgeType) {
 std::string CFGEmitter::emitSelectorWord(const Expression* expr) {
     // Evaluate the selector expression
     std::string selector = astEmitter_.emitExpression(expr);
-    
+
     // Get the expression type
     BaseType exprType = astEmitter_.getExpressionType(expr);
-    
-    // If already an integer type, return as-is
+
+    // If already an integer type, ensure it's a word (w)
     if (exprType == BaseType::INTEGER || exprType == BaseType::LONG ||
         exprType == BaseType::SHORT || exprType == BaseType::BYTE) {
-        // Ensure it's a word type
         if (exprType == BaseType::INTEGER) {
             return selector;  // Already word
         }
-        // Convert to word
         std::string wordTemp = builder_.newTemp();
         if (exprType == BaseType::LONG) {
-            builder_.emitRaw("    " + wordTemp + " =w copy " + selector + "\n");
+            builder_.emitTrunc(wordTemp, "w", selector);
         } else if (exprType == BaseType::SHORT) {
             builder_.emitExtend(wordTemp, "w", "extsh", selector);
         } else if (exprType == BaseType::BYTE) {
@@ -1020,7 +931,7 @@ std::string CFGEmitter::emitSelectorWord(const Expression* expr) {
         }
         return wordTemp;
     }
-    
+
     // Convert floating point to word
     std::string wordTemp = builder_.newTemp();
     if (exprType == BaseType::DOUBLE) {
@@ -1028,39 +939,40 @@ std::string CFGEmitter::emitSelectorWord(const Expression* expr) {
     } else if (exprType == BaseType::SINGLE) {
         builder_.emitConvert(wordTemp, "w", "stosi", selector);
     } else {
-        // Default: copy as word
-        builder_.emitRaw("    " + wordTemp + " =w copy " + selector + "\n");
+        // Default: truncate / copy as word
+        builder_.emitTrunc(wordTemp, "w", selector);
     }
-    
+
     return wordTemp;
 }
 
 void CFGEmitter::emitPushReturnBlock(int returnBlockId) {
     builder_.emitComment("Push return block " + std::to_string(returnBlockId) + " onto GOSUB return stack");
-    
+
     // 1. Load current stack pointer
     std::string spTemp = builder_.newTemp();
-    builder_.emitRaw("    " + spTemp + " =w loadw $gosub_return_sp\n");
-    
+    builder_.emitLoad(spTemp, "w", "$gosub_return_sp");
+
     // 2. Convert SP to long for address calculation
     std::string spLong = builder_.newTemp();
-    builder_.emitRaw("    " + spLong + " =l extsw " + spTemp + "\n");
-    
-    // 3. Calculate byte offset: SP * 4 (word size)
+    builder_.emitExtend(spLong, "l", "extsw", spTemp);
+
+    // 3. Calculate byte offset: SP * GOSUB_ENTRY_BYTES
     std::string byteOffset = builder_.newTemp();
-    builder_.emitRaw("    " + byteOffset + " =l mul " + spLong + ", 4\n");
-    
+    builder_.emitBinary(byteOffset, "l", "mul", spLong,
+                        std::to_string(GOSUB_ENTRY_BYTES));
+
     // 4. Calculate stack address: $gosub_return_stack + offset
     std::string stackAddr = builder_.newTemp();
-    builder_.emitRaw("    " + stackAddr + " =l add $gosub_return_stack, " + byteOffset + "\n");
-    
+    builder_.emitBinary(stackAddr, "l", "add", "$gosub_return_stack", byteOffset);
+
     // 5. Store return block ID at that address
-    builder_.emitRaw("    storew " + std::to_string(returnBlockId) + ", " + stackAddr + "\n");
-    
+    builder_.emitStore("w", std::to_string(returnBlockId), stackAddr);
+
     // 6. Increment stack pointer
     std::string newSp = builder_.newTemp();
-    builder_.emitRaw("    " + newSp + " =w add " + spTemp + ", 1\n");
-    builder_.emitRaw("    storew " + newSp + ", $gosub_return_sp\n");
+    builder_.emitBinary(newSp, "w", "add", spTemp, "1");
+    builder_.emitStore("w", newSp, "$gosub_return_sp");
 }
 
 void CFGEmitter::emitOnGotoTerminator(const OnGotoStatement* stmt, 

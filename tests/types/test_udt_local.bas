@@ -1,0 +1,14 @@
+10 REM Test: LOCAL UDT variables inside SUB
+20 TYPE Point
+30   X AS INTEGER
+40   Y AS INTEGER
+50 END TYPE
+60 CALL TestLocalUDT()
+70 END
+80 SUB TestLocalUDT()
+90   LOCAL P AS Point
+100   P.X = 42
+110   P.Y = 99
+120   PRINT "P.X = "; P.X; ", P.Y = "; P.Y
+130   IF P.X = 42 AND P.Y = 99 THEN PRINT "PASS" ELSE PRINT "FAIL"
+140 END SUB

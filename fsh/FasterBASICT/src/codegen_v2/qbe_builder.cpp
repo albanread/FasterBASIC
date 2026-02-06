@@ -96,20 +96,41 @@ void QBEBuilder::emitCompare(const std::string& dest, const std::string& type,
                             const std::string& op, const std::string& lhs,
                             const std::string& rhs) {
     std::ostringstream oss;
-    // For floating point types (s, d), use 'clt' not 'cslt'
-    // For integer types (w, l), use 'cslt'
+    // Build the full QBE comparison mnemonic.
+    //
+    // Callers pass a *base* comparison name.  Accepted forms:
+    //   - Already-prefixed signed-integer ops: "slt", "sle", "sgt", "sge"
+    //   - Bare names that work for both int and float: "eq", "ne"
+    //   - Bare names for ordering: "lt", "le", "gt", "ge"
+    //
+    // For integer types (w, l) we need signed prefix:  csltw, cslew …
+    // For float types  (s, d) we need bare ordering:   cltd,  cled  …
+    //
+    // Strategy: normalise the op to its bare root (strip leading 's' when it
+    // is a signed-integer prefix, i.e. one of slt/sle/sgt/sge), then
+    // re-prefix according to the operand type.
+
+    // Normalise: strip leading 's' only when the op is a well-known signed
+    // integer comparison (slt, sle, sgt, sge).  This avoids accidentally
+    // stripping the 's' from unrelated ops.
+    std::string baseOp = op;
+    if (baseOp == "slt" || baseOp == "sle" || baseOp == "sgt" || baseOp == "sge") {
+        baseOp = baseOp.substr(1);  // "lt", "le", "gt", "ge"
+    }
+
     std::string fullOp;
     if (type == "s" || type == "d") {
-        // Floating point: remove 's' prefix if present
-        if (op.length() > 0 && op[0] == 's') {
-            fullOp = "c" + op.substr(1) + type;
-        } else {
-            fullOp = "c" + op + type;
-        }
+        // Floating-point: c<op><type>  e.g. cltd, ceqs
+        fullOp = "c" + baseOp + type;
     } else {
-        // Integer: keep as is
-        fullOp = "c" + op + type;
+        // Integer: cs<op><type>  e.g. csltw, cslel  (except eq/ne which are c<op><type>)
+        if (baseOp == "eq" || baseOp == "ne") {
+            fullOp = "c" + baseOp + type;
+        } else {
+            fullOp = "cs" + baseOp + type;
+        }
     }
+
     oss << dest << " =w " << fullOp << " " << lhs << ", " << rhs;
     emitInstruction(oss.str());
 }
@@ -137,19 +158,31 @@ void QBEBuilder::emitStore(const std::string& type, const std::string& value,
     emitInstruction(oss.str());
 }
 
-void QBEBuilder::emitAlloc(const std::string& dest, int size) {
-    std::ostringstream oss;
-    oss << dest << " =l alloc";
-    
-    // Choose alloc4, alloc8, or alloc16 based on size
-    if (size <= 4) {
-        oss << "4 " << size;
-    } else if (size <= 8) {
-        oss << "8 " << size;
-    } else {
-        oss << "16 " << size;
+void QBEBuilder::emitAlloc(const std::string& dest, int size, int alignment) {
+    // In QBE the suffix on alloc (4, 8, 16) specifies the *alignment* of the
+    // allocation, and the operand is the number of bytes to reserve on the
+    // stack.
+    //
+    // When the caller supplies an explicit alignment we use it directly.
+    // When alignment == 0 (default / legacy) we pick from the requested size
+    // using a simple heuristic that matches the most common cases.
+    int align = alignment;
+    if (align <= 0) {
+        // Legacy heuristic: choose alignment from size
+        if (size <= 4)       align = 4;
+        else if (size <= 8)  align = 8;
+        else                 align = 8;  // 8-byte alignment is sufficient for
+                                         // most data; use 16 only when asked
     }
-    
+
+    // Clamp to one of the three QBE alloc variants
+    int allocSuffix;
+    if (align <= 4)       allocSuffix = 4;
+    else if (align <= 8)  allocSuffix = 8;
+    else                  allocSuffix = 16;
+
+    std::ostringstream oss;
+    oss << dest << " =l alloc" << allocSuffix << " " << size;
     emitInstruction(oss.str());
 }
 

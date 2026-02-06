@@ -247,6 +247,57 @@ private:
      */
     std::string getEdgeTypeName(FasterBASIC::EdgeType edgeType);
     
+    // === Decomposed Terminator Helpers ===
+    
+    /**
+     * Scan a block's statements and extract control-flow-relevant statements.
+     * Populates the four out-parameters with the first matching statement of
+     * each kind found in the block (or nullptr if absent).
+     */
+    void scanControlFlowStatements(
+        const FasterBASIC::BasicBlock* block,
+        const FasterBASIC::ReturnStatement*& outReturn,
+        const FasterBASIC::OnGotoStatement*& outOnGoto,
+        const FasterBASIC::OnGosubStatement*& outOnGosub,
+        const FasterBASIC::OnCallStatement*& outOnCall);
+    
+    /**
+     * Handle a RETURN statement found inside a block: evaluate the return
+     * expression (if any) and store it in the function's implicit return
+     * variable.
+     */
+    void emitReturnStatementValue(const FasterBASIC::ReturnStatement* returnStmt);
+    
+    /**
+     * Emit the terminator for an exit block (no out-edges).
+     * For main this emits `ret 0`; for functions it loads and returns the
+     * implicit return variable; for SUBs it emits a bare `ret`.
+     */
+    void emitExitBlockTerminator();
+    
+    /**
+     * Emit the GOSUB call pattern: push the return-point block ID onto
+     * the GOSUB return stack, then jump to the subroutine entry block.
+     */
+    void emitGosubCallEdge(const std::vector<FasterBASIC::CFGEdge>& outEdges,
+                           const FasterBASIC::BasicBlock* block);
+    
+    /**
+     * Emit the RETURN-from-GOSUB dispatch: pop the return stack and
+     * branch to the correct return-point block via a comparison chain.
+     */
+    void emitGosubReturnEdge(const FasterBASIC::BasicBlock* block,
+                             const FasterBASIC::ControlFlowGraph* cfg);
+    
+    /**
+     * Emit terminators for simple edge types (FALLTHROUGH, JUMP,
+     * CONDITIONAL, EXCEPTION, and generic multi-way).
+     */
+    void emitSimpleEdgeTerminator(
+        const FasterBASIC::BasicBlock* block,
+        const std::vector<FasterBASIC::CFGEdge>& outEdges,
+        const FasterBASIC::ReturnStatement* returnStmt);
+
     // === ON GOTO/GOSUB Helpers ===
     
     /**

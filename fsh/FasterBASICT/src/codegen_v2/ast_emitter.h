@@ -316,6 +316,14 @@ private:
     std::string emitArrayElementAddress(const std::string& arrayName, 
                                         const std::vector<FasterBASIC::ExpressionPtr>& indices);
     
+    // === Helper: recursive UDT field-by-field copy with proper string refcounting ===
+    // Copies all fields from sourceAddr to targetAddr for the given UDT definition.
+    // Handles string fields with retain/release and nested UDTs recursively.
+    void emitUDTCopyFieldByField(const std::string& sourceAddr,
+                                 const std::string& targetAddr,
+                                 const FasterBASIC::TypeSymbol& udtDef,
+                                 const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap);
+    
     // === Helper: normalize FOR loop variable names ===
     // If varName references a FOR loop variable, returns it with the correct integer suffix
     // Otherwise returns varName unchanged

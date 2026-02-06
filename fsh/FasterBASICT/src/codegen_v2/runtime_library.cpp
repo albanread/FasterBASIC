@@ -1,4 +1,5 @@
 #include "runtime_library.h"
+#include "type_manager.h"
 
 namespace fbc {
 
@@ -90,7 +91,7 @@ std::string RuntimeLibrary::emitMid(const std::string& stringPtr, const std::str
         // MID$(s$, start) - to end of string
         // Pass very large length to get remainder
         return emitRuntimeCall("basic_mid", "l", 
-            "l " + stringPtr + ", w " + start + ", w 999999");
+            "l " + stringPtr + ", w " + start + ", w " + std::to_string(MID_TO_END_SENTINEL));
     } else {
         // MID$(s$, start, length)
         return emitRuntimeCall("basic_mid", "l", 

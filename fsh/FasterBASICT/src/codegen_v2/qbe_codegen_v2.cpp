@@ -129,20 +129,17 @@ std::string QBECodeGeneratorV2::generateFunction(const FunctionSymbol* funcSymbo
     builder_->emitFunctionStart(mangledName.substr(1), returnType, params);
     builder_->emitComment("TRACE: Started FUNCTION " + funcSymbol->name + " with " + std::to_string(cfg->parameters.size()) + " parameters");
     
-    // Enter function scope with parameters
+    // Enter function scope with RAII guard (ensures exitFunctionScope on any exit path)
     for (size_t i = 0; i < cfg->parameters.size(); ++i) {
         builder_->emitComment("  FUNCTION param[" + std::to_string(i) + "]: " + cfg->parameters[i]);
     }
-    symbolMapper_->enterFunctionScope(funcSymbol->name, cfg->parameters);
+    FunctionScopeGuard scopeGuard(*symbolMapper_, funcSymbol->name, cfg->parameters);
     
     // Register SHARED variables from this function
     registerSharedVariables(cfg, symbolMapper_.get());
     
     // Emit CFG
     cfgEmitter_->emitCFG(cfg, funcSymbol->name);
-    
-    // Exit function scope
-    symbolMapper_->exitFunctionScope();
     
     // End function
     builder_->emitFunctionEnd();
@@ -181,20 +178,17 @@ std::string QBECodeGeneratorV2::generateSub(const FunctionSymbol* subSymbol,
     builder_->emitFunctionStart(mangledName.substr(1), returnType, params);
     builder_->emitComment("TRACE: Started SUB " + subSymbol->name + " with " + std::to_string(cfg->parameters.size()) + " parameters");
     
-    // Enter function scope with parameters
+    // Enter function scope with RAII guard (ensures exitFunctionScope on any exit path)
     for (size_t i = 0; i < cfg->parameters.size(); ++i) {
         builder_->emitComment("  SUB param[" + std::to_string(i) + "]: " + cfg->parameters[i]);
     }
-    symbolMapper_->enterFunctionScope(subSymbol->name, cfg->parameters);
+    FunctionScopeGuard scopeGuard(*symbolMapper_, subSymbol->name, cfg->parameters);
     
     // Register SHARED variables from this SUB
     registerSharedVariables(cfg, symbolMapper_.get());
     
     // Emit CFG
     cfgEmitter_->emitCFG(cfg, subSymbol->name);
-    
-    // Exit function scope
-    symbolMapper_->exitFunctionScope();
     
     // End function
     builder_->emitFunctionEnd();
@@ -252,14 +246,15 @@ void QBECodeGeneratorV2::emitRuntimeDeclarations() {
 void QBECodeGeneratorV2::emitGosubReturnStack() {
     builder_->emitBlankLine();
     builder_->emitComment("=== GOSUB Return Stack ===");
-    builder_->emitComment("Stack for GOSUB/RETURN statements (16 levels deep)");
+    builder_->emitComment("Stack for GOSUB/RETURN statements (" +
+                          std::to_string(GOSUB_STACK_DEPTH) + " levels deep)");
     builder_->emitBlankLine();
     
-    // Emit return stack: 16-word array to hold return block IDs
+    // Emit return stack: GOSUB_STACK_DEPTH-word array to hold return block IDs
     builder_->emitRaw("export data $gosub_return_stack = { ");
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < GOSUB_STACK_DEPTH; i++) {
         builder_->emitRaw("w 0");
-        if (i < 15) {
+        if (i < GOSUB_STACK_DEPTH - 1) {
             builder_->emitRaw(", ");
         }
     }
@@ -281,16 +276,13 @@ void QBECodeGeneratorV2::generateMainFunction(const ControlFlowGraph* cfg) {
     // Start main function
     builder_->emitFunctionStart("main", "w", "");
     
-    // Enter global scope
-    symbolMapper_->enterFunctionScope("main");
+    // Enter global scope with RAII guard
+    FunctionScopeGuard scopeGuard(*symbolMapper_, "main");
     
     // Emit CFG (local variable allocations will be inserted at entry block)
     cfgEmitter_->emitCFG(cfg, "main");
     
-    // Exit global scope
-    symbolMapper_->exitFunctionScope();
-    
-    // End main function
+    // End main function (scope guard exits function scope automatically)
     builder_->emitFunctionEnd();
 }
 

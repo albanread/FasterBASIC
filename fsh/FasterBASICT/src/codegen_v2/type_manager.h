@@ -2,12 +2,29 @@
 #define TYPE_MANAGER_H
 
 #include <string>
+#include <cstdint>
 #include "../fasterbasic_semantic.h"
 
 namespace fbc {
 
 // Type alias for BaseType from FasterBASIC semantic analyzer
 using BasicType = FasterBASIC::BaseType;
+
+// =============================================================================
+// Named Constants (previously magic numbers scattered across codegen)
+// =============================================================================
+
+/** Maximum depth for GOSUB return stack (number of nested GOSUBs supported) */
+constexpr int GOSUB_STACK_DEPTH = 16;
+
+/** Size of each GOSUB return stack entry in bytes (stores a block ID as w/int32) */
+constexpr int GOSUB_ENTRY_BYTES = 4;
+
+/** Sentinel length value for MID$() when no length is specified ("to end of string") */
+constexpr int MID_TO_END_SENTINEL = INT32_MAX;
+
+/** Default maximum number of QBE local variables per function */
+constexpr int MAX_LOCAL_VARIABLES = 200;
 
 /**
  * TypeManager - BASIC to QBE type mapping and conversions
@@ -59,6 +76,15 @@ public:
      * @return Size in bytes (4 for INTEGER/SINGLE, 8 for DOUBLE/LONG/STRING)
      */
     int getTypeSize(BasicType basicType) const;
+    
+    /**
+     * Get the natural alignment in bytes for a BASIC type.
+     * Used to select the correct QBE alloc variant (alloc4, alloc8, alloc16)
+     * and to compute padded UDT field offsets.
+     * @param basicType BASIC type
+     * @return Alignment in bytes (1, 2, 4, or 8)
+     */
+    int getTypeAlignment(BasicType basicType) const;
     
     /**
      * Get the size in bytes for a UDT (User-Defined Type)
@@ -170,6 +196,30 @@ public:
      * @return Default value string (e.g., "0" for INTEGER, "s_0.0" for SINGLE)
      */
     std::string getDefaultValue(BasicType basicType) const;
+
+    // === Return Variable Name Helpers ===
+    
+    /**
+     * Get the normalized suffix for a function return variable, based on its
+     * return type. Used by FUNCTION codegen to build the implicit return
+     * variable name (e.g., "MyFunc" + "_DOUBLE" -> "MyFunc_DOUBLE").
+     *
+     * @param returnType The BASIC return type of the function
+     * @return Suffix string (e.g., "_INT", "_DOUBLE", "_STRING"), or "" for
+     *         types that have no conventional suffix (VOID, UNKNOWN, etc.)
+     */
+    std::string getReturnVariableSuffix(BasicType returnType) const;
+    
+    /**
+     * Build the full normalized return variable name for a FUNCTION.
+     * Convenience wrapper: returns funcName + getReturnVariableSuffix(returnType).
+     *
+     * @param funcName  The BASIC function name (e.g., "Add")
+     * @param returnType The function's return type
+     * @return Full return variable name (e.g., "Add_INT")
+     */
+    std::string getReturnVariableName(const std::string& funcName,
+                                      BasicType returnType) const;
 
 private:
     // Internal helper: get QBE type character

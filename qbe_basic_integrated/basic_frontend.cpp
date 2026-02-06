@@ -28,14 +28,30 @@ FILE* compile_basic_to_il(const char *basic_path) {
     
     size_t len = strlen(qbe_il);
     
-    /* Create FILE* from memory buffer using fmemopen */
-    FILE *mem_file = fmemopen(qbe_il, len, "r");
+    /* Create a FILE* backed by its own internal buffer (buf=NULL).
+     * fmemopen with a NULL buffer allocates and owns its own memory,
+     * which is freed automatically when fclose() is called.
+     * We write the compiled IL into it, rewind, then free the original. */
+    FILE *mem_file = fmemopen(NULL, len + 1, "w+");
     if (!mem_file) {
         free(qbe_il);
         return NULL;
     }
     
-    /* Note: qbe_il memory is now owned by fmemopen */
+    /* Write the compiled IL into the fmemopen-managed buffer */
+    size_t written = fwrite(qbe_il, 1, len, mem_file);
+    
+    /* Free the original compiler output – mem_file has its own copy now */
+    free(qbe_il);
+    
+    if (written != len) {
+        fclose(mem_file);
+        return NULL;
+    }
+    
+    /* Rewind so the caller reads from the beginning */
+    rewind(mem_file);
+    
     return mem_file;
 }
 

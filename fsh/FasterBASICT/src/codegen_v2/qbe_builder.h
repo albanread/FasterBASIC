@@ -130,11 +130,20 @@ public:
                   const std::string& addr);
     
     /**
-     * Emit an alloc4/alloc8/alloc16 instruction
-     * @param dest Destination (receives pointer)
-     * @param size Size in bytes
+     * Emit an alloc4/alloc8/alloc16 instruction.
+     *
+     * In QBE the numeric suffix on alloc specifies the **alignment** of the
+     * allocation, not a size threshold.  The operand is the number of bytes
+     * to allocate.
+     *
+     * @param dest      Destination temporary (receives pointer, always 'l')
+     * @param size      Number of bytes to allocate
+     * @param alignment Required alignment in bytes (must be 4, 8, or 16;
+     *                  values <= 4 use alloc4, <= 8 use alloc8, else alloc16).
+     *                  When omitted, the alignment is chosen from the size
+     *                  using a simple heuristic (legacy behaviour).
      */
-    void emitAlloc(const std::string& dest, int size);
+    void emitAlloc(const std::string& dest, int size, int alignment = 0);
 
     // === Control Flow ===
     

@@ -4,7 +4,6 @@
 #include <sstream>
 #include <cmath>
 #include <iostream>
-#include <fstream>
 
 namespace fbc {
 
@@ -400,12 +399,22 @@ std::string ASTEmitter::emitMemberAccessExpression(const MemberAccessExpression*
         std::string mangledName = symbolMapper_.mangleVariableName(varName, varSymbol->scope.isGlobal());
         basePtr = builder_.newTemp();
         
-        if (varSymbol->scope.isGlobal()) {
-            // Global UDT - get address (mangledName already includes $ prefix)
+        // Check if this is a UDT parameter (passed by pointer/reference)
+        // In that case, the stack slot contains a POINTER to the struct, not the struct itself.
+        // We need an extra level of indirection: load the pointer from the stack slot first.
+        bool isUDTParameter = (symbolMapper_.inFunctionScope() && symbolMapper_.isParameter(varName) &&
+                               varSymbol->typeDesc.baseType == BaseType::USER_DEFINED);
+        
+        if (isUDTParameter) {
+            // UDT parameter: stack slot holds a pointer TO the actual struct
+            builder_.emitComment("Load UDT parameter pointer (pass-by-ref): " + varName);
+            builder_.emitLoad(basePtr, "l", mangledName);
+        } else if (varSymbol->scope.isGlobal()) {
+            // Global UDT - address IS the data (mangledName already includes $ prefix)
             builder_.emitComment("Load address of global UDT: " + varName);
             builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
         } else {
-            // Local UDT - get address from stack (mangledName already includes % prefix)
+            // Local UDT - address IS the data on stack (mangledName already includes % prefix)
             builder_.emitComment("Load address of local UDT: " + varName);
             builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
         }
@@ -452,7 +461,11 @@ std::string ASTEmitter::emitMemberAccessExpression(const MemberAccessExpression*
             builder_.emitComment("ERROR: Member access on non-UDT variable: " + varName);
             return "0";
         }
+        // Try typeName first, fall back to typeDesc.udtName (needed for UDT parameters)
         udtTypeName = varSymbol->typeName;
+        if (udtTypeName.empty()) {
+            udtTypeName = varSymbol->typeDesc.udtName;
+        }
     } else if (expr->object->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
         // For array elements, re-lookup the array to get UDT name
         const auto& symbolTable2 = semantic_.getSymbolTable();
@@ -1023,10 +1036,7 @@ std::string ASTEmitter::emitFunctionCall(const FunctionCallExpression* expr) {
         // User-defined function call
         const auto& funcSymbol = funcIt->second;
         
-        // Debug output
-        std::ofstream debugFile("/tmp/func_call_debug.txt", std::ios::app);
-        debugFile << "[DEBUG] Function call: funcName='" << funcName << "'" << std::endl;
-        debugFile.close();
+        builder_.emitComment("User-defined function call: " + funcName);
         
         // Evaluate arguments
         std::vector<std::string> argTemps;
@@ -1516,13 +1526,26 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
             // Get base address
             std::string mangledName = symbolMapper_.mangleVariableName(stmt->variable, varSymbol->scope.isGlobal());
             basePtr = builder_.newTemp();
-            if (varSymbol->scope.isGlobal()) {
+            
+            // Check if this is a UDT parameter (passed by pointer/reference)
+            bool isUDTParam = (symbolMapper_.inFunctionScope() && symbolMapper_.isParameter(stmt->variable) &&
+                               varSymbol->typeDesc.baseType == BaseType::USER_DEFINED);
+            
+            if (isUDTParam) {
+                // UDT parameter: stack slot holds a pointer TO the actual struct
+                builder_.emitComment("Load UDT parameter pointer (pass-by-ref): " + stmt->variable);
+                builder_.emitLoad(basePtr, "l", mangledName);
+            } else if (varSymbol->scope.isGlobal()) {
                 builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
             } else {
                 builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
             }
             
+            // Get UDT type name - try typeName first, fall back to typeDesc.udtName
             std::string currentUDTName = varSymbol->typeName;
+            if (currentUDTName.empty()) {
+                currentUDTName = varSymbol->typeDesc.udtName;
+            }
             
             // Traverse all but the last member
             for (size_t i = 0; i < stmt->memberChain.size() - 1; ++i) {
@@ -1630,7 +1653,15 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
             std::string mangledName = symbolMapper_.mangleVariableName(stmt->variable, varSymbol->scope.isGlobal());
             basePtr = builder_.newTemp();
             
-            if (varSymbol->scope.isGlobal()) {
+            // Check if this is a UDT parameter (passed by pointer/reference)
+            bool isUDTParam = (symbolMapper_.inFunctionScope() && symbolMapper_.isParameter(stmt->variable) &&
+                               varSymbol->typeDesc.baseType == BaseType::USER_DEFINED);
+            
+            if (isUDTParam) {
+                // UDT parameter: stack slot holds a pointer TO the actual struct
+                builder_.emitComment("Load UDT parameter pointer (pass-by-ref): " + stmt->variable);
+                builder_.emitLoad(basePtr, "l", mangledName);
+            } else if (varSymbol->scope.isGlobal()) {
                 // Global UDT - get address (mangledName already includes $ prefix)
                 builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
             } else {
@@ -1638,7 +1669,11 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
                 builder_.emitRaw("    " + basePtr + " =l copy " + mangledName);
             }
             
+            // Get UDT type name - try typeName first, fall back to typeDesc.udtName
             udtTypeName = varSymbol->typeName;
+            if (udtTypeName.empty()) {
+                udtTypeName = varSymbol->typeDesc.udtName;
+            }
         }
         
         // Look up the UDT definition
@@ -1731,6 +1766,9 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
                 }
                 
                 std::string targetUDTName = targetVarSymbol->typeName;
+                if (targetUDTName.empty()) {
+                    targetUDTName = targetVarSymbol->typeDesc.udtName;
+                }
                 
                 // Look up the UDT definition
                 const auto& symbolTable = semantic_.getSymbolTable();
@@ -1745,9 +1783,7 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
                 // Get target UDT base address
                 std::string targetAddr = getVariableAddress(stmt->variable);
                 
-                // Get source UDT address
-                // If source is a simple variable, get its address
-                // If source is a member access, emit the member access expression
+                // Get source UDT address based on source expression type
                 std::string sourceAddr;
                 
                 if (stmt->value->getType() == ASTNodeType::EXPR_VARIABLE) {
@@ -1755,152 +1791,22 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
                     const auto* varExpr = static_cast<const VariableExpression*>(stmt->value.get());
                     sourceAddr = getVariableAddress(varExpr->name);
                 } else if (stmt->value->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
-                    // Member access: Outer.Inner (returns a UDT)
-                    // For now, we'll handle this by emitting the expression
-                    // which should return the address of the UDT
-                    builder_.emitComment("ERROR: UDT assignment from member access not yet supported");
-                    return;
+                    // Member access: Container.Inner (returns address for UDT fields)
+                    sourceAddr = emitMemberAccessExpression(
+                        static_cast<const MemberAccessExpression*>(stmt->value.get()));
                 } else if (stmt->value->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
                     // Array element: People(i) (where People is array of UDTs)
-                    builder_.emitComment("ERROR: UDT assignment from array element not yet supported");
-                    return;
+                    const auto* arrExpr = static_cast<const ArrayAccessExpression*>(stmt->value.get());
+                    sourceAddr = emitArrayElementAddress(arrExpr->name, arrExpr->indices);
                 } else {
                     builder_.emitComment("ERROR: Unsupported UDT source expression type");
                     return;
                 }
                 
-                // Copy field-by-field to handle string refcounting properly
+                // Copy field-by-field using recursive helper (handles strings
+                // with proper refcounting at any nesting depth)
                 builder_.emitComment("Copying UDT fields with proper string handling");
-                
-                int64_t offset = 0;
-                for (size_t i = 0; i < udtDef.fields.size(); ++i) {
-                    const auto& field = udtDef.fields[i];
-                    BaseType fieldType = field.typeDesc.baseType;
-                    
-                    builder_.emitComment("Copy field: " + field.name + " (offset " + std::to_string(offset) + ")");
-                    
-                    // Calculate field address in source and target
-                    std::string sourceFieldAddr = builder_.newTemp();
-                    std::string targetFieldAddr = builder_.newTemp();
-                    
-                    if (offset > 0) {
-                        builder_.emitBinary(sourceFieldAddr, "l", "add", sourceAddr, std::to_string(offset));
-                        builder_.emitBinary(targetFieldAddr, "l", "add", targetAddr, std::to_string(offset));
-                    } else {
-                        builder_.emitRaw("    " + sourceFieldAddr + " =l copy " + sourceAddr);
-                        builder_.emitRaw("    " + targetFieldAddr + " =l copy " + targetAddr);
-                    }
-                    
-                    // Load from source
-                    std::string fieldValue = builder_.newTemp();
-                    std::string qbeType = typeManager_.getQBEType(fieldType);
-                    
-                    if (fieldType == BaseType::STRING) {
-                        // String field - load pointer, retain, release old, store new
-                        builder_.emitLoad(fieldValue, "l", sourceFieldAddr);
-                        
-                        // Load old target string pointer
-                        std::string oldPtr = builder_.newTemp();
-                        builder_.emitLoad(oldPtr, "l", targetFieldAddr);
-                        
-                        // Retain source string (increment refcount)
-                        std::string retainedPtr = builder_.newTemp();
-                        builder_.emitCall(retainedPtr, "l", "string_retain", "l " + fieldValue);
-                        
-                        // Store new pointer to target
-                        builder_.emitStore("l", retainedPtr, targetFieldAddr);
-                        
-                        // Release old target string (decrement refcount, free if 0)
-                        builder_.emitCall("", "", "string_release", "l " + oldPtr);
-                    } else if (fieldType == BaseType::USER_DEFINED) {
-                        // Nested UDT field - recursively copy field-by-field to handle strings properly
-                        auto nestedIt = symbolTable.types.find(field.typeDesc.udtName);
-                        if (nestedIt != symbolTable.types.end()) {
-                            const auto& nestedUDT = nestedIt->second;
-                            builder_.emitComment("Nested UDT copy: " + field.name + " (type " + field.typeDesc.udtName + ")");
-                            
-                            // Recursively copy each field of the nested UDT
-                            int64_t nestedOffset = 0;
-                            for (size_t j = 0; j < nestedUDT.fields.size(); ++j) {
-                                const auto& nestedField = nestedUDT.fields[j];
-                                BaseType nestedFieldType = nestedField.typeDesc.baseType;
-                                
-                                builder_.emitComment("  Nested field: " + nestedField.name + " (offset " + std::to_string(nestedOffset) + ")");
-                                
-                                // Calculate nested field addresses
-                                std::string nestedSourceAddr = builder_.newTemp();
-                                std::string nestedTargetAddr = builder_.newTemp();
-                                
-                                if (nestedOffset > 0) {
-                                    builder_.emitBinary(nestedSourceAddr, "l", "add", sourceFieldAddr, std::to_string(nestedOffset));
-                                    builder_.emitBinary(nestedTargetAddr, "l", "add", targetFieldAddr, std::to_string(nestedOffset));
-                                } else {
-                                    builder_.emitRaw("    " + nestedSourceAddr + " =l copy " + sourceFieldAddr);
-                                    builder_.emitRaw("    " + nestedTargetAddr + " =l copy " + targetFieldAddr);
-                                }
-                                
-                                if (nestedFieldType == BaseType::STRING) {
-                                    // String field in nested UDT - use proper refcounting
-                                    std::string nestedValue = builder_.newTemp();
-                                    builder_.emitLoad(nestedValue, "l", nestedSourceAddr);
-                                    
-                                    // Load old target string
-                                    std::string nestedOldPtr = builder_.newTemp();
-                                    builder_.emitLoad(nestedOldPtr, "l", nestedTargetAddr);
-                                    
-                                    // Retain source string
-                                    std::string nestedRetained = builder_.newTemp();
-                                    builder_.emitCall(nestedRetained, "l", "string_retain", "l " + nestedValue);
-                                    
-                                    // Store new pointer
-                                    builder_.emitStore("l", nestedRetained, nestedTargetAddr);
-                                    
-                                    // Release old string
-                                    builder_.emitCall("", "", "string_release", "l " + nestedOldPtr);
-                                } else if (nestedFieldType == BaseType::USER_DEFINED) {
-                                    // TODO: Handle deeply nested UDTs (for now, use memcpy as fallback)
-                                    auto deepNestedIt = symbolTable.types.find(nestedField.typeDesc.udtName);
-                                    if (deepNestedIt != symbolTable.types.end()) {
-                                        int64_t deepSize = typeManager_.getUDTSizeRecursive(deepNestedIt->second, symbolTable.types);
-                                        builder_.emitComment("  Deep nested UDT - using memcpy (size " + std::to_string(deepSize) + ")");
-                                        builder_.emitCall("", "", "memcpy", 
-                                                        "l " + nestedTargetAddr + ", l " + nestedSourceAddr + ", l " + std::to_string(deepSize));
-                                    }
-                                } else {
-                                    // Scalar field - simple load/store
-                                    std::string nestedValue = builder_.newTemp();
-                                    std::string nestedQbeType = typeManager_.getQBEType(nestedFieldType);
-                                    builder_.emitLoad(nestedValue, nestedQbeType, nestedSourceAddr);
-                                    builder_.emitStore(nestedQbeType, nestedValue, nestedTargetAddr);
-                                }
-                                
-                                // Update nested offset
-                                if (nestedFieldType == BaseType::USER_DEFINED) {
-                                    auto deepNestedIt = symbolTable.types.find(nestedField.typeDesc.udtName);
-                                    if (deepNestedIt != symbolTable.types.end()) {
-                                        nestedOffset += typeManager_.getUDTSizeRecursive(deepNestedIt->second, symbolTable.types);
-                                    }
-                                } else {
-                                    nestedOffset += typeManager_.getTypeSize(nestedFieldType);
-                                }
-                            }
-                        }
-                    } else {
-                        // Scalar field (INTEGER, DOUBLE, etc.) - simple load/store
-                        builder_.emitLoad(fieldValue, qbeType, sourceFieldAddr);
-                        builder_.emitStore(qbeType, fieldValue, targetFieldAddr);
-                    }
-                    
-                    // Update offset for next field
-                    if (fieldType == BaseType::USER_DEFINED) {
-                        auto nestedIt = symbolTable.types.find(field.typeDesc.udtName);
-                        if (nestedIt != symbolTable.types.end()) {
-                            offset += typeManager_.getUDTSizeRecursive(nestedIt->second, symbolTable.types);
-                        }
-                    } else {
-                        offset += typeManager_.getTypeSize(fieldType);
-                    }
-                }
+                emitUDTCopyFieldByField(sourceAddr, targetAddr, udtDef, symbolTable.types);
                 
                 builder_.emitComment("End UDT-to-UDT assignment");
                 return;
@@ -2071,38 +1977,8 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
             return;
         }
         
-        const auto& funcSymbol = funcIt->second;
-        BaseType returnType = funcSymbol.returnTypeDesc.baseType;
-        
-        // Build normalized return variable name
-        std::string returnVarName = currentFunc + "_DOUBLE"; // Default
-        switch (returnType) {
-            case BaseType::INTEGER:
-                returnVarName = currentFunc + "_INT";
-                break;
-            case BaseType::LONG:
-                returnVarName = currentFunc + "_LONG";
-                break;
-            case BaseType::SHORT:
-                returnVarName = currentFunc + "_SHORT";
-                break;
-            case BaseType::BYTE:
-                returnVarName = currentFunc + "_BYTE";
-                break;
-            case BaseType::SINGLE:
-                returnVarName = currentFunc + "_FLOAT";
-                break;
-            case BaseType::DOUBLE:
-                returnVarName = currentFunc + "_DOUBLE";
-                break;
-            case BaseType::STRING:
-            case BaseType::UNICODE:
-                returnVarName = currentFunc + "_STRING";
-                break;
-            default:
-                returnVarName = currentFunc;
-                break;
-        }
+        BaseType returnType = funcIt->second.returnTypeDesc.baseType;
+        std::string returnVarName = typeManager_.getReturnVariableName(currentFunc, returnType);
         
         // Store the value in the return variable
         storeVariable(returnVarName, value);
@@ -2140,6 +2016,15 @@ void ASTEmitter::emitLocalStatement(const LocalStatement* stmt) {
         BaseType varType = varSymbol->typeDesc.baseType;
         int64_t size = typeManager_.getTypeSize(varType);
         
+        // For UDT types, calculate actual struct size from field definitions
+        if (varType == BaseType::USER_DEFINED) {
+            const auto& symbolTable = semantic_.getSymbolTable();
+            auto udtIt = symbolTable.types.find(varSymbol->typeName);
+            if (udtIt != symbolTable.types.end()) {
+                size = typeManager_.getUDTSizeRecursive(udtIt->second, symbolTable.types);
+            }
+        }
+        
         if (size == 4) {
             builder_.emitRaw("    " + mangledName + " =l alloc4 4");
         } else if (size == 8) {
@@ -2152,6 +2037,11 @@ void ASTEmitter::emitLocalStatement(const LocalStatement* stmt) {
         if (typeManager_.isString(varType)) {
             // Strings initialized to null pointer
             builder_.emitRaw("    storel 0, " + mangledName);
+        } else if (varType == BaseType::USER_DEFINED && size > 8) {
+            // UDT types: zero-initialize all bytes using memset
+            builder_.emitComment("Zero-initialize UDT (" + std::to_string(size) + " bytes)");
+            builder_.emitCall("", "", "memset",
+                            "l " + mangledName + ", w 0, l " + std::to_string(size));
         } else if (size == 4) {
             builder_.emitRaw("    storew 0, " + mangledName);
         } else if (size == 8) {
@@ -2599,10 +2489,6 @@ void ASTEmitter::emitCallStatement(const CallStatement* stmt) {
 std::string ASTEmitter::normalizeForLoopVarName(const std::string& varName) const {
     if (varName.empty()) return varName;
     
-    // Debug
-    std::ofstream debugFile("/tmp/for_debug.txt", std::ios::app);
-    debugFile << "[DEBUG normalize] Input varName: '" << varName << "'" << std::endl;
-    
     // Strip any existing suffix to get base name (handle both character and text suffixes)
     std::string baseName = varName;
     
@@ -2631,23 +2517,16 @@ std::string ASTEmitter::normalizeForLoopVarName(const std::string& varName) cons
     }
     
     // Check if this base name is a FOR loop variable
-    debugFile << "[DEBUG normalize] Stripped baseName: '" << baseName << "'" << std::endl;
-    debugFile << "[DEBUG normalize] isForLoopVariable(baseName): " << semantic_.isForLoopVariable(baseName) << std::endl;
-    
     if (semantic_.isForLoopVariable(baseName)) {
         // This is a FOR loop variable - return base name with correct integer suffix
         // The suffix is determined by OPTION FOR setting
         // Use text suffix format (_INT or _LONG) to match parser mangling
         std::string intSuffix = semantic_.getForLoopIntegerSuffix();
         std::string result = baseName + intSuffix;
-        debugFile << "[DEBUG normalize] Normalized to: '" << result << "'" << std::endl;
-        debugFile.close();
         return result;
     }
     
     // Not a FOR loop variable - return original name unchanged
-    debugFile << "[DEBUG normalize] NOT a FOR var, returning unchanged: '" << varName << "'" << std::endl;
-    debugFile.close();
     return varName;
 }
 
@@ -2716,13 +2595,25 @@ std::string ASTEmitter::getVariableAddress(const std::string& varName) {
     bool isParameter = symbolMapper_.isParameter(lookupName);
     // OBJECT types (hashmaps, etc.) are always treated as globals to avoid stack issues
     bool isObjectType = (varSymbol.typeDesc.baseType == BaseType::OBJECT);
-    // UDT types are also always treated as globals (they're allocated as data sections)
-    bool isUDTType = (varSymbol.typeDesc.baseType == BaseType::USER_DEFINED);
+    // UDT types in main/global scope are treated as globals (they're allocated as data sections)
+    // Function-local UDTs are stack-allocated and should NOT be treated as globals
+    bool isUDTType = (varSymbol.typeDesc.baseType == BaseType::USER_DEFINED && varSymbol.scope.isGlobal());
     bool treatAsGlobal = (varSymbol.isGlobal || isShared || isParameter || isObjectType || isUDTType);
     
     // Mangle the variable name properly (strips type suffixes, sanitizes, etc.)
     // Use lookupName (with suffix stripped for FOR loop vars)
     std::string mangledName = symbolMapper_.mangleVariableName(lookupName, treatAsGlobal);
+    
+    // For UDT parameters passed by reference, the stack slot contains a POINTER
+    // to the actual struct. We need to load that pointer to get the real address.
+    if (varSymbol.typeDesc.baseType == BaseType::USER_DEFINED &&
+        symbolMapper_.inFunctionScope() && symbolMapper_.isParameter(lookupName) &&
+        !isShared) {
+        builder_.emitComment("Deref UDT parameter pointer: " + lookupName);
+        std::string ptrTemp = builder_.newTemp();
+        builder_.emitLoad(ptrTemp, "l", mangledName);
+        return ptrTemp;
+    }
     
     if (treatAsGlobal) {
         // Cache the address
@@ -2762,6 +2653,16 @@ std::string ASTEmitter::loadVariable(const std::string& varName) {
     
     BaseType varType = getVariableType(lookupName);
     std::string qbeType = typeManager_.getQBEType(varType);
+    
+    // UDT types are value types stored inline at the variable's address.
+    // "Loading" a UDT means getting its address (pointer), not reading from it.
+    // The address IS the value we pass around – member access and assignment
+    // functions all work with addresses.
+    if (varType == BaseType::USER_DEFINED) {
+        std::string addr = getVariableAddress(lookupName);
+        builder_.emitComment("UDT variable address (pass-by-ref): " + lookupName);
+        return addr;
+    }
     
     // Check if we're in a function and the variable is SHARED
     bool treatAsGlobal = varSymbol.isGlobal || 
@@ -3230,24 +3131,93 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
         case ASTNodeType::EXPR_MEMBER_ACCESS: {
             const auto* memberExpr = static_cast<const MemberAccessExpression*>(expr);
             
-            // Only support simple variable.field access for now
-            if (memberExpr->object->getType() != ASTNodeType::EXPR_VARIABLE) {
+            // Determine the UDT type name of the base object
+            std::string udtTypeName;
+            
+            if (memberExpr->object->getType() == ASTNodeType::EXPR_VARIABLE) {
+                // Simple variable: P.X
+                const auto* varExpr = static_cast<const VariableExpression*>(memberExpr->object.get());
+                std::string varName = varExpr->name;
+                
+                std::string currentFunc = symbolMapper_.getCurrentFunction();
+                const auto* varSymbol = semantic_.lookupVariableScoped(varName, currentFunc);
+                if (!varSymbol || varSymbol->typeDesc.baseType != BaseType::USER_DEFINED) {
+                    return BaseType::UNKNOWN;
+                }
+                udtTypeName = varSymbol->typeName;
+                
+            } else if (memberExpr->object->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+                // Array element: Points(0).X
+                const auto* arrExpr = static_cast<const ArrayAccessExpression*>(memberExpr->object.get());
+                const auto& symbolTable = semantic_.getSymbolTable();
+                auto arrIt = symbolTable.arrays.find(arrExpr->name);
+                if (arrIt == symbolTable.arrays.end() ||
+                    arrIt->second.elementTypeDesc.baseType != BaseType::USER_DEFINED) {
+                    return BaseType::UNKNOWN;
+                }
+                udtTypeName = arrIt->second.elementTypeDesc.udtName;
+                
+            } else if (memberExpr->object->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+                // Nested member access: O.Item.Value
+                // Walk to the root variable, then traverse the chain to find the
+                // UDT type of the intermediate member (the base of this expression).
+                
+                // Collect the chain of member names from root to the parent of this expr
+                std::vector<std::string> chainNames;
+                const Expression* cur = memberExpr->object.get();
+                while (cur->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+                    const auto* ma = static_cast<const MemberAccessExpression*>(cur);
+                    chainNames.push_back(ma->memberName);
+                    cur = ma->object.get();
+                }
+                // chainNames is in reverse order (innermost first)
+                std::reverse(chainNames.begin(), chainNames.end());
+                
+                // cur should now be the root variable or array access
+                std::string rootUDTName;
+                if (cur->getType() == ASTNodeType::EXPR_VARIABLE) {
+                    const auto* rootVar = static_cast<const VariableExpression*>(cur);
+                    std::string currentFunc = symbolMapper_.getCurrentFunction();
+                    const auto* rootSym = semantic_.lookupVariableScoped(rootVar->name, currentFunc);
+                    if (!rootSym || rootSym->typeDesc.baseType != BaseType::USER_DEFINED) {
+                        return BaseType::UNKNOWN;
+                    }
+                    rootUDTName = rootSym->typeName;
+                } else if (cur->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+                    const auto* arrExpr = static_cast<const ArrayAccessExpression*>(cur);
+                    const auto& symbolTable = semantic_.getSymbolTable();
+                    auto arrIt = symbolTable.arrays.find(arrExpr->name);
+                    if (arrIt == symbolTable.arrays.end() ||
+                        arrIt->second.elementTypeDesc.baseType != BaseType::USER_DEFINED) {
+                        return BaseType::UNKNOWN;
+                    }
+                    rootUDTName = arrIt->second.elementTypeDesc.udtName;
+                } else {
+                    return BaseType::UNKNOWN;
+                }
+                
+                // Traverse the chain to find the UDT type of the intermediate result
+                const auto& symbolTable = semantic_.getSymbolTable();
+                std::string currentUDT = rootUDTName;
+                for (const auto& name : chainNames) {
+                    auto it = symbolTable.types.find(currentUDT);
+                    if (it == symbolTable.types.end()) return BaseType::UNKNOWN;
+                    const auto* fld = it->second.findField(name);
+                    if (!fld) return BaseType::UNKNOWN;
+                    if (fld->typeDesc.baseType != BaseType::USER_DEFINED) {
+                        return BaseType::UNKNOWN; // intermediate must be UDT
+                    }
+                    currentUDT = fld->typeDesc.udtName;
+                }
+                udtTypeName = currentUDT;
+                
+            } else {
                 return BaseType::UNKNOWN;
             }
             
-            const auto* varExpr = static_cast<const VariableExpression*>(memberExpr->object.get());
-            std::string varName = varExpr->name;
-            
-            // Look up the variable to get its type
-            std::string currentFunc = symbolMapper_.getCurrentFunction();
-            const auto* varSymbol = semantic_.lookupVariableScoped(varName, currentFunc);
-            if (!varSymbol || varSymbol->typeDesc.baseType != BaseType::USER_DEFINED) {
-                return BaseType::UNKNOWN;
-            }
-            
-            // Look up the UDT definition
+            // Look up the UDT definition and find the field type
             const auto& symbolTable = semantic_.getSymbolTable();
-            auto udtIt = symbolTable.types.find(varSymbol->typeName);
+            auto udtIt = symbolTable.types.find(udtTypeName);
             if (udtIt == symbolTable.types.end()) {
                 return BaseType::UNKNOWN;
             }
@@ -3759,6 +3729,79 @@ std::string ASTEmitter::emitArrayElementAddress(const std::string& arrayName,
     builder_.emitBinary(elemAddr, "l", "add", dataPtr, byteOffset);
     
     return elemAddr;
+}
+
+// =============================================================================
+// emitUDTCopyFieldByField - Recursive UDT field-by-field copy
+// =============================================================================
+// Copies all fields from sourceAddr to targetAddr for the given UDT definition.
+// Handles string fields with retain/release and nested UDTs recursively to
+// any depth, ensuring proper memory management at every level.
+
+void ASTEmitter::emitUDTCopyFieldByField(
+        const std::string& sourceAddr,
+        const std::string& targetAddr,
+        const FasterBASIC::TypeSymbol& udtDef,
+        const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) {
+
+    int64_t offset = 0;
+    for (size_t i = 0; i < udtDef.fields.size(); ++i) {
+        const auto& field = udtDef.fields[i];
+        BaseType fieldType = field.typeDesc.baseType;
+
+        builder_.emitComment("Copy field: " + field.name + " (offset " + std::to_string(offset) + ")");
+
+        // Calculate field address in source and target
+        std::string srcFieldAddr = builder_.newTemp();
+        std::string dstFieldAddr = builder_.newTemp();
+
+        if (offset > 0) {
+            builder_.emitBinary(srcFieldAddr, "l", "add", sourceAddr, std::to_string(offset));
+            builder_.emitBinary(dstFieldAddr, "l", "add", targetAddr, std::to_string(offset));
+        } else {
+            builder_.emitRaw("    " + srcFieldAddr + " =l copy " + sourceAddr);
+            builder_.emitRaw("    " + dstFieldAddr + " =l copy " + targetAddr);
+        }
+
+        if (fieldType == BaseType::STRING) {
+            // String field – load pointer, retain new, store, release old
+            std::string srcPtr = builder_.newTemp();
+            builder_.emitLoad(srcPtr, "l", srcFieldAddr);
+
+            std::string oldPtr = builder_.newTemp();
+            builder_.emitLoad(oldPtr, "l", dstFieldAddr);
+
+            std::string retainedPtr = builder_.newTemp();
+            builder_.emitCall(retainedPtr, "l", "string_retain", "l " + srcPtr);
+
+            builder_.emitStore("l", retainedPtr, dstFieldAddr);
+            builder_.emitCall("", "", "string_release", "l " + oldPtr);
+
+        } else if (fieldType == BaseType::USER_DEFINED) {
+            // Nested UDT – recurse
+            auto nestedIt = udtMap.find(field.typeDesc.udtName);
+            if (nestedIt != udtMap.end()) {
+                builder_.emitComment("Nested UDT copy: " + field.name + " (type " + field.typeDesc.udtName + ")");
+                emitUDTCopyFieldByField(srcFieldAddr, dstFieldAddr, nestedIt->second, udtMap);
+            }
+        } else {
+            // Scalar field – simple load/store
+            std::string qbeType = typeManager_.getQBEType(fieldType);
+            std::string val = builder_.newTemp();
+            builder_.emitLoad(val, qbeType, srcFieldAddr);
+            builder_.emitStore(qbeType, val, dstFieldAddr);
+        }
+
+        // Advance offset for next field
+        if (fieldType == BaseType::USER_DEFINED) {
+            auto nestedIt = udtMap.find(field.typeDesc.udtName);
+            if (nestedIt != udtMap.end()) {
+                offset += typeManager_.getUDTSizeRecursive(nestedIt->second, udtMap);
+            }
+        } else {
+            offset += typeManager_.getTypeSize(fieldType);
+        }
+    }
 }
 
 } // namespace fbc

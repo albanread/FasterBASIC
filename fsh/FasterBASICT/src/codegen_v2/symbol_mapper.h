@@ -218,6 +218,42 @@ private:
     void initializeReservedWords();
 };
 
+/**
+ * FunctionScopeGuard - RAII wrapper for SymbolMapper function scope.
+ *
+ * Ensures that exitFunctionScope() is always called, even if code
+ * generation throws an exception or returns early.
+ *
+ * Usage:
+ *   {
+ *       FunctionScopeGuard guard(symbolMapper, "MyFunc", params);
+ *       // ... generate code ...
+ *   } // exitFunctionScope() called automatically
+ */
+class FunctionScopeGuard {
+public:
+    FunctionScopeGuard(SymbolMapper& mapper,
+                       const std::string& functionName,
+                       const std::vector<std::string>& parameters = {})
+        : mapper_(mapper)
+    {
+        mapper_.enterFunctionScope(functionName, parameters);
+    }
+
+    ~FunctionScopeGuard() {
+        mapper_.exitFunctionScope();
+    }
+
+    // Non-copyable, non-movable
+    FunctionScopeGuard(const FunctionScopeGuard&) = delete;
+    FunctionScopeGuard& operator=(const FunctionScopeGuard&) = delete;
+    FunctionScopeGuard(FunctionScopeGuard&&) = delete;
+    FunctionScopeGuard& operator=(FunctionScopeGuard&&) = delete;
+
+private:
+    SymbolMapper& mapper_;
+};
+
 } // namespace fbc
 
 #endif // SYMBOL_MAPPER_H
