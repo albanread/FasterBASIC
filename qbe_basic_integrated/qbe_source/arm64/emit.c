@@ -607,6 +607,46 @@ is_shift_fusion_enabled(void)
 	return enabled;
 }
 
+/* Check if LDP/STP pairing is enabled via environment variable
+ * Returns 1 if enabled, 0 if disabled (default: enabled)
+ */
+static int
+is_ldp_stp_fusion_enabled(void)
+{
+	static int checked = 0;
+	static int enabled = 1;  /* Default: enabled */
+
+	if (!checked) {
+		const char *env = getenv("ENABLE_LDP_STP_FUSION");
+		if (env) {
+			enabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+		}
+		checked = 1;
+	}
+
+	return enabled;
+}
+
+/* Check if indexed addressing fusion is enabled via environment variable
+ * Returns 1 if enabled, 0 if disabled (default: enabled)
+ */
+static int
+is_indexed_addr_enabled(void)
+{
+	static int checked = 0;
+	static int enabled = 1;  /* Default: enabled */
+
+	if (!checked) {
+		const char *env = getenv("ENABLE_INDEXED_ADDR");
+		if (env) {
+			enabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+		}
+		checked = 1;
+	}
+
+	return enabled;
+}
+
 /* Try to fuse shift + arithmetic patterns into single instructions with shifted operands.
  * ARM64 supports shifted operands in many instructions: ADD, SUB, AND, OR, EOR, etc.
  * Pattern: SHIFT dest, src, #imm
@@ -739,6 +779,345 @@ try_shift_fusion(Ins *i, Ins *prev, E *e, Blk *b)
 			shift_mnemonic, i->op == Oadd ? "ADD" : 
 			i->op == Osub ? "SUB" : i->op == Oand ? "AND" :
 			i->op == Oor ? "OR" : "XOR");
+
+	return 1; /* Successfully fused */
+}
+
+/* Determine the "pair class" of a memory instruction for LDP/STP fusion.
+ * Returns 0 if the instruction cannot participate in pairing.
+ *   1 = 4-byte integer (W registers)
+ *   2 = 8-byte integer (X registers)
+ *   3 = 4-byte float   (S registers)
+ *   4 = 8-byte float   (D registers)
+ * The pair class encodes both the size and the register bank.
+ */
+static int
+mem_pair_class(Ins *i)
+{
+	/* Stores */
+	switch (i->op) {
+	case Ostorew: return 1;  /* str wN */
+	case Ostorel: return 2;  /* str xN */
+	case Ostores: return 3;  /* str sN */
+	case Ostored: return 4;  /* str dN */
+	default: break;
+	}
+
+	/* Loads — only pair those that use 'ldr' (not ldrsb, ldrsh, ldrsw) */
+	switch (i->op) {
+	case Oloaduw: return 1;  /* ldr wN */
+	case Oloadsw:
+		/* Kw → ldr w (can pair), Kl → ldrsw x (cannot pair) */
+		return (i->cls == Kw) ? 1 : 0;
+	case Oload:
+		switch (i->cls) {
+		case Kw: return 1;
+		case Kl: return 2;
+		case Ks: return 3;
+		case Kd: return 4;
+		}
+		return 0;
+	default:
+		return 0;
+	}
+}
+
+/* Size in bytes for a given pair class. */
+static int
+pair_class_size(int pc)
+{
+	switch (pc) {
+	case 1: return 4;
+	case 2: return 8;
+	case 3: return 4;
+	case 4: return 8;
+	default: return 0;
+	}
+}
+
+/* Register class (for rname) for a given pair class. */
+static int
+pair_class_k(int pc)
+{
+	switch (pc) {
+	case 1: return Kw;
+	case 2: return Kl;
+	case 3: return Ks;
+	case 4: return Kd;
+	default: return Kw;
+	}
+}
+
+/* Try to fuse two consecutive loads into a single LDP instruction,
+ * or two consecutive stores into a single STP instruction.
+ *
+ * ARM64 LDP/STP use a signed 7-bit scaled immediate offset from the
+ * base register.  Ranges (from first element):
+ *   32-bit (W/S): [-256, 252]  in steps of 4
+ *   64-bit (X/D): [-512, 504]  in steps of 8
+ *
+ * Only slot-based addressing (relative to x29) is paired.
+ *
+ * Returns: 1 if fused (both instructions emitted), 0 if not fusible.
+ */
+static int
+try_ldp_stp_fusion(Ins *i, Ins *prev, E *e, Blk *b)
+{
+	int pc_prev, pc_cur, sz, k;
+	uint64_t off1, off2, lo, hi;
+	int is_load_prev, is_load_cur, is_store_prev, is_store_cur;
+	Ref addr_prev, addr_cur;
+	Ref reg1, reg2;  /* the data registers (load dest / store src) */
+
+	pc_prev = mem_pair_class(prev);
+	pc_cur  = mem_pair_class(i);
+
+	/* Both must be pairable and of the same class */
+	if (pc_prev == 0 || pc_cur == 0 || pc_prev != pc_cur)
+		return 0;
+
+	/* Both must be the same direction (both loads or both stores) */
+	is_load_prev  = isload(prev->op);
+	is_load_cur   = isload(i->op);
+	is_store_prev = isstore(prev->op);
+	is_store_cur  = isstore(i->op);
+
+	if (is_load_prev != is_load_cur || is_store_prev != is_store_cur)
+		return 0;
+
+	/* Determine the address refs */
+	if (is_load_prev) {
+		addr_prev = prev->arg[0];
+		addr_cur  = i->arg[0];
+		reg1 = prev->to;
+		reg2 = i->to;
+	} else {
+		/* stores: arg[0] = value, arg[1] = address */
+		addr_prev = prev->arg[1];
+		addr_cur  = i->arg[1];
+		reg1 = prev->arg[0];
+		reg2 = i->arg[0];
+	}
+
+	/* Both must be slot references */
+	if (rtype(addr_prev) != RSlot || rtype(addr_cur) != RSlot)
+		return 0;
+
+	/* Data operands must be registers */
+	if (!isreg(reg1) || !isreg(reg2))
+		return 0;
+
+	/* For LDP, destination registers must be distinct */
+	if (is_load_prev && req(reg1, reg2))
+		return 0;
+
+	/* Compute slot offsets */
+	off1 = slot(addr_prev, e);
+	off2 = slot(addr_cur, e);
+
+	sz = pair_class_size(pc_prev);
+	k  = pair_class_k(pc_prev);
+
+	/* Determine which comes first; we need them adjacent.
+	 * After this block: lo = lower offset, hi = lo + sz,
+	 * and reg1/reg2 are ordered to match. */
+	if (off2 == off1 + (uint64_t)sz) {
+		lo = off1;
+		/* reg1 already first, reg2 second — keep order */
+	} else if (off1 == off2 + (uint64_t)sz) {
+		lo = off2;
+		/* Swap so reg ordering matches offset ordering */
+		Ref tmp = reg1; reg1 = reg2; reg2 = tmp;
+	} else {
+		return 0; /* not adjacent */
+	}
+
+	/* Alignment: base offset must be a multiple of access size */
+	if (lo % (uint64_t)sz != 0)
+		return 0;
+
+	/* Range check: LDP/STP signed 7-bit scaled offset.
+	 * The offset is encoded as imm7 * scale relative to base.
+	 * Positive range up to 63 * scale. */
+	hi = lo;  /* we use the lower offset for the instruction */
+	if (sz == 4 && hi > 252)
+		return 0;
+	if (sz == 8 && hi > 504)
+		return 0;
+
+	/* Also check that fixarg wouldn't have transformed these
+	 * (fixarg triggers when offset > sz * 4095, far above LDP range,
+	 *  so this is always safe — but be defensive). */
+	if (lo > (uint64_t)sz * 4095u || lo + sz > (uint64_t)sz * 4095u)
+		return 0;
+
+	/* Emit the paired instruction */
+	if (is_load_prev) {
+		fprintf(e->f, "\tldp\t");
+	} else {
+		fprintf(e->f, "\tstp\t");
+	}
+	fprintf(e->f, "%s, ", rname(reg1.val, k));
+	fprintf(e->f, "%s, ", rname(reg2.val, k));
+	fprintf(e->f, "[x29, #%"PRIu64"]\n", lo);
+
+	if (getenv("DEBUG_LDP_STP"))
+		fprintf(stderr, "LDP/STP: Paired %s at offsets %"PRIu64" and %"PRIu64" (size %d)\n",
+			is_load_prev ? "loads" : "stores", off1, off2, sz);
+
+	return 1; /* Successfully fused */
+}
+
+/* Try to fold an ADD into a subsequent load/store as indexed addressing.
+ *
+ * Pattern:  ADD rN, rBase, rIndex   (64-bit, both operands registers)
+ *           LDR rD, [rN]           (or STR rS, [rN])
+ * Emits:    LDR rD, [rBase, rIndex] (or STR rS, [rBase, rIndex])
+ *
+ * This is the common array-access pattern where base + scaled_index
+ * has been computed in a separate ADD, and the result is used once
+ * as a memory address.
+ *
+ * Safety: The ADD result must not be used by any later instruction.
+ *         (We reuse prev_result_used_later() for this check.)
+ *
+ * Returns: 1 if fused, 0 if not fusible.
+ */
+static int
+try_indexed_addr_fusion(Ins *i, Ins *prev, E *e, Blk *b)
+{
+	int is_ld, is_st;
+	Ref addr_ref;
+	char *mnemonic;
+	int data_k;  /* register class for the data register */
+
+	/* prev must be an ADD in Kl (64-bit address arithmetic) */
+	if (!prev || prev->op != Oadd || prev->cls != Kl)
+		return 0;
+
+	/* Both ADD operands must be registers (not constants, not slots) */
+	if (rtype(prev->arg[0]) != RTmp || rtype(prev->arg[1]) != RTmp)
+		return 0;
+	if (!isreg(prev->arg[0]) || !isreg(prev->arg[1]))
+		return 0;
+
+	/* Neither ADD operand should be the scratch register IP1 */
+	if (prev->arg[0].val == IP1 || prev->arg[1].val == IP1)
+		return 0;
+
+	/* ADD must produce a register result */
+	if (!isreg(prev->to))
+		return 0;
+
+	/* Current instruction must be a load or store */
+	is_ld = isload(i->op);
+	is_st = isstore(i->op);
+	if (!is_ld && !is_st)
+		return 0;
+
+	/* Determine the address operand of the memory instruction */
+	if (is_ld) {
+		addr_ref = i->arg[0];
+	} else {
+		addr_ref = i->arg[1];
+	}
+
+	/* The address must be an RTmp that matches the ADD result */
+	if (rtype(addr_ref) != RTmp || !req(addr_ref, prev->to))
+		return 0;
+
+	/* Safety: the ADD result must not be used after this load/store */
+	if (prev_result_used_later(i, b, prev->to))
+		return 0;
+
+	/* Determine the memory instruction mnemonic and data register class.
+	 * We need to handle each load/store variant to emit the correct
+	 * instruction with register-offset addressing. */
+	switch (i->op) {
+	case Oloadsb:
+		mnemonic = (i->cls == Kl) ? "ldrsb" : "ldrsb";
+		data_k = i->cls;
+		break;
+	case Oloadub:
+		mnemonic = "ldrb";
+		data_k = Kw;
+		break;
+	case Oloadsh:
+		mnemonic = (i->cls == Kl) ? "ldrsh" : "ldrsh";
+		data_k = i->cls;
+		break;
+	case Oloaduh:
+		mnemonic = "ldrh";
+		data_k = Kw;
+		break;
+	case Oloadsw:
+		if (i->cls == Kl) {
+			mnemonic = "ldrsw";
+			data_k = Kl;
+		} else {
+			mnemonic = "ldr";
+			data_k = Kw;
+		}
+		break;
+	case Oloaduw:
+		mnemonic = "ldr";
+		data_k = Kw;
+		break;
+	case Oload:
+		mnemonic = "ldr";
+		data_k = i->cls;
+		break;
+	case Ostoreb:
+		mnemonic = "strb";
+		data_k = Kw;
+		break;
+	case Ostoreh:
+		mnemonic = "strh";
+		data_k = Kw;
+		break;
+	case Ostorew:
+		mnemonic = "str";
+		data_k = Kw;
+		break;
+	case Ostorel:
+		mnemonic = "str";
+		data_k = Kl;
+		break;
+	case Ostores:
+		mnemonic = "str";
+		data_k = Ks;
+		break;
+	case Ostored:
+		mnemonic = "str";
+		data_k = Kd;
+		break;
+	default:
+		return 0;
+	}
+
+	/* For loads, the data register is i->to.
+	 * For stores, the data register is i->arg[0]. */
+	Ref data_reg;
+	if (is_ld) {
+		data_reg = i->to;
+		if (!isreg(data_reg))
+			return 0;
+	} else {
+		data_reg = i->arg[0];
+		if (!isreg(data_reg))
+			return 0;
+	}
+
+	/* Emit: mnemonic dataReg, [base, index]
+	 * Use separate fprintf calls because rname uses a static buffer. */
+	fprintf(e->f, "\t%s\t", mnemonic);
+	fprintf(e->f, "%s, [", rname(data_reg.val, data_k));
+	fprintf(e->f, "%s, ", rname(prev->arg[0].val, Kl));
+	fprintf(e->f, "%s]\n", rname(prev->arg[1].val, Kl));
+
+	if (getenv("DEBUG_INDEXED_ADDR"))
+		fprintf(stderr, "IDXADDR: Fused ADD+%s into indexed addressing [base, index]\n",
+			is_ld ? "load" : "store");
 
 	return 1; /* Successfully fused */
 }
@@ -963,16 +1342,73 @@ arm64_emitfn(Fn *fn, FILE *out)
 		);
 	fputs("\tmov\tx29, sp\n", e->f);
 	s = (e->frame - e->padding) / 4;
-	for (r=arm64_rclob; *r>=0; r++)
-		if (e->fn->reg & BIT(*r)) {
-			s -= 2;
-			i = &(Ins){.arg = {TMP(*r), SLOT(s)}};
-			i->op = *r >= V0 ? Ostored : Ostorel;
+	if (is_ldp_stp_fusion_enabled()) {
+		/* Collect callee-save registers that need saving,
+		 * then emit STP pairs for adjacent slots. */
+		int csave_regs[64];
+		int csave_slots[64];
+		int csave_n = 0;
+		int stmp = s;
+		for (r=arm64_rclob; *r>=0; r++)
+			if (e->fn->reg & BIT(*r)) {
+				stmp -= 2;
+				csave_regs[csave_n] = *r;
+				csave_slots[csave_n] = stmp;
+				csave_n++;
+			}
+		/* Try to pair consecutive saves of the same bank */
+		int ci = 0;
+		while (ci < csave_n) {
+			if (ci + 1 < csave_n) {
+				int r1 = csave_regs[ci];
+				int r2 = csave_regs[ci+1];
+				int s1 = csave_slots[ci];
+				int s2 = csave_slots[ci+1];
+				int both_gpr = (r1 < V0 && r2 < V0);
+				int both_fpr = (r1 >= V0 && r2 >= V0);
+				if ((both_gpr || both_fpr) && (s2 == s1 - 2 || s1 == s2 - 2)) {
+					/* Adjacent slots, same bank — emit STP */
+					int lo_slot, lo_r, hi_r;
+					int k = both_gpr ? Kl : Kd;
+					int sz = both_gpr ? 8 : 8;
+					if (s1 < s2) {
+						lo_slot = s1; lo_r = r1; hi_r = r2;
+					} else {
+						lo_slot = s2; lo_r = r2; hi_r = r1;
+					}
+					uint64_t off = 16 + e->padding + 4 * (uint64_t)lo_slot;
+					if (off <= 504) {
+						fprintf(e->f, "\tstp\t");
+						fprintf(e->f, "%s, ", rname(lo_r, k));
+						fprintf(e->f, "%s, ", rname(hi_r, k));
+						fprintf(e->f, "[x29, #%"PRIu64"]\n", off);
+						ci += 2;
+						continue;
+					}
+				}
+			}
+			/* Unpaired — emit single store */
+			int sr = csave_regs[ci];
+			int ss = csave_slots[ci];
+			i = &(Ins){.arg = {TMP(sr), SLOT(ss)}};
+			i->op = sr >= V0 ? Ostored : Ostorel;
 			emitins(i, e);
+			ci++;
 		}
+		s = stmp;
+	} else {
+		for (r=arm64_rclob; *r>=0; r++)
+			if (e->fn->reg & BIT(*r)) {
+				s -= 2;
+				i = &(Ins){.arg = {TMP(*r), SLOT(s)}};
+				i->op = *r >= V0 ? Ostored : Ostorel;
+				emitins(i, e);
+			}
+	}
 
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
 		Ins *prev = NULL;
+		Ins *prev_mem = NULL;  /* buffered load/store for LDP/STP pairing */
 		if (lbl || b->npred > 1)
 			fprintf(e->f, "%s%d:\n", T.asloc, id0+b->id);
 		for (i=b->ins; i!=&b->ins[b->nins]; i++) {
@@ -1001,6 +1437,17 @@ arm64_emitfn(Fn *fn, FILE *out)
 						continue;
 					}
 				}
+
+				/* Try indexed addressing: ADD + load/store → ldr/str [base, index] */
+				if (is_indexed_addr_enabled() && prev->op == Oadd && prev->cls == Kl) {
+					if (try_indexed_addr_fusion(i, prev, e, b)) {
+						/* Fused! ADD folded into memory instruction */
+						prev = NULL;
+						/* This memory op was fused, so don't buffer it
+						 * for LDP/STP (it's already emitted). */
+						continue;
+					}
+				}
 				
 				/* Couldn't fuse - emit the pending instruction now */
 				emitins(prev, e);
@@ -1013,13 +1460,52 @@ arm64_emitfn(Fn *fn, FILE *out)
 			if ((is_madd_fusion_enabled() && i->op == Omul) ||
 			    (is_shift_fusion_enabled() && 
 			     (i->op == Oshl || i->op == Oshr || i->op == Osar)) ||
+			    (is_indexed_addr_enabled() && i->op == Oadd
+			     && i->cls == Kl
+			     && rtype(i->arg[0]) == RTmp && rtype(i->arg[1]) == RTmp
+			     && isreg(i->arg[0]) && isreg(i->arg[1])
+			     && i->arg[0].val != IP1 && i->arg[1].val != IP1) ||
 			    i->op == Oacmp) {
+				/* Flush any pending memory op before deferring */
+				if (prev_mem) {
+					emitins(prev_mem, e);
+					prev_mem = NULL;
+				}
 				prev = i;
 				continue;
 			}
-			
-			/* Not a fusible instruction, emit normally */
+
+			/* LDP/STP pairing: buffer loads/stores for adjacent-pair fusion */
+			if (is_ldp_stp_fusion_enabled() && mem_pair_class(i) != 0) {
+				if (prev_mem) {
+					/* Try to pair prev_mem with i */
+					if (try_ldp_stp_fusion(i, prev_mem, e, b)) {
+						/* Both emitted as a single LDP/STP */
+						prev_mem = NULL;
+						continue;
+					}
+					/* Can't pair — emit the buffered one, buffer the new one */
+					emitins(prev_mem, e);
+				}
+				prev_mem = i;
+				continue;
+			}
+
+			/* Non-memory, non-fusible instruction.
+			 * Flush any buffered memory op first. */
+			if (prev_mem) {
+				emitins(prev_mem, e);
+				prev_mem = NULL;
+			}
+
+			/* Emit current instruction normally */
 			emitins(i, e);
+		}
+
+		/* Flush any remaining buffered memory instruction */
+		if (prev_mem) {
+			emitins(prev_mem, e);
+			prev_mem = NULL;
 		}
 		
 		/* If we have a pending instruction at end of block, try
@@ -1071,13 +1557,66 @@ arm64_emitfn(Fn *fn, FILE *out)
 			break;
 		case Jret0:
 			s = (e->frame - e->padding) / 4;
-			for (r=arm64_rclob; *r>=0; r++)
-				if (e->fn->reg & BIT(*r)) {
-					s -= 2;
-					i = &(Ins){Oload, 0, TMP(*r), {SLOT(s)}};
-					i->cls = *r >= V0 ? Kd : Kl;
+			if (is_ldp_stp_fusion_enabled()) {
+				/* Collect callee-save registers for restore,
+				 * then emit LDP pairs for adjacent slots. */
+				int cr_regs[64];
+				int cr_slots[64];
+				int cr_n = 0;
+				int rtmp = s;
+				for (r=arm64_rclob; *r>=0; r++)
+					if (e->fn->reg & BIT(*r)) {
+						rtmp -= 2;
+						cr_regs[cr_n] = *r;
+						cr_slots[cr_n] = rtmp;
+						cr_n++;
+					}
+				int ri = 0;
+				while (ri < cr_n) {
+					if (ri + 1 < cr_n) {
+						int r1 = cr_regs[ri];
+						int r2 = cr_regs[ri+1];
+						int s1 = cr_slots[ri];
+						int s2 = cr_slots[ri+1];
+						int both_gpr = (r1 < V0 && r2 < V0);
+						int both_fpr = (r1 >= V0 && r2 >= V0);
+						if ((both_gpr || both_fpr) && (s2 == s1 - 2 || s1 == s2 - 2)) {
+							int lo_slot, lo_r, hi_r;
+							int k = both_gpr ? Kl : Kd;
+							if (s1 < s2) {
+								lo_slot = s1; lo_r = r1; hi_r = r2;
+							} else {
+								lo_slot = s2; lo_r = r2; hi_r = r1;
+							}
+							uint64_t off = 16 + e->padding + 4 * (uint64_t)lo_slot;
+							if (off <= 504) {
+								fprintf(e->f, "\tldp\t");
+								fprintf(e->f, "%s, ", rname(lo_r, k));
+								fprintf(e->f, "%s, ", rname(hi_r, k));
+								fprintf(e->f, "[x29, #%"PRIu64"]\n", off);
+								ri += 2;
+								continue;
+							}
+						}
+					}
+					/* Unpaired — emit single load */
+					int rr = cr_regs[ri];
+					int rs = cr_slots[ri];
+					i = &(Ins){Oload, 0, TMP(rr), {SLOT(rs)}};
+					i->cls = rr >= V0 ? Kd : Kl;
 					emitins(i, e);
+					ri++;
 				}
+				s = rtmp;
+			} else {
+				for (r=arm64_rclob; *r>=0; r++)
+					if (e->fn->reg & BIT(*r)) {
+						s -= 2;
+						i = &(Ins){Oload, 0, TMP(*r), {SLOT(s)}};
+						i->cls = *r >= V0 ? Kd : Kl;
+						emitins(i, e);
+					}
+			}
 			if (e->fn->dynalloc)
 				fputs("\tmov sp, x29\n", e->f);
 			o = e->frame + 16;
