@@ -364,6 +364,14 @@ void Parser::collectOptionsFromTokens() {
                     m_options.forceYieldBudget = budget;
                 }
                 // If no number, keep default budget (10000)
+            } else if (match(TokenType::SAMM)) {
+                if (match(TokenType::ON)) {
+                    m_options.sammEnabled = true;
+                } else if (match(TokenType::OFF)) {
+                    m_options.sammEnabled = false;
+                } else {
+                    error("Expected ON or OFF after OPTION SAMM");
+                }
             } else {
                 error("Unknown OPTION type");
             }
@@ -4486,8 +4494,18 @@ StatementPtr Parser::parseOptionStatement() {
             error("Expected ON or OFF after OPTION BOUNDS_CHECK");
             return nullptr;
         }
+    } else if (match(TokenType::SAMM)) {
+        // Parse ON/OFF for OPTION SAMM
+        if (match(TokenType::ON)) {
+            return std::make_unique<OptionStatement>(OptionStatement::OptionType::SAMM, 1);
+        } else if (match(TokenType::OFF)) {
+            return std::make_unique<OptionStatement>(OptionStatement::OptionType::SAMM, 0);
+        } else {
+            error("Expected ON or OFF after OPTION SAMM");
+            return nullptr;
+        }
     } else {
-        error("Unknown OPTION type. Expected BITWISE, LOGICAL, BASE, EXPLICIT, UNICODE, ASCII, DETECTSTRING, ERROR, CANCELLABLE, or BOUNDS_CHECK");
+        error("Unknown OPTION type. Expected BITWISE, LOGICAL, BASE, EXPLICIT, UNICODE, ASCII, DETECTSTRING, ERROR, CANCELLABLE, BOUNDS_CHECK, or SAMM");
         return nullptr;
     }
 }
@@ -4736,16 +4754,6 @@ StatementPtr Parser::parseFunctionStatement() {
     if (returnType == TokenType::UNKNOWN && !stmt->hasReturnAsType) {
         returnType = TokenType::TYPE_DOUBLE;
         stmt->returnTypeSuffix = TokenType::TYPE_DOUBLE;
-        // Debug output to file
-        std::ofstream debugFile("/tmp/func_type_debug.txt", std::ios::app);
-        debugFile << "[DEBUG] Function " << funcName << " has no type suffix or AS clause, defaulting to DOUBLE" << std::endl;
-        debugFile.close();
-    } else {
-        std::ofstream debugFile("/tmp/func_type_debug.txt", std::ios::app);
-        debugFile << "[DEBUG] Function " << funcName << " returnType=" << static_cast<int>(returnType) 
-                  << " hasReturnAsType=" << stmt->hasReturnAsType 
-                  << " returnTypeSuffix=" << static_cast<int>(stmt->returnTypeSuffix) << std::endl;
-        debugFile.close();
     }
 
     // Expect end of line after FUNCTION declaration

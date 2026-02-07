@@ -90,6 +90,7 @@ enum class TokenType {
     CANCELLABLE,     // CANCELLABLE (for OPTION CANCELLABLE - loop cancellation)
     BOUNDS_CHECK,    // BOUNDS_CHECK (for OPTION BOUNDS_CHECK - array bounds checking)
     FORCE_YIELD,     // FORCE_YIELD (for OPTION FORCE_YIELD - quasi-preemptive handlers)
+    SAMM,            // SAMM (for OPTION SAMM ON/OFF - scope-aware memory management)
     
     // Keywords - Functions and Procedures
     SUB,             // SUB

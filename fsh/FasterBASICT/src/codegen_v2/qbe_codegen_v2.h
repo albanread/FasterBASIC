@@ -194,6 +194,14 @@ private:
     // === Helper Methods ===
     
     /**
+     * Check if SAMM (Scope-Aware Memory Management) is enabled.
+     * Returns false when the program contains OPTION SAMM OFF.
+     * All SAMM emission sites should check this before emitting
+     * samm_init / samm_enter_scope / samm_exit_scope / samm_shutdown calls.
+     */
+    bool isSAMMEnabled() const;
+    
+    /**
      * Initialize all components
      */
     void initializeComponents();

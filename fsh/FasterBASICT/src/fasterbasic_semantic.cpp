@@ -290,11 +290,6 @@ void SemanticAnalyzer::registerDataLabels(const std::map<std::string, int>& data
 // =============================================================================
 
 bool SemanticAnalyzer::analyze(Program& program, const CompilerOptions& options) {
-    // Debug: write to file immediately to confirm this function is called
-    std::ofstream debugFileAnalyze("/tmp/for_debug.txt", std::ios::app);
-    debugFileAnalyze << "[DEBUG] analyze() called, starting semantic analysis" << std::endl;
-    debugFileAnalyze.close();
-    
     m_program = &program;
     m_errors.clear();
     m_warnings.clear();
@@ -317,6 +312,7 @@ bool SemanticAnalyzer::analyze(Program& program, const CompilerOptions& options)
     m_symbolTable.cancellableLoops = options.cancellableLoops;
     m_symbolTable.forceYieldEnabled = options.forceYieldEnabled;
     m_symbolTable.forceYieldBudget = options.forceYieldBudget;
+    m_symbolTable.sammEnabled = options.sammEnabled;
     m_cancellableLoops = options.cancellableLoops;
     
     // Clear control flow stacks
@@ -482,13 +478,60 @@ void SemanticAnalyzer::collectGlobalStatements(Program& program) {
     m_symbolTable.globalVariableCount = nextOffset;
 }
 
+// Recursively walk a statement list and process any DIM statements found,
+// including those nested inside FOR/IF/WHILE/DO bodies.  The current
+// function scope (m_currentFunctionScope / m_currentFunctionName) must
+// already be set correctly by the caller.
+void SemanticAnalyzer::collectDimStatementsRecursive(const std::vector<StatementPtr>& stmts) {
+    for (const auto& stmt : stmts) {
+        if (!stmt) continue;
+        switch (stmt->getType()) {
+            case ASTNodeType::STMT_DIM:
+                processDimStatement(static_cast<const DimStatement&>(*stmt));
+                break;
+
+            case ASTNodeType::STMT_FOR: {
+                const auto* forStmt = static_cast<const ForStatement*>(stmt.get());
+                collectDimStatementsRecursive(forStmt->body);
+                break;
+            }
+            case ASTNodeType::STMT_FOR_IN: {
+                const auto* forInStmt = static_cast<const ForInStatement*>(stmt.get());
+                collectDimStatementsRecursive(forInStmt->body);
+                break;
+            }
+            case ASTNodeType::STMT_IF: {
+                const auto* ifStmt = static_cast<const IfStatement*>(stmt.get());
+                collectDimStatementsRecursive(ifStmt->thenStatements);
+                for (const auto& clause : ifStmt->elseIfClauses) {
+                    collectDimStatementsRecursive(clause.statements);
+                }
+                collectDimStatementsRecursive(ifStmt->elseStatements);
+                break;
+            }
+            case ASTNodeType::STMT_WHILE: {
+                const auto* whileStmt = static_cast<const WhileStatement*>(stmt.get());
+                collectDimStatementsRecursive(whileStmt->body);
+                break;
+            }
+            case ASTNodeType::STMT_DO: {
+                const auto* doStmt = static_cast<const DoStatement*>(stmt.get());
+                collectDimStatementsRecursive(doStmt->body);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
 void SemanticAnalyzer::collectDimStatements(Program& program) {
     for (const auto& line : program.lines) {
         for (const auto& stmt : line->statements) {
             if (stmt->getType() == ASTNodeType::STMT_DIM) {
                 processDimStatement(static_cast<const DimStatement&>(*stmt));
             }
-            // Also process DIM statements inside FUNCTION bodies
+            // Also process DIM statements inside FUNCTION bodies (recursively)
             else if (stmt->getType() == ASTNodeType::STMT_FUNCTION) {
                 const FunctionStatement* funcStmt = static_cast<const FunctionStatement*>(stmt.get());
                 
@@ -502,17 +545,13 @@ void SemanticAnalyzer::collectDimStatements(Program& program) {
                 m_currentFunctionScope.isSub = false;
                 m_currentFunctionName = funcStmt->functionName;
                 
-                for (const auto& bodyStmt : funcStmt->body) {
-                    if (bodyStmt->getType() == ASTNodeType::STMT_DIM) {
-                        processDimStatement(static_cast<const DimStatement&>(*bodyStmt));
-                    }
-                }
+                collectDimStatementsRecursive(funcStmt->body);
                 
                 // Restore previous scope
                 m_currentFunctionScope = prevScope;
                 m_currentFunctionName = prevFuncName;
             }
-            // Also process DIM statements inside SUB bodies
+            // Also process DIM statements inside SUB bodies (recursively)
             else if (stmt->getType() == ASTNodeType::STMT_SUB) {
                 const SubStatement* subStmt = static_cast<const SubStatement*>(stmt.get());
                 
@@ -526,15 +565,36 @@ void SemanticAnalyzer::collectDimStatements(Program& program) {
                 m_currentFunctionScope.isSub = true;
                 m_currentFunctionName = subStmt->subName;
                 
-                for (const auto& bodyStmt : subStmt->body) {
-                    if (bodyStmt->getType() == ASTNodeType::STMT_DIM) {
-                        processDimStatement(static_cast<const DimStatement&>(*bodyStmt));
-                    }
-                }
+                collectDimStatementsRecursive(subStmt->body);
                 
                 // Restore previous scope
                 m_currentFunctionScope = prevScope;
                 m_currentFunctionName = prevFuncName;
+            }
+            // Also walk top-level FOR/IF/WHILE/DO bodies for nested DIMs
+            else if (stmt->getType() == ASTNodeType::STMT_FOR) {
+                const auto* forStmt = static_cast<const ForStatement*>(stmt.get());
+                collectDimStatementsRecursive(forStmt->body);
+            }
+            else if (stmt->getType() == ASTNodeType::STMT_FOR_IN) {
+                const auto* forInStmt = static_cast<const ForInStatement*>(stmt.get());
+                collectDimStatementsRecursive(forInStmt->body);
+            }
+            else if (stmt->getType() == ASTNodeType::STMT_IF) {
+                const auto* ifStmt = static_cast<const IfStatement*>(stmt.get());
+                collectDimStatementsRecursive(ifStmt->thenStatements);
+                for (const auto& clause : ifStmt->elseIfClauses) {
+                    collectDimStatementsRecursive(clause.statements);
+                }
+                collectDimStatementsRecursive(ifStmt->elseStatements);
+            }
+            else if (stmt->getType() == ASTNodeType::STMT_WHILE) {
+                const auto* whileStmt = static_cast<const WhileStatement*>(stmt.get());
+                collectDimStatementsRecursive(whileStmt->body);
+            }
+            else if (stmt->getType() == ASTNodeType::STMT_DO) {
+                const auto* doStmt = static_cast<const DoStatement*>(stmt.get());
+                collectDimStatementsRecursive(doStmt->body);
             }
         }
     }
@@ -1096,12 +1156,6 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         VariableType paramType = VariableType::UNKNOWN;
         std::string paramTypeName = "";
         
-        // Debug output
-        std::ofstream debugFile("/tmp/func_param_debug.txt", std::ios::app);
-        debugFile << "[DEBUG] Processing parameter " << i << ": " << stmt.parameters[i] 
-                  << " parameterAsTypes.size()=" << stmt.parameterAsTypes.size()
-                  << " parameterTypes.size()=" << stmt.parameterTypes.size() << std::endl;
-        
         if (i < stmt.parameterAsTypes.size() && !stmt.parameterAsTypes[i].empty()) {
             // Has AS TypeName
             paramTypeName = stmt.parameterAsTypes[i];
@@ -1144,12 +1198,9 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         } else if (i < stmt.parameterTypes.size()) {
             // Has type suffix
             paramType = inferTypeFromSuffix(stmt.parameterTypes[i]);
-            debugFile << "[DEBUG] Using suffix, paramType=" << static_cast<int>(paramType) << std::endl;
         } else {
             paramType = VariableType::DOUBLE;  // Default type (DOUBLE, not FLOAT)
-            debugFile << "[DEBUG] Defaulting to DOUBLE" << std::endl;
         }
-        debugFile.close();
         
         // Build TypeDescriptor for this parameter
         TypeDescriptor paramTypeDesc;
@@ -2667,13 +2718,6 @@ void SemanticAnalyzer::validateForStatement(const ForStatement& stmt) {
     // Create normalized variable name with correct integer suffix
     TypeDescriptor forTypeDesc(forVarType);
     std::string normalizedVarName = normalizeVariableName(plainVarName, forTypeDesc);
-    
-    // Debug output to file
-    std::ofstream debugFile("/tmp/for_debug.txt", std::ios::app);
-    debugFile << "[DEBUG] validateForStatement called for variable: " << stmt.variable << std::endl;
-    debugFile << "[DEBUG] FOR variable normalized: " << plainVarName 
-              << " -> " << normalizedVarName << std::endl;
-    debugFile.close();
     
     // Register the variable in symbol table with normalized name and explicit scope
     Scope currentScope = getCurrentScope();
@@ -4236,36 +4280,25 @@ void SemanticAnalyzer::useVariable(const std::string& name, const SourceLocation
     // This is critical for FOR loop variables which are declared as INTEGER but referenced without suffix
     Scope currentScope = getCurrentScope();
     
-    // Debug output to file
-    std::ofstream debugFile("/tmp/use_var_debug.txt", std::ios::app);
-    debugFile << "[DEBUG useVariable] name='" << name << "' scope=" << currentScope.toString() << std::endl;
-    
     // Strip any existing suffix from the name
     std::string baseName = stripTypeSuffix(name);
     
     // Check if the name already has a suffix (parser mangled it)
     bool hasExplicitSuffix = (name != baseName);
-    debugFile << "[DEBUG useVariable] baseName='" << baseName << "' hasExplicitSuffix=" << hasExplicitSuffix << std::endl;
     
     // If no explicit suffix, try to find the variable with any suffix in current scope
     if (!hasExplicitSuffix) {
         std::vector<std::string> suffixes = {"_INT", "_LONG", "_SHORT", "_BYTE", "_DOUBLE", "_FLOAT", "_STRING"};
         for (const auto& suffix : suffixes) {
             std::string candidate = baseName + suffix;
-            debugFile << "[DEBUG useVariable] Trying candidate: '" << candidate << "' in scope " << currentScope.toString() << std::endl;
             auto* existingSym = m_symbolTable.lookupVariable(candidate, currentScope);
             if (existingSym) {
                 // Found it! Use this existing variable
-                debugFile << "[DEBUG useVariable] FOUND existing variable: " << candidate << std::endl;
-                debugFile.close();
                 existingSym->isUsed = true;
                 return;
             }
         }
     }
-    
-    debugFile << "[DEBUG useVariable] Variable not found, will auto-declare" << std::endl;
-    debugFile.close();
     
     // Variable doesn't exist in current scope - infer type and create it
     TypeDescriptor typeDesc = inferTypeFromNameD(name);

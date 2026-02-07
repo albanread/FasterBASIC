@@ -173,10 +173,10 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
     // The preamble MUST be emitted after the label because QBE requires
     // all instructions to be inside a labeled block.
     if (blockId == 0) {
-        if (sammPreamble_ == SAMMPreamble::MAIN_INIT) {
+        if (sammPreamble_ == SAMMPreamble::MAIN_INIT && astEmitter_.isSAMMEnabled()) {
             builder_.emitComment("SAMM: Initialise scope-aware memory management");
             builder_.emitCall("", "", "samm_init", "");
-        } else if (sammPreamble_ == SAMMPreamble::SCOPE_ENTER) {
+        } else if (sammPreamble_ == SAMMPreamble::SCOPE_ENTER && astEmitter_.isSAMMEnabled()) {
             builder_.emitComment("SAMM: Enter " + sammPreambleLabel_ + " scope");
             builder_.emitCall("", "", "samm_enter_scope", "");
         }
@@ -401,6 +401,13 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         // Find the ForStatement by searching predecessors
         const ForStatement* forStmt = findForStatementInLoop(block, cfg);
         if (forStmt) {
+            // SAMM: Exit loop-iteration scope before incrementing, but only
+            // if the loop body contains DIM statements (matches the enter
+            // scope emitted in the For_Body block).
+            if (astEmitter_.isSAMMEnabled() && ASTEmitter::bodyContainsDim(forStmt->body)) {
+                builder_.emitComment("SAMM: Exit FOR loop-iteration scope");
+                builder_.emitCall("", "", "samm_exit_scope", "");
+            }
             astEmitter_.emitForIncrement(forStmt);
         }
     }
@@ -526,8 +533,120 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         }
     }
 
+    // === SAMM: Enter loop-iteration scope for For_Body / While_Body / Do_Body ===
+    // Emit samm_enter_scope() at the top of loop body blocks when the
+    // loop body contains DIM statements.  The matching samm_exit_scope()
+    // is emitted at the convergence point (For_Increment block for FOR
+    // loops; end of While_Body/Do_Body block or the back-edge target for
+    // WHILE/DO loops).
+    bool sammLoopScopeEntered = false;
+
+    if (block->label.find("For_Body") != std::string::npos &&
+        block->label.find("ForIn_Body") == std::string::npos) {
+        // FOR loop body — find the ForStatement via predecessor chain
+        const ForStatement* forStmt = findForStatementInLoop(block, cfg);
+        if (forStmt && astEmitter_.isSAMMEnabled() && ASTEmitter::bodyContainsDim(forStmt->body)) {
+            builder_.emitComment("SAMM: Enter FOR loop-iteration scope");
+            builder_.emitCall("", "", "samm_enter_scope", "");
+            // Exit scope is emitted in the For_Increment block (above).
+        }
+    } else if (block->label.find("While_Body") != std::string::npos) {
+        // WHILE loop body — find the WhileStatement in the header (predecessor)
+        for (int predId : block->predecessors) {
+            if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* predBlock = cfg->blocks[predId].get();
+                if (predBlock && predBlock->label.find("While_Header") != std::string::npos) {
+                    for (const Statement* stmt : predBlock->statements) {
+                        if (stmt && stmt->getType() == ASTNodeType::STMT_WHILE) {
+                            const WhileStatement* whileStmt = static_cast<const WhileStatement*>(stmt);
+                            if (astEmitter_.isSAMMEnabled() && ASTEmitter::bodyContainsDim(whileStmt->body)) {
+                                builder_.emitComment("SAMM: Enter WHILE loop-iteration scope");
+                                builder_.emitCall("", "", "samm_enter_scope", "");
+                                sammLoopScopeEntered = true;
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    } else if (block->label.find("Do_Body") != std::string::npos) {
+        // DO loop body — find the DoStatement in the header (predecessor)
+        for (int predId : block->predecessors) {
+            if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* predBlock = cfg->blocks[predId].get();
+                if (predBlock && (predBlock->label.find("Do_Header") != std::string::npos ||
+                                  predBlock->label.find("Do_Body") != std::string::npos)) {
+                    for (const Statement* stmt : predBlock->statements) {
+                        if (stmt && stmt->getType() == ASTNodeType::STMT_DO) {
+                            const DoStatement* doStmt = static_cast<const DoStatement*>(stmt);
+                            if (astEmitter_.isSAMMEnabled() && ASTEmitter::bodyContainsDim(doStmt->body)) {
+                                builder_.emitComment("SAMM: Enter DO loop-iteration scope");
+                                builder_.emitCall("", "", "samm_enter_scope", "");
+                                sammLoopScopeEntered = true;
+                            }
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     // Emit statements in this block
     emitBlockStatements(block);
+
+    // === SAMM: Exit loop-iteration scope for WHILE / DO body blocks ===
+    // For WHILE and DO loops there is no separate increment block, so we
+    // emit samm_exit_scope() at the end of the body block (after
+    // statements, before the terminator jump).
+    //
+    // IMPORTANT: We only emit the exit scope when the body block has a
+    // direct back-edge to its loop header — i.e. the body is a single
+    // CFG block.  For multi-block bodies (nested IF / loops that create
+    // additional blocks), emitting exit scope here would destroy DIM'd
+    // variables before subsequent body blocks can use them.
+    // Multi-block WHILE/DO SAMM scoping is deferred to a future pass.
+    if (sammLoopScopeEntered) {
+        if (block->label.find("While_Body") != std::string::npos) {
+            // Check if this body block directly edges back to its While_Header
+            bool directBackEdge = false;
+            for (int succId : block->successors) {
+                if (succId >= 0 && succId < static_cast<int>(cfg->blocks.size())) {
+                    const BasicBlock* succBlock = cfg->blocks[succId].get();
+                    if (succBlock && succBlock->label.find("While_Header") != std::string::npos) {
+                        directBackEdge = true;
+                        break;
+                    }
+                }
+            }
+            if (directBackEdge) {
+                builder_.emitComment("SAMM: Exit WHILE loop-iteration scope");
+                builder_.emitCall("", "", "samm_exit_scope", "");
+            }
+            // else: multi-block body — skip per-iteration scope exit;
+            // scope will be cleaned up when the enclosing function/sub returns.
+        } else if (block->label.find("Do_Body") != std::string::npos) {
+            // Check if this body block directly edges to Do_Header or Do_Condition
+            bool directBackEdge = false;
+            for (int succId : block->successors) {
+                if (succId >= 0 && succId < static_cast<int>(cfg->blocks.size())) {
+                    const BasicBlock* succBlock = cfg->blocks[succId].get();
+                    if (succBlock && (succBlock->label.find("Do_Header") != std::string::npos ||
+                                     succBlock->label.find("Do_Condition") != std::string::npos)) {
+                        directBackEdge = true;
+                        break;
+                    }
+                }
+            }
+            if (directBackEdge) {
+                builder_.emitComment("SAMM: Exit DO loop-iteration scope");
+                builder_.emitCall("", "", "samm_exit_scope", "");
+            }
+        }
+    }
     
     // Check if block contains an END statement - if so, skip emitting terminator
     // since END already terminates execution
@@ -602,8 +721,10 @@ void CFGEmitter::emitExitBlockTerminator() {
         // SAMM: Shutdown scope-aware memory management before program exit.
         // This drains the cleanup queue, stops the background worker, and
         // ensures all destructors have run before the process terminates.
-        builder_.emitComment("SAMM: Shutdown scope-aware memory management");
-        builder_.emitCall("", "", "samm_shutdown", "");
+        if (astEmitter_.isSAMMEnabled()) {
+            builder_.emitComment("SAMM: Shutdown scope-aware memory management");
+            builder_.emitCall("", "", "samm_shutdown", "");
+        }
 
         builder_.emitComment("Implicit return 0");
         builder_.emitReturn("0");
@@ -615,8 +736,10 @@ void CFGEmitter::emitExitBlockTerminator() {
     auto funcIt = symbolTable.functions.find(currentFunction_);
     if (funcIt == symbolTable.functions.end()) {
         // Unknown function — still exit scope to avoid leak
-        builder_.emitComment("SAMM: Exit scope (unknown function)");
-        builder_.emitCall("", "", "samm_exit_scope", "");
+        if (astEmitter_.isSAMMEnabled()) {
+            builder_.emitComment("SAMM: Exit scope (unknown function)");
+            builder_.emitCall("", "", "samm_exit_scope", "");
+        }
 
         builder_.emitComment("WARNING: block with no out-edges (missing return?)");
         builder_.emitReturn();
@@ -629,8 +752,10 @@ void CFGEmitter::emitExitBlockTerminator() {
     // SUBs have VOID return type – just return without a value
     if (returnType == BaseType::VOID) {
         // SAMM: Exit SUB scope before returning
-        builder_.emitComment("SAMM: Exit SUB scope");
-        builder_.emitCall("", "", "samm_exit_scope", "");
+        if (astEmitter_.isSAMMEnabled()) {
+            builder_.emitComment("SAMM: Exit SUB scope");
+            builder_.emitCall("", "", "samm_exit_scope", "");
+        }
 
         builder_.emitComment("SUB exit - no return value");
         builder_.emitReturn();
@@ -654,8 +779,10 @@ void CFGEmitter::emitExitBlockTerminator() {
 
     // SAMM: Exit FUNCTION scope before returning.
     // Tracked allocations (except RETAINed ones) are queued for cleanup.
-    builder_.emitComment("SAMM: Exit FUNCTION scope");
-    builder_.emitCall("", "", "samm_exit_scope", "");
+    if (astEmitter_.isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Exit FUNCTION scope");
+        builder_.emitCall("", "", "samm_exit_scope", "");
+    }
 
     builder_.emitReturn(retTemp);
 }

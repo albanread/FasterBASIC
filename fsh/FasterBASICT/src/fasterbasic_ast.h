@@ -2373,7 +2373,8 @@ public:
         DETECTSTRING,
         ERROR,
         CANCELLABLE,
-        BOUNDS_CHECK
+        BOUNDS_CHECK,
+        SAMM
     };
 
     OptionType type;
@@ -2397,6 +2398,7 @@ public:
             case OptionType::ERROR: oss << "ERROR"; break;
             case OptionType::CANCELLABLE: oss << "CANCELLABLE"; break;
             case OptionType::BOUNDS_CHECK: oss << "BOUNDS_CHECK"; break;
+            case OptionType::SAMM: oss << "SAMM"; break;
         }
         oss << "\n";
         return oss.str();

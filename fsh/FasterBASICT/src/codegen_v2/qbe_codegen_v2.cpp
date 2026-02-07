@@ -15,6 +15,10 @@ QBECodeGeneratorV2::QBECodeGeneratorV2(SemanticAnalyzer& semantic)
 
 QBECodeGeneratorV2::~QBECodeGeneratorV2() = default;
 
+bool QBECodeGeneratorV2::isSAMMEnabled() const {
+    return semantic_.getSymbolTable().sammEnabled;
+}
+
 void QBECodeGeneratorV2::initializeComponents() {
     // Create all components in correct dependency order
     builder_ = std::make_unique<QBEBuilder>();
@@ -152,7 +156,9 @@ std::string QBECodeGeneratorV2::generateFunction(const FunctionSymbol* funcSymbo
     // (after the @block_0 label). QBE requires all instructions to be
     // inside a labeled block. samm_exit_scope() is emitted by
     // emitExitBlockTerminator() before each exit `ret`.
-    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "FUNCTION");
+    if (isSAMMEnabled()) {
+        cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "FUNCTION");
+    }
     cfgEmitter_->emitCFG(cfg, funcSymbol->name);
     
     // End function
@@ -205,7 +211,9 @@ std::string QBECodeGeneratorV2::generateSub(const FunctionSymbol* subSymbol,
     // (after the @block_0 label). QBE requires all instructions to be
     // inside a labeled block. samm_exit_scope() is emitted by
     // emitExitBlockTerminator() before each exit `ret`.
-    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "SUB");
+    if (isSAMMEnabled()) {
+        cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "SUB");
+    }
     cfgEmitter_->emitCFG(cfg, subSymbol->name);
     
     // End function
@@ -302,7 +310,9 @@ void QBECodeGeneratorV2::generateMainFunction(const ControlFlowGraph* cfg) {
     // inside a labeled block, so we cannot emit calls before the first label.
     // samm_shutdown() is emitted by emitExitBlockTerminator() and
     // emitEndStatement() before each exit point.
-    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::MAIN_INIT, "main");
+    if (isSAMMEnabled()) {
+        cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::MAIN_INIT, "main");
+    }
     cfgEmitter_->emitCFG(cfg, "main");
     
     // End main function (scope guard exits function scope automatically)
@@ -1139,8 +1149,10 @@ void QBECodeGeneratorV2::emitClassMethod(const ClassStatement& classStmt,
     
     // SAMM: Enter METHOD scope — local allocations (DIM inside method)
     // are tracked and cleaned up when the method returns.
-    builder_->emitComment("SAMM: Enter METHOD scope");
-    builder_->emitCall("", "", "samm_enter_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Enter METHOD scope");
+        builder_->emitCall("", "", "samm_enter_scope", "");
+    }
     
     // Allocate local variables for parameters so they can be addressed
     for (size_t i = 0; i < method.parameters.size(); i++) {
@@ -1167,12 +1179,41 @@ void QBECodeGeneratorV2::emitClassMethod(const ClassStatement& classStmt,
     
     // Set method return type so RETURN statements emit direct `ret`
     astEmitter_->setMethodReturnType(methodInfo->returnType.baseType);
-    
+
+    // Set method name so that return-via-assignment (e.g., `Hello = "Hi"`)
+    // is detected and routed to the return slot in emitLetStatement.
+    astEmitter_->setMethodName(method.methodName);
+
+    // Allocate a return-value stack slot for non-void methods.
+    // This enables the BASIC convention of assigning to the method name
+    // to set the return value (e.g., `GetName = ME.Name`).
+    // The slot is registered as a method "param" under the method name
+    // so that storeVariable / loadVariable can resolve it.
+    std::string methodRetSlot;
+    if (methodInfo->returnType.baseType != BaseType::VOID) {
+        std::string retQbeType = getQBETypeForDescriptor(methodInfo->returnType);
+        int retSlotSize = (retQbeType == "w" || retQbeType == "s") ? 4 : 8;
+        methodRetSlot = "%method_ret";
+        builder_->emitComment("Allocate return-value slot for return-via-assignment");
+        builder_->emitRaw("    " + methodRetSlot + " =l alloc8 " + std::to_string(retSlotSize) + "\n");
+        // Zero-initialize the return slot (default return value)
+        if (retSlotSize == 4) {
+            builder_->emitRaw("    storew 0, " + methodRetSlot + "\n");
+        } else {
+            builder_->emitRaw("    storel 0, " + methodRetSlot + "\n");
+        }
+        // Register under the method name so `MethodName = expr` resolves here
+        astEmitter_->registerMethodParam(method.methodName, methodRetSlot, methodInfo->returnType.baseType);
+        astEmitter_->setMethodReturnSlot(methodRetSlot);
+    }
+
     // Emit method body statements
     astEmitter_->emitMethodBody(method.body);
     
-    // Clear class context, method return type, and method params
+    // Clear class context, method return type, method name, return slot, and method params
     astEmitter_->setMethodReturnType(FasterBASIC::BaseType::VOID);
+    astEmitter_->setMethodName("");
+    astEmitter_->setMethodReturnSlot("");
     astEmitter_->setCurrentClassContext(nullptr);
     astEmitter_->clearMethodParams();
     
@@ -1187,23 +1228,33 @@ void QBECodeGeneratorV2::emitClassMethod(const ClassStatement& classStmt,
     // SAMM: Exit METHOD scope on the fallback (no explicit RETURN) path.
     // Explicit RETURN paths emit their own samm_exit_scope() in
     // ASTEmitter::emitReturnStatement().
-    builder_->emitComment("SAMM: Exit METHOD scope (fallback path)");
-    builder_->emitCall("", "", "samm_exit_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Exit METHOD scope (fallback path)");
+        builder_->emitCall("", "", "samm_exit_scope", "");
+    }
     
     if (methodInfo->returnType.baseType == BaseType::VOID) {
         builder_->emitReturn();
     } else {
-        // Return default value for the type
+        // Load the return value from the return-via-assignment slot.
+        // If the method body assigned to the method name (e.g., `GetName = ME.Name`),
+        // the value will be in this slot.  Otherwise it returns the zero-initialized default.
         std::string retType = getQBETypeForDescriptor(methodInfo->returnType);
-        if (retType == "w") {
-            builder_->emitReturn("0");
-        } else if (retType == "s") {
-            builder_->emitReturn("s_0.0");
-        } else if (retType == "d") {
-            builder_->emitReturn("d_0.0");
-        } else {
-            builder_->emitReturn("0");
+        std::string retVal = "%method_ret_val_" + std::to_string(fallbackId);
+        std::string loadOp;
+        if (retType == "w")      loadOp = "loadw";
+        else if (retType == "s") loadOp = "loads";
+        else if (retType == "d") loadOp = "loadd";
+        else                     loadOp = "loadl";
+        builder_->emitRaw("    " + retVal + " =" + retType + " " + loadOp + " " + methodRetSlot + "\n");
+
+        // SAMM: If returning a CLASS instance, RETAIN to parent scope
+        if (methodInfo->returnType.baseType == BaseType::CLASS_INSTANCE) {
+            builder_->emitComment("SAMM: RETAIN returned CLASS instance to parent scope (fallback)");
+            builder_->emitCall("", "", "samm_retain_parent", "l " + retVal);
         }
+
+        builder_->emitReturn(retVal);
     }
     
     builder_->emitFunctionEnd();
@@ -1232,8 +1283,10 @@ void QBECodeGeneratorV2::emitClassConstructor(const ClassStatement& classStmt,
     
     // SAMM: Enter CONSTRUCTOR scope — local allocations within the
     // constructor body are tracked and cleaned up when it returns.
-    builder_->emitComment("SAMM: Enter CONSTRUCTOR scope");
-    builder_->emitCall("", "", "samm_enter_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Enter CONSTRUCTOR scope");
+        builder_->emitCall("", "", "samm_enter_scope", "");
+    }
     
     // Allocate local variables for parameters
     for (size_t i = 0; i < ctor.parameters.size(); i++) {
@@ -1287,8 +1340,10 @@ void QBECodeGeneratorV2::emitClassConstructor(const ClassStatement& classStmt,
     astEmitter_->clearMethodParams();
     
     // SAMM: Exit CONSTRUCTOR scope before return.
-    builder_->emitComment("SAMM: Exit CONSTRUCTOR scope");
-    builder_->emitCall("", "", "samm_exit_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Exit CONSTRUCTOR scope");
+        builder_->emitCall("", "", "samm_exit_scope", "");
+    }
     
     // Constructor always returns void
     builder_->emitReturn();
@@ -1311,8 +1366,10 @@ void QBECodeGeneratorV2::emitClassDestructor(const ClassStatement& classStmt,
     // returns.  This is especially important when destructors are invoked
     // on the SAMM background cleanup worker thread, which has no ambient
     // scope of its own.
-    builder_->emitComment("SAMM: Enter DESTRUCTOR scope");
-    builder_->emitCall("", "", "samm_enter_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Enter DESTRUCTOR scope");
+        builder_->emitCall("", "", "samm_enter_scope", "");
+    }
     
     // Set current class context for ME resolution
     astEmitter_->setCurrentClassContext(&cls);
@@ -1332,8 +1389,10 @@ void QBECodeGeneratorV2::emitClassDestructor(const ClassStatement& classStmt,
     
     // SAMM: Exit DESTRUCTOR scope — any temporaries allocated during
     // the destructor body are queued for cleanup.
-    builder_->emitComment("SAMM: Exit DESTRUCTOR scope");
-    builder_->emitCall("", "", "samm_exit_scope", "");
+    if (isSAMMEnabled()) {
+        builder_->emitComment("SAMM: Exit DESTRUCTOR scope");
+        builder_->emitCall("", "", "samm_exit_scope", "");
+    }
     
     builder_->emitReturn();
     builder_->emitFunctionEnd();

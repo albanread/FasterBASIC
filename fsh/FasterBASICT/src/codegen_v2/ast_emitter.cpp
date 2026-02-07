@@ -22,6 +22,10 @@ ASTEmitter::ASTEmitter(QBEBuilder& builder, TypeManager& typeManager,
 {
 }
 
+bool ASTEmitter::isSAMMEnabled() const {
+    return semantic_.getSymbolTable().sammEnabled;
+}
+
 // === Expression Emission ===
 
 std::string ASTEmitter::emitExpression(const Expression* expr) {
@@ -419,6 +423,33 @@ std::string ASTEmitter::emitMemberAccessExpression(const MemberAccessExpression*
                 classSym = symbolTable.lookupClass(vs->typeDesc.className);
                 // Load the object pointer from the variable
                 objPtr = loadVariable(varExpr->name);
+            }
+            // --- METHOD-local CLASS instance fallback ---
+            // DIM'd CLASS instances inside METHOD bodies are registered in
+            // methodParamAddresses_ / methodParamTypes_ but are NOT in the
+            // semantic symbol table.  Check our local maps.
+            if (!classSym && currentClassContext_) {
+                auto mpTypeIt = methodParamTypes_.find(varExpr->name);
+                if (mpTypeIt != methodParamTypes_.end() &&
+                    mpTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                    const auto& symbolTable = semantic_.getSymbolTable();
+                    auto cnIt = methodParamClassNames_.find(varExpr->name);
+                    if (cnIt != methodParamClassNames_.end()) {
+                        classSym = symbolTable.lookupClass(cnIt->second);
+                    }
+                    // Fallback: search all classes for one with this field
+                    if (!classSym) {
+                        for (const auto& pair : symbolTable.classes) {
+                            if (pair.second.findField(expr->memberName)) {
+                                classSym = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (classSym) {
+                        objPtr = loadVariable(varExpr->name);
+                    }
+                }
             }
         }
 
@@ -1365,6 +1396,7 @@ void ASTEmitter::registerMethodParam(const std::string& name, const std::string&
 void ASTEmitter::clearMethodParams() {
     methodParamAddresses_.clear();
     methodParamTypes_.clear();
+    methodParamClassNames_.clear();
 }
 
 std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
@@ -1418,6 +1450,35 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
             if (varSym && varSym->typeDesc.isClassType) {
                 classSym = symbolTable.lookupClass(varSym->typeDesc.className);
                 objPtr = loadVariable(varExpr->name);
+            }
+            // --- METHOD-local CLASS instance fallback ---
+            // DIM'd CLASS instances inside METHOD bodies are registered in
+            // methodParamAddresses_ / methodParamTypes_ but are NOT in the
+            // semantic symbol table.  If the symbol-table lookup above did
+            // not resolve a class, check if the variable is a method-local
+            // CLASS_INSTANCE and look up its class from methodParamClassNames_.
+            if (!classSym && currentClassContext_) {
+                auto mpTypeIt = methodParamTypes_.find(varExpr->name);
+                if (mpTypeIt != methodParamTypes_.end() &&
+                    mpTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                    // Look up the CLASS name stored when the variable was DIM'd
+                    auto cnIt = methodParamClassNames_.find(varExpr->name);
+                    if (cnIt != methodParamClassNames_.end()) {
+                        classSym = symbolTable.lookupClass(cnIt->second);
+                    }
+                    // Fallback: search all classes for one that has the method
+                    if (!classSym) {
+                        for (const auto& pair : symbolTable.classes) {
+                            if (pair.second.findMethod(methodName)) {
+                                classSym = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (classSym) {
+                        objPtr = loadVariable(varExpr->name);
+                    }
+                }
             }
         }
         
@@ -2624,8 +2685,10 @@ void ASTEmitter::emitEndStatement(const EndStatement* stmt) {
     // SAMM: Must shut down scope-aware memory management before exiting
     // so that the background cleanup worker is stopped, all pending
     // destructors are called, and diagnostic metrics are printed.
-    builder_.emitComment("SAMM: Shutdown before END");
-    builder_.emitCall("", "", "samm_shutdown", "");
+    if (isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Shutdown before END");
+        builder_.emitCall("", "", "samm_shutdown", "");
+    }
 
     builder_.emitComment("END statement - program exit");
     builder_.emitReturn("0");
@@ -2646,15 +2709,17 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
             // to the parent scope so it survives the current method scope's
             // cleanup. This is essential for factory methods and methods that
             // create and return new objects.
-            if (methodReturnType_ == FasterBASIC::BaseType::CLASS_INSTANCE) {
+            if (isSAMMEnabled() && methodReturnType_ == FasterBASIC::BaseType::CLASS_INSTANCE) {
                 builder_.emitComment("SAMM: RETAIN returned CLASS instance to parent scope");
                 builder_.emitCall("", "", "samm_retain_parent", "l " + value);
             }
 
             // SAMM: Exit METHOD scope before returning. All tracked
             // allocations (except RETAINed ones) are queued for cleanup.
-            builder_.emitComment("SAMM: Exit METHOD scope");
-            builder_.emitCall("", "", "samm_exit_scope", "");
+            if (isSAMMEnabled()) {
+                builder_.emitComment("SAMM: Exit METHOD scope");
+                builder_.emitCall("", "", "samm_exit_scope", "");
+            }
 
             builder_.emitComment("METHOD RETURN");
             builder_.emitReturn(value);
@@ -2697,8 +2762,10 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
         // scope exit instead.
         if (currentClassContext_ != nullptr) {
             // We're inside a METHOD/CONSTRUCTOR body — emit direct return
-            builder_.emitComment("SAMM: Exit METHOD scope (early void RETURN)");
-            builder_.emitCall("", "", "samm_exit_scope", "");
+            if (isSAMMEnabled()) {
+                builder_.emitComment("SAMM: Exit METHOD scope (early void RETURN)");
+                builder_.emitCall("", "", "samm_exit_scope", "");
+            }
 
             builder_.emitComment("METHOD RETURN (void)");
             builder_.emitReturn();
@@ -2807,7 +2874,32 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
                     // CLASS instance variable — pointer semantics
                     builder_.emitComment("DIM " + arrayName + " AS " + cls->name + " (CLASS instance)");
                     
-                    // Get variable address
+                    // === METHOD-local CLASS instance DIM ===
+                    // Method bodies don't go through CFGEmitter, so local
+                    // variables are NOT pre-allocated.  Allocate a stack slot
+                    // here and register it so loadVariable/storeVariable/
+                    // getVariableAddress can resolve it.
+                    if (currentClassContext_) {
+                        std::string varSlot = "%var_" + arrayName;
+                        builder_.emitComment("METHOD-local DIM: " + arrayName + " AS " + cls->name);
+                        builder_.emitRaw("    " + varSlot + " =l alloc8 8\n");
+                        // Zero-initialize (NOTHING)
+                        builder_.emitRaw("    storel 0, " + varSlot + "\n");
+                        // Register so load/store/getVariableAddress can resolve it
+                        registerMethodParam(arrayName, varSlot, FasterBASIC::BaseType::CLASS_INSTANCE);
+                        // Store the CLASS name so emitMethodCall can resolve
+                        // the correct ClassSymbol for virtual dispatch.
+                        methodParamClassNames_[arrayName] = cls->name;
+                        
+                        // Handle initializer (e.g., = NEW ClassName(...))
+                        if (arrayDecl.initializer) {
+                            std::string initVal = emitExpression(arrayDecl.initializer.get());
+                            builder_.emitRaw("    storel " + initVal + ", " + varSlot + "\n");
+                        }
+                        continue;
+                    }
+                    
+                    // Get variable address (global / function-local via CFG)
                     std::string varAddr = getVariableAddress(arrayName);
                     
                     // If there's an initializer (e.g., = NEW ClassName(...)), emit it
@@ -3370,6 +3462,22 @@ std::string ASTEmitter::normalizeForLoopVarName(const std::string& varName) cons
     return varName;
 }
 
+std::string ASTEmitter::stripTextTypeSuffix(const std::string& name) {
+    if (name.empty()) return name;
+    // Check for text suffixes appended by parser mangling
+    struct { const char* suffix; size_t len; } suffixes[] = {
+        {"_STRING", 7}, {"_DOUBLE", 7}, {"_FLOAT", 6},
+        {"_SHORT", 6}, {"_LONG", 5}, {"_BYTE", 5}, {"_INT", 4}
+    };
+    for (const auto& s : suffixes) {
+        if (name.length() > s.len &&
+            name.compare(name.length() - s.len, s.len, s.suffix) == 0) {
+            return name.substr(0, name.length() - s.len);
+        }
+    }
+    return name;
+}
+
 std::string ASTEmitter::normalizeVariableName(const std::string& varName) const {
     // First check if it's a FOR loop variable
     std::string forNormalized = normalizeForLoopVarName(varName);
@@ -3380,6 +3488,24 @@ std::string ASTEmitter::normalizeVariableName(const std::string& varName) const 
     // Check if this is a FOR EACH iteration variable (not in symbol table by design)
     if (forEachVarTypes_.count(varName) > 0) {
         return varName;  // Return raw name — loadVariable/storeVariable handle the rest
+    }
+    
+    // --- METHOD/CONSTRUCTOR local-variable & parameter check ---
+    // Variables registered via registerMethodParam() (method parameters,
+    // DIM'd locals inside METHOD bodies, FOR loop vars, and the method
+    // return-value slot) are NOT in the semantic symbol table.
+    // Check our local parameter map BEFORE falling through to the symbol
+    // table, using both the raw name and the suffix-stripped base name.
+    if (!methodParamAddresses_.empty()) {
+        // Try raw name first (e.g. "acc", "m", "last")
+        if (methodParamAddresses_.count(varName) > 0) {
+            return varName;
+        }
+        // Try suffix-stripped base name (e.g. "m_INT" -> "m", "acc_DOUBLE" -> "acc")
+        std::string baseName = stripTextTypeSuffix(varName);
+        if (baseName != varName && methodParamAddresses_.count(baseName) > 0) {
+            return baseName;
+        }
     }
     
     // Not a FOR loop variable - check if name already has a suffix
@@ -3612,6 +3738,48 @@ void ASTEmitter::storeVariable(const std::string& varName, const std::string& va
     // Normalize variable name using semantic analyzer's type inference
     std::string lookupName = normalizeVariableName(varName);
     
+    // --- METHOD/CONSTRUCTOR local-variable & return-slot fallback ---
+    // Variables registered via registerMethodParam() (method parameters,
+    // DIM'd locals inside METHOD bodies, and the method return-value slot)
+    // are NOT in the semantic symbol table.  Check our local map first,
+    // mirroring the fallback in loadVariable / getVariableAddress.
+    {
+        auto mpIt = methodParamAddresses_.find(varName);
+        std::string mpKey = varName;
+        if (mpIt == methodParamAddresses_.end() && varName != lookupName) {
+            mpIt = methodParamAddresses_.find(lookupName);
+            mpKey = lookupName;
+        }
+        if (mpIt != methodParamAddresses_.end()) {
+            std::string addr = mpIt->second;
+            BaseType mpType = BaseType::LONG;  // default
+            auto typeIt = methodParamTypes_.find(mpKey);
+            if (typeIt != methodParamTypes_.end()) {
+                mpType = typeIt->second;
+            }
+
+            // STRING assignment with reference counting
+            if (typeManager_.isString(mpType)) {
+                builder_.emitComment("Method-local string assignment: " + varName);
+                std::string oldPtr = builder_.newTemp();
+                builder_.emitRaw("    " + oldPtr + " =l loadl " + addr + "\n");
+                std::string retainedPtr = builder_.newTemp();
+                builder_.emitCall(retainedPtr, "l", "string_retain", "l " + value);
+                builder_.emitRaw("    storel " + retainedPtr + ", " + addr + "\n");
+                builder_.emitCall("", "", "string_release", "l " + oldPtr);
+            } else {
+                std::string qbeT = typeManager_.getQBEType(mpType);
+                std::string storeOp;
+                if (qbeT == "w")      storeOp = "storew";
+                else if (qbeT == "s") storeOp = "stores";
+                else if (qbeT == "d") storeOp = "stored";
+                else                  storeOp = "storel";
+                builder_.emitRaw("    " + storeOp + " " + value + ", " + addr + "\n");
+            }
+            return;
+        }
+    }
+
     // --- FOR EACH variable fallback ---
     {
         auto feIt = forEachVarTypes_.find(lookupName);
@@ -4105,6 +4273,38 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
                             const FasterBASIC::MethodSignature* method = objDesc->findMethod(methodExpr->methodName);
                             if (method) {
                                 return method->returnType;
+                            }
+                        }
+                    }
+                }
+                
+                // --- METHOD-local CLASS instance fallback ---
+                // DIM'd CLASS instances inside METHOD bodies are registered
+                // in methodParamTypes_ / methodParamClassNames_ but are NOT
+                // in the semantic symbol table.  Resolve the return type
+                // from the ClassSymbol stored at DIM time.
+                if (!varSym && currentClassContext_) {
+                    auto mpTypeIt = methodParamTypes_.find(objectName);
+                    if (mpTypeIt != methodParamTypes_.end() &&
+                        mpTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                        const FasterBASIC::ClassSymbol* cls = nullptr;
+                        auto cnIt = methodParamClassNames_.find(objectName);
+                        if (cnIt != methodParamClassNames_.end()) {
+                            cls = semantic_.getSymbolTable().lookupClass(cnIt->second);
+                        }
+                        // Fallback: search all classes for one with this method
+                        if (!cls) {
+                            for (const auto& pair : semantic_.getSymbolTable().classes) {
+                                if (pair.second.findMethod(methodExpr->methodName)) {
+                                    cls = &pair.second;
+                                    break;
+                                }
+                            }
+                        }
+                        if (cls) {
+                            const auto* mi = cls->findMethod(methodExpr->methodName);
+                            if (mi) {
+                                return mi->returnType.baseType;
                             }
                         }
                     }
@@ -6638,6 +6838,54 @@ void ASTEmitter::emitIfDirect(const FasterBASIC::IfStatement* stmt) {
     builder_.emitLabel(endLabel);
 }
 
+// ---------------------------------------------------------------------------
+// bodyContainsDim — recursively check whether a statement list contains any
+// DIM statement (at any nesting depth inside FOR/IF/WHILE/DO bodies).
+// Used to gate SAMM loop-iteration scope emission: we only pay the cost of
+// samm_enter_scope / samm_exit_scope when the loop actually allocates.
+// ---------------------------------------------------------------------------
+bool ASTEmitter::bodyContainsDim(const std::vector<FasterBASIC::StatementPtr>& body) {
+    for (const auto& s : body) {
+        if (!s) continue;
+        switch (s->getType()) {
+            case FasterBASIC::ASTNodeType::STMT_DIM:
+                return true;
+            case FasterBASIC::ASTNodeType::STMT_FOR: {
+                const auto* f = static_cast<const FasterBASIC::ForStatement*>(s.get());
+                if (bodyContainsDim(f->body)) return true;
+                break;
+            }
+            case FasterBASIC::ASTNodeType::STMT_FOR_IN: {
+                const auto* f = static_cast<const FasterBASIC::ForInStatement*>(s.get());
+                if (bodyContainsDim(f->body)) return true;
+                break;
+            }
+            case FasterBASIC::ASTNodeType::STMT_IF: {
+                const auto* i = static_cast<const FasterBASIC::IfStatement*>(s.get());
+                if (bodyContainsDim(i->thenStatements)) return true;
+                for (const auto& c : i->elseIfClauses) {
+                    if (bodyContainsDim(c.statements)) return true;
+                }
+                if (bodyContainsDim(i->elseStatements)) return true;
+                break;
+            }
+            case FasterBASIC::ASTNodeType::STMT_WHILE: {
+                const auto* w = static_cast<const FasterBASIC::WhileStatement*>(s.get());
+                if (bodyContainsDim(w->body)) return true;
+                break;
+            }
+            case FasterBASIC::ASTNodeType::STMT_DO: {
+                const auto* d = static_cast<const FasterBASIC::DoStatement*>(s.get());
+                if (bodyContainsDim(d->body)) return true;
+                break;
+            }
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
     if (!stmt) return;
 
@@ -6660,12 +6908,12 @@ void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
         registerMethodParam(loopVarName, varSlot, FasterBASIC::BaseType::LONG);
     }
 
-    // Initialise loop variable with start value
-    std::string startVal = emitExpression(stmt->start.get());
+    // Initialise loop variable with start value (widened to LONG for 8-byte slot)
+    std::string startVal = emitExpressionAs(stmt->start.get(), FasterBASIC::BaseType::LONG);
     storeVariable(loopVarName, startVal);
 
-    // Evaluate end value and step, store in temp slots
-    std::string endVal = emitExpression(stmt->end.get());
+    // Evaluate end value and step, store in temp slots (widened to LONG)
+    std::string endVal = emitExpressionAs(stmt->end.get(), FasterBASIC::BaseType::LONG);
     std::string endSlot = "%mfor_end_" + std::to_string(id);
     builder_.emitRaw("    " + endSlot + " =l alloc8 8\n");
     builder_.emitRaw("    storel " + endVal + ", " + endSlot + "\n");
@@ -6674,7 +6922,7 @@ void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
     std::string stepSlot = "%mfor_step_" + std::to_string(id);
     builder_.emitRaw("    " + stepSlot + " =l alloc8 8\n");
     if (stmt->step) {
-        stepVal = emitExpression(stmt->step.get());
+        stepVal = emitExpressionAs(stmt->step.get(), FasterBASIC::BaseType::LONG);
     } else {
         stepVal = "1";
     }
@@ -6732,8 +6980,19 @@ void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
 
     // --- Body ---
     builder_.emitLabel(bodyLabel);
+    // SAMM: Only emit loop-iteration scope if the body contains DIM
+    // statements — avoids overhead on simple loops that don't allocate.
+    bool forNeedsSammScope = bodyContainsDim(stmt->body);
+    if (forNeedsSammScope && isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Enter FOR loop-iteration scope");
+        builder_.emitCall("", "", "samm_enter_scope", "");
+    }
     for (const auto& s : stmt->body) {
         if (s) emitStatement(s.get());
+    }
+    if (forNeedsSammScope && isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Exit FOR loop-iteration scope");
+        builder_.emitCall("", "", "samm_exit_scope", "");
     }
     builder_.emitJump(incrLabel);
 
@@ -6790,8 +7049,19 @@ void ASTEmitter::emitWhileDirect(const FasterBASIC::WhileStatement* stmt) {
 
     // --- Body ---
     builder_.emitLabel(bodyLabel);
+    // SAMM: Only emit loop-iteration scope if the body contains DIM
+    // statements — avoids overhead on simple loops that don't allocate.
+    bool whileNeedsSammScope = bodyContainsDim(stmt->body);
+    if (whileNeedsSammScope && isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Enter WHILE loop-iteration scope");
+        builder_.emitCall("", "", "samm_enter_scope", "");
+    }
     for (const auto& s : stmt->body) {
         if (s) emitStatement(s.get());
+    }
+    if (whileNeedsSammScope && isSAMMEnabled()) {
+        builder_.emitComment("SAMM: Exit WHILE loop-iteration scope");
+        builder_.emitCall("", "", "samm_exit_scope", "");
     }
     builder_.emitJump(condLabel);
 

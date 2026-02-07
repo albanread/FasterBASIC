@@ -73,6 +73,12 @@ public:
                FasterBASIC::SemanticAnalyzer& semantic);
     ~ASTEmitter() = default;
 
+    /**
+     * Check if SAMM (Scope-Aware Memory Management) is enabled.
+     * Returns false when the program contains OPTION SAMM OFF.
+     */
+    bool isSAMMEnabled() const;
+
     // === Expression Emission ===
     
     /**
@@ -108,6 +114,33 @@ public:
      * Get the current METHOD return type (VOID if not inside a method).
      */
     FasterBASIC::BaseType getMethodReturnType() const { return methodReturnType_; }
+
+    /**
+     * Set the current METHOD name being emitted.
+     * Used to detect return-via-assignment (e.g., `Hello = "Hi"` inside
+     * METHOD Hello() AS STRING).  The name is compared case-insensitively
+     * against LET assignment targets.
+     * Pass an empty string to clear after method emission.
+     * @param name The METHOD name (e.g. "Hello", "GetName$")
+     */
+    void setMethodName(const std::string& name) { methodName_ = name; }
+
+    /**
+     * Get the current METHOD name (empty if not inside a method).
+     */
+    const std::string& getMethodName() const { return methodName_; }
+
+    /**
+     * Set the QBE stack-slot name for the method return variable.
+     * Allocated by emitClassMethod when the method has a non-void return type.
+     * @param slot QBE address (e.g. "%method_ret")
+     */
+    void setMethodReturnSlot(const std::string& slot) { methodReturnSlot_ = slot; }
+
+    /**
+     * Get the QBE stack-slot name for the method return variable.
+     */
+    const std::string& getMethodReturnSlot() const { return methodReturnSlot_; }
     
     /**
      * Emit a sequence of statements (used for METHOD/CONSTRUCTOR/DESTRUCTOR bodies).
@@ -468,6 +501,18 @@ private:
     // `ret <value>` instead of the FUNCTION-style store-and-jump pattern.
     // Set to VOID (default) when not inside a method body.
     FasterBASIC::BaseType methodReturnType_ = FasterBASIC::BaseType::VOID;
+
+    // === METHOD name context ===
+    // When emitting a METHOD body, this holds the method's name so that
+    // assignment-to-method-name (e.g., `Hello = "Hi"`) can be detected and
+    // routed to the method return slot instead of a regular variable store.
+    std::string methodName_;
+
+    // === METHOD return-value stack slot ===
+    // QBE address of the stack slot allocated for method return-via-assignment.
+    // Allocated in emitClassMethod; loaded in the fallback-return path.
+    // Empty when not inside a method or when the method is void.
+    std::string methodReturnSlot_;
     
     // === METHOD/CONSTRUCTOR parameter maps ===
     // Registered before emitting a method body so that getVariableAddress / loadVariable
@@ -476,6 +521,10 @@ private:
     std::unordered_map<std::string, std::string> methodParamAddresses_;
     // Key: raw parameter name, Value: BaseType of the parameter
     std::unordered_map<std::string, FasterBASIC::BaseType> methodParamTypes_;
+    // Key: raw variable name, Value: CLASS name (e.g. "Item")
+    // Only populated for CLASS_INSTANCE variables DIM'd inside METHOD bodies.
+    // Used by emitMethodCall to resolve the correct ClassSymbol for virtual dispatch.
+    std::unordered_map<std::string, std::string> methodParamClassNames_;
     
     // === Expression Emitters (by type) ===
     
@@ -581,6 +630,11 @@ private:
     // This ensures codegen uses the same normalized names as the symbol table
     std::string normalizeVariableName(const std::string& varName) const;
 
+    // Strip text-form type suffixes (_INT, _LONG, _DOUBLE, _STRING, _FLOAT, _BYTE, _SHORT)
+    // from a variable name, returning the base name.  Used to reconcile parser-mangled
+    // names (e.g. "m_INT") with method-param registration keys (e.g. "m").
+    static std::string stripTextTypeSuffix(const std::string& name);
+
 public:
     // === NEON Phase 3: Array Loop Vectorization (public for CFGEmitter) ===
 
@@ -623,6 +677,14 @@ public:
      */
     void emitForDirect(const FasterBASIC::ForStatement* stmt);
     
+    /**
+     * Check whether a statement list contains any DIM statement (recursively).
+     * Used to decide whether SAMM loop-iteration scopes are needed — we only
+     * emit samm_enter_scope/samm_exit_scope around loop bodies that actually
+     * allocate variables, avoiding overhead on simple loops.
+     */
+    static bool bodyContainsDim(const std::vector<FasterBASIC::StatementPtr>& body);
+
     /**
      * Emit a WHILE..WEND loop directly (without CFG).
      * Used inside METHOD/CONSTRUCTOR/DESTRUCTOR bodies.

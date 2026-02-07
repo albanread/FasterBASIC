@@ -926,6 +926,7 @@ struct SymbolTable {
     bool eventsUsed = false;  // EVENT DETECTION: if true, program uses ON EVENT statements and needs event processing code
     bool forceYieldEnabled = false;  // OPTION FORCE_YIELD: if true, enable quasi-preemptive handler yielding
     int forceYieldBudget = 10000;  // OPTION FORCE_YIELD budget: instructions before forced yield
+    bool sammEnabled = true;  // OPTION SAMM: if true, emit SAMM scope enter/exit calls for automatic memory management
     
     // Type registry for UDT type IDs (new type system)
     std::unordered_map<std::string, int> typeNameToId;  // UDT name -> unique type ID
@@ -1250,6 +1251,10 @@ private:
     void collectTypeDeclarations(Program& program);  // Collect TYPE/END TYPE declarations
     void collectClassDeclarations(Program& program);  // Collect CLASS/END CLASS declarations
     void collectTimerHandlers(Program& program);  // Collect AFTER/EVERY handlers in pass1
+
+    // Recursively walk a statement list and process any DIM statements found,
+    // including those nested inside FOR/IF/WHILE/DO bodies.
+    void collectDimStatementsRecursive(const std::vector<StatementPtr>& stmts);
 
     void processDimStatement(const DimStatement& stmt);
     void processFunctionStatement(const FunctionStatement& stmt);

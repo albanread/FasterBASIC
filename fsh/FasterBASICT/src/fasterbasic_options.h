@@ -70,6 +70,11 @@ struct CompilerOptions {
     // When false, variables can be implicitly declared on first use
     bool explicitDeclarations = false;
     
+    // Scope-aware memory management: OPTION SAMM ON/OFF
+    // When true, emit SAMM scope enter/exit calls for automatic memory management
+    // When false, skip all SAMM emission (useful for debugging or maximum performance)
+    bool sammEnabled = true;
+    
     // Forced yielding: OPTION FORCE_YIELD [budget]
     // When enabled, timer handlers are automatically yielded after N instructions
     // This prevents long-running handlers from blocking the main program
@@ -89,6 +94,7 @@ struct CompilerOptions {
         errorTracking = true;      // Default to enabled for better UX
         bitwiseOperators = false;
         explicitDeclarations = false;
+        sammEnabled = true;
         forceYieldEnabled = false;
         forceYieldBudget = 10000;
     }
