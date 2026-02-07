@@ -235,6 +235,16 @@ void RuntimeObjectRegistry::registerListType() {
     pop.withDescription("Remove and return the last element");
     list.addMethod(pop);
 
+    // Enable subscript operator: myList(n) for read access (sugar for .GET(n))
+    // The actual codegen selects list_get_int/list_get_float/list_get_ptr based on
+    // the list's element type — these defaults are just for the semantic analyzer.
+    list.enableSubscript(
+        TypeDescriptor(BaseType::INTEGER),  // Key is 1-based integer index
+        TypeDescriptor(BaseType::LONG),     // Default return type (overridden by codegen)
+        "list_get_int",                     // Default get function (overridden by codegen)
+        "list_insert_int"                   // Default set function (not yet used)
+    );
+
     registerObjectType(list);
 }
 

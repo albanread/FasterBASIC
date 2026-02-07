@@ -341,6 +341,12 @@ std::string ASTEmitter::emitBinaryExpression(const BinaryExpression* expr) {
     // Numeric operation - promote to common type
     BaseType commonType = typeManager_.getPromotedType(leftType, rightType);
     
+    // BASIC: `/` is always floating-point division.  `\` is integer division.
+    // If both operands are integral and the operator is `/`, force DOUBLE.
+    if (op == TokenType::DIVIDE && !typeManager_.isFloatingPoint(commonType)) {
+        commonType = BaseType::DOUBLE;
+    }
+    
     std::string left = emitExpressionAs(expr->left.get(), commonType);
     std::string right = emitExpressionAs(expr->right.get(), commonType);
     
@@ -4966,8 +4972,13 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
                 return BaseType::STRING;
             }
             
-            // Arithmetic operations promote to common type
-            return typeManager_.getPromotedType(leftType, rightType);
+            // BASIC: `/` always produces DOUBLE (float division).
+            // `\` (INT_DIVIDE) stays integral.
+            BaseType result = typeManager_.getPromotedType(leftType, rightType);
+            if (binExpr->op == TokenType::DIVIDE && !typeManager_.isFloatingPoint(result)) {
+                return BaseType::DOUBLE;
+            }
+            return result;
         }
         
         case ASTNodeType::EXPR_UNARY: {
@@ -8043,67 +8054,7 @@ void ASTEmitter::emitIfDirect(const FasterBASIC::IfStatement* stmt) {
     builder_.emitLabel(endLabel);
 }
 
-// ---------------------------------------------------------------------------
-// bodyContainsDim — recursively check whether a statement list contains any
-// DIM statement or string-producing operation (at any nesting depth inside
-// FOR/IF/WHILE/DO bodies).
-// Used to gate SAMM loop-iteration scope emission: we only pay the cost of
-// samm_enter_scope / samm_exit_scope when the loop actually allocates.
-// With SAMM string tracking, string operations (assignments to $ variables,
-// PRINT of strings, etc.) also allocate and should trigger loop scopes.
-// ---------------------------------------------------------------------------
-bool ASTEmitter::bodyContainsDim(const std::vector<FasterBASIC::StatementPtr>& body) {
-    for (const auto& s : body) {
-        if (!s) continue;
-        switch (s->getType()) {
-            case FasterBASIC::ASTNodeType::STMT_DIM:
-                return true;
-            // LET assignment to a string variable (name ends with '$')
-            // creates a new string descriptor that should be scope-tracked.
-            case FasterBASIC::ASTNodeType::STMT_LET: {
-                const auto* let = static_cast<const FasterBASIC::LetStatement*>(s.get());
-                if (!let->variable.empty() && let->variable.back() == '$') return true;
-                break;
-            }
-            // PRINT statements frequently concatenate strings, creating
-            // temporaries that benefit from per-iteration cleanup.
-            case FasterBASIC::ASTNodeType::STMT_PRINT:
-                return true;
-            case FasterBASIC::ASTNodeType::STMT_FOR: {
-                const auto* f = static_cast<const FasterBASIC::ForStatement*>(s.get());
-                if (bodyContainsDim(f->body)) return true;
-                break;
-            }
-            case FasterBASIC::ASTNodeType::STMT_FOR_IN: {
-                const auto* f = static_cast<const FasterBASIC::ForInStatement*>(s.get());
-                if (bodyContainsDim(f->body)) return true;
-                break;
-            }
-            case FasterBASIC::ASTNodeType::STMT_IF: {
-                const auto* i = static_cast<const FasterBASIC::IfStatement*>(s.get());
-                if (bodyContainsDim(i->thenStatements)) return true;
-                for (const auto& c : i->elseIfClauses) {
-                    if (bodyContainsDim(c.statements)) return true;
-                }
-                if (bodyContainsDim(i->elseStatements)) return true;
-                break;
-            }
-            case FasterBASIC::ASTNodeType::STMT_WHILE: {
-                const auto* w = static_cast<const FasterBASIC::WhileStatement*>(s.get());
-                if (bodyContainsDim(w->body)) return true;
-                break;
-            }
-            case FasterBASIC::ASTNodeType::STMT_DO: {
-                const auto* d = static_cast<const FasterBASIC::DoStatement*>(s.get());
-                if (bodyContainsDim(d->body)) return true;
-                break;
-            }
-            default:
-                break;
-        }
-    }
-    return false;
-}
+
 
 void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
     if (!stmt) return;
@@ -8199,19 +8150,9 @@ void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
 
     // --- Body ---
     builder_.emitLabel(bodyLabel);
-    // SAMM: Only emit loop-iteration scope if the body contains DIM
-    // statements — avoids overhead on simple loops that don't allocate.
-    bool forNeedsSammScope = bodyContainsDim(stmt->body);
-    if (forNeedsSammScope && isSAMMEnabled()) {
-        builder_.emitComment("SAMM: Enter FOR loop-iteration scope");
-        builder_.emitCall("", "", "samm_enter_scope", "");
-    }
+    // BASIC variables have function scope — no per-iteration SAMM scoping.
     for (const auto& s : stmt->body) {
         if (s) emitStatement(s.get());
-    }
-    if (forNeedsSammScope && isSAMMEnabled()) {
-        builder_.emitComment("SAMM: Exit FOR loop-iteration scope");
-        builder_.emitCall("", "", "samm_exit_scope", "");
     }
     builder_.emitJump(incrLabel);
 
@@ -8268,19 +8209,9 @@ void ASTEmitter::emitWhileDirect(const FasterBASIC::WhileStatement* stmt) {
 
     // --- Body ---
     builder_.emitLabel(bodyLabel);
-    // SAMM: Only emit loop-iteration scope if the body contains DIM
-    // statements — avoids overhead on simple loops that don't allocate.
-    bool whileNeedsSammScope = bodyContainsDim(stmt->body);
-    if (whileNeedsSammScope && isSAMMEnabled()) {
-        builder_.emitComment("SAMM: Enter WHILE loop-iteration scope");
-        builder_.emitCall("", "", "samm_enter_scope", "");
-    }
+    // BASIC variables have function scope — no per-iteration SAMM scoping.
     for (const auto& s : stmt->body) {
         if (s) emitStatement(s.get());
-    }
-    if (whileNeedsSammScope && isSAMMEnabled()) {
-        builder_.emitComment("SAMM: Exit WHILE loop-iteration scope");
-        builder_.emitCall("", "", "samm_exit_scope", "");
     }
     builder_.emitJump(condLabel);
 

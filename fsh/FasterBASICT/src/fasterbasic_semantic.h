@@ -1266,6 +1266,7 @@ private:
     // Pass 1: Declaration collection
     void collectLineNumbers(Program& program);
     void collectLabels(Program& program);
+    void collectLabelsRecursive(const std::vector<StatementPtr>& statements, int fallbackLineNumber);
     void collectOptionStatements(Program& program);
     void collectGlobalStatements(Program& program);
     void collectDimStatements(Program& program);

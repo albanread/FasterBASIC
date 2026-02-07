@@ -177,6 +177,26 @@ BasicBlock* CFGBuilder::buildStatementRange(
         }
         
         // =============================================================================
+        // Label Statements (block boundaries)
+        // =============================================================================
+        
+        if (auto* labelStmt = dynamic_cast<const LabelStatement*>(stmt.get())) {
+            // Labels start a new basic block and register the label→block mapping
+            // so that GOTO/GOSUB can resolve label targets.
+            BasicBlock* labelBlock = createBlock("Label_" + labelStmt->labelName);
+            addUnconditionalEdge(currentBlock->id, labelBlock->id);
+            registerLabel(labelStmt->labelName, labelBlock->id);
+            // The label statement itself doesn't generate code — it's just a marker
+            addStatementToBlock(labelBlock, stmt.get(), getLineNumber(stmt.get()));
+            currentBlock = labelBlock;
+            if (m_debugMode) {
+                std::cout << "[CFG] Label '" << labelStmt->labelName 
+                          << "' -> block " << labelBlock->id << std::endl;
+            }
+            continue;
+        }
+        
+        // =============================================================================
         // Jump Statements (terminators)
         // =============================================================================
         

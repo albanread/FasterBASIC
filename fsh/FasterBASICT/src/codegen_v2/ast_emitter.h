@@ -838,14 +838,6 @@ public:
     void emitForDirect(const FasterBASIC::ForStatement* stmt);
     
     /**
-     * Check whether a statement list contains any DIM statement (recursively).
-     * Used to decide whether SAMM loop-iteration scopes are needed — we only
-     * emit samm_enter_scope/samm_exit_scope around loop bodies that actually
-     * allocate variables, avoiding overhead on simple loops.
-     */
-    static bool bodyContainsDim(const std::vector<FasterBASIC::StatementPtr>& body);
-
-    /**
      * Emit a WHILE..WEND loop directly (without CFG).
      * Used inside METHOD/CONSTRUCTOR/DESTRUCTOR bodies.
      */

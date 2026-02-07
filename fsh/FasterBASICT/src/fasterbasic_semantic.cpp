@@ -393,20 +393,106 @@ void SemanticAnalyzer::collectLineNumbers(Program& program) {
     }
 }
 
+void SemanticAnalyzer::collectLabelsRecursive(const std::vector<StatementPtr>& statements, int fallbackLineNumber) {
+    for (const auto& stmt : statements) {
+        if (!stmt) continue;
+
+        if (stmt->getType() == ASTNodeType::STMT_LABEL) {
+            const auto& labelStmt = static_cast<const LabelStatement&>(*stmt);
+            declareLabel(labelStmt.labelName, fallbackLineNumber, stmt->location);
+            continue;
+        }
+
+        // Recurse into compound statement bodies
+        switch (stmt->getType()) {
+            case ASTNodeType::STMT_WHILE: {
+                const auto& whileStmt = static_cast<const WhileStatement&>(*stmt);
+                collectLabelsRecursive(whileStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_FOR: {
+                const auto& forStmt = static_cast<const ForStatement&>(*stmt);
+                collectLabelsRecursive(forStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_FOR_IN: {
+                const auto& forInStmt = static_cast<const ForInStatement&>(*stmt);
+                collectLabelsRecursive(forInStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_DO: {
+                const auto& doStmt = static_cast<const DoStatement&>(*stmt);
+                collectLabelsRecursive(doStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_REPEAT: {
+                const auto& repeatStmt = static_cast<const RepeatStatement&>(*stmt);
+                collectLabelsRecursive(repeatStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_IF: {
+                const auto& ifStmt = static_cast<const IfStatement&>(*stmt);
+                collectLabelsRecursive(ifStmt.thenStatements, fallbackLineNumber);
+                for (const auto& elseIfClause : ifStmt.elseIfClauses) {
+                    collectLabelsRecursive(elseIfClause.statements, fallbackLineNumber);
+                }
+                collectLabelsRecursive(ifStmt.elseStatements, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_CASE: {
+                const auto& caseStmt = static_cast<const CaseStatement&>(*stmt);
+                for (const auto& whenClause : caseStmt.whenClauses) {
+                    collectLabelsRecursive(whenClause.statements, fallbackLineNumber);
+                }
+                collectLabelsRecursive(caseStmt.otherwiseStatements, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_MATCH_TYPE: {
+                const auto& matchStmt = static_cast<const MatchTypeStatement&>(*stmt);
+                for (const auto& arm : matchStmt.caseArms) {
+                    collectLabelsRecursive(arm.body, fallbackLineNumber);
+                }
+                if (!matchStmt.caseElseBody.empty()) {
+                    collectLabelsRecursive(matchStmt.caseElseBody, fallbackLineNumber);
+                }
+                break;
+            }
+            case ASTNodeType::STMT_TRY_CATCH: {
+                const auto& tryStmt = static_cast<const TryCatchStatement&>(*stmt);
+                collectLabelsRecursive(tryStmt.tryBlock, fallbackLineNumber);
+                for (const auto& clause : tryStmt.catchClauses) {
+                    collectLabelsRecursive(clause.block, fallbackLineNumber);
+                }
+                if (tryStmt.hasFinally) {
+                    collectLabelsRecursive(tryStmt.finallyBlock, fallbackLineNumber);
+                }
+                break;
+            }
+            case ASTNodeType::STMT_FUNCTION: {
+                const auto& funcStmt = static_cast<const FunctionStatement&>(*stmt);
+                collectLabelsRecursive(funcStmt.body, fallbackLineNumber);
+                break;
+            }
+            case ASTNodeType::STMT_SUB: {
+                const auto& subStmt = static_cast<const SubStatement&>(*stmt);
+                collectLabelsRecursive(subStmt.body, fallbackLineNumber);
+                break;
+            }
+            default:
+                break;
+        }
+    }
+}
+
 void SemanticAnalyzer::collectLabels(Program& program) {
     for (size_t i = 0; i < program.lines.size(); ++i) {
         const auto& line = program.lines[i];
-        for (const auto& stmt : line->statements) {
-            if (stmt->getType() == ASTNodeType::STMT_LABEL) {
-                const auto& labelStmt = static_cast<const LabelStatement&>(*stmt);
-                // For labels on lines by themselves, use the next line's number
-                int labelLineNumber = line->lineNumber;
-                if (line->statements.size() == 1 && i + 1 < program.lines.size()) {
-                    labelLineNumber = program.lines[i + 1]->lineNumber;
-                }
-                declareLabel(labelStmt.labelName, labelLineNumber, stmt->location);
-            }
+        // Determine fallback line number for labels on their own line
+        int fallbackLineNumber = line->lineNumber;
+        if (i + 1 < program.lines.size()) {
+            fallbackLineNumber = program.lines[i + 1]->lineNumber;
         }
+        collectLabelsRecursive(line->statements, fallbackLineNumber);
     }
 }
 
@@ -1194,8 +1280,8 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
                 paramType = VariableType::STRING;
                 paramTypeName = "";
             } else if (upperTypeName == "LONG") {
-                paramType = VariableType::INT;
-                paramTypeName = "";
+                paramType = VariableType::INT;  // legacy enum (lossy)
+                paramTypeName = "LONG";  // preserve for direct TypeDescriptor below
             } else {
                 // User-defined type - validate it exists (check both TYPEs and CLASSes)
                 if (m_symbolTable.types.find(paramTypeName) != m_symbolTable.types.end()) {
@@ -1219,8 +1305,24 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         }
         
         // Build TypeDescriptor for this parameter
+        // Types that the legacy VariableType enum can't represent (LONG, SHORT,
+        // BYTE, etc.) are built directly to avoid losing precision.
         TypeDescriptor paramTypeDesc;
-        if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+        if (paramTypeName == "LONG") {
+            paramTypeDesc = TypeDescriptor(BaseType::LONG);
+        } else if (paramTypeName == "SHORT") {
+            paramTypeDesc = TypeDescriptor(BaseType::SHORT);
+        } else if (paramTypeName == "BYTE") {
+            paramTypeDesc = TypeDescriptor(BaseType::BYTE);
+        } else if (paramTypeName == "ULONG") {
+            paramTypeDesc = TypeDescriptor(BaseType::ULONG);
+        } else if (paramTypeName == "UBYTE") {
+            paramTypeDesc = TypeDescriptor(BaseType::UBYTE);
+        } else if (paramTypeName == "USHORT") {
+            paramTypeDesc = TypeDescriptor(BaseType::USHORT);
+        } else if (paramTypeName == "UINTEGER" || paramTypeName == "UINT") {
+            paramTypeDesc = TypeDescriptor(BaseType::UINTEGER);
+        } else if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
             // Check if this is a CLASS type
             std::string upperParamTypeName = paramTypeName;
             std::transform(upperParamTypeName.begin(), upperParamTypeName.end(), upperParamTypeName.begin(), ::toupper);
@@ -1377,8 +1479,8 @@ void SemanticAnalyzer::processSubStatement(const SubStatement& stmt) {
                 paramType = VariableType::STRING;
                 paramTypeName = "";
             } else if (upperTypeName == "LONG") {
-                paramType = VariableType::INT;
-                paramTypeName = "";
+                paramType = VariableType::INT;  // legacy enum (lossy)
+                paramTypeName = "LONG";  // preserve for direct TypeDescriptor below
             } else {
                 // User-defined type - validate it exists
                 if (m_symbolTable.types.find(paramTypeName) == m_symbolTable.types.end()) {
@@ -1396,10 +1498,29 @@ void SemanticAnalyzer::processSubStatement(const SubStatement& stmt) {
         }
         
         // Build TypeDescriptor for this parameter
-        TypeDescriptor paramTypeDesc = legacyTypeToDescriptor(paramType);
-        if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+        // Types that the legacy VariableType enum can't represent (LONG, SHORT,
+        // BYTE, etc.) are built directly to avoid losing precision.
+        TypeDescriptor paramTypeDesc;
+        if (paramTypeName == "LONG") {
+            paramTypeDesc = TypeDescriptor(BaseType::LONG);
+        } else if (paramTypeName == "SHORT") {
+            paramTypeDesc = TypeDescriptor(BaseType::SHORT);
+        } else if (paramTypeName == "BYTE") {
+            paramTypeDesc = TypeDescriptor(BaseType::BYTE);
+        } else if (paramTypeName == "ULONG") {
+            paramTypeDesc = TypeDescriptor(BaseType::ULONG);
+        } else if (paramTypeName == "UBYTE") {
+            paramTypeDesc = TypeDescriptor(BaseType::UBYTE);
+        } else if (paramTypeName == "USHORT") {
+            paramTypeDesc = TypeDescriptor(BaseType::USHORT);
+        } else if (paramTypeName == "UINTEGER" || paramTypeName == "UINT") {
+            paramTypeDesc = TypeDescriptor(BaseType::UINTEGER);
+        } else if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
+            paramTypeDesc = legacyTypeToDescriptor(paramType);
             paramTypeDesc.udtName = paramTypeName;
             paramTypeDesc.udtTypeId = m_symbolTable.allocateTypeId(paramTypeName);
+        } else {
+            paramTypeDesc = legacyTypeToDescriptor(paramType);
         }
         sym.parameterTypeDescs.push_back(paramTypeDesc);
         
@@ -1703,16 +1824,21 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
             // Use keywordToDescriptor to get correct unsigned type
             elementType = keywordToDescriptor(arrayDim.asTypeKeyword);
         } else if (arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
-            // Verify the type exists
-            if (m_symbolTable.types.find(arrayDim.asTypeName) == m_symbolTable.types.end()) {
+            // Check if the type is a CLASS first, then fall back to TYPE (UDT)
+            const ClassSymbol* cls = m_symbolTable.lookupClass(arrayDim.asTypeName);
+            if (cls) {
+                // Array of CLASS instances — each element is a class-instance pointer
+                elementType = TypeDescriptor::makeClassInstance(arrayDim.asTypeName);
+            } else if (m_symbolTable.types.find(arrayDim.asTypeName) != m_symbolTable.types.end()) {
+                elementType = TypeDescriptor(BaseType::USER_DEFINED);
+                elementType.udtName = arrayDim.asTypeName;
+                elementType.udtTypeId = m_symbolTable.allocateTypeId(arrayDim.asTypeName);
+            } else {
                 error(SemanticErrorType::UNDEFINED_TYPE,
                       "Type '" + arrayDim.asTypeName + "' not defined",
                       stmt.location);
                 continue;
             }
-            elementType = TypeDescriptor(BaseType::USER_DEFINED);
-            elementType.udtName = arrayDim.asTypeName;
-            elementType.udtTypeId = m_symbolTable.allocateTypeId(arrayDim.asTypeName);
         } else {
             // Built-in type - check for AS clause or infer from suffix/name
             if (arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
@@ -4449,7 +4575,10 @@ void SemanticAnalyzer::useArray(const std::string& name, size_t dimensionCount,
 VariableType SemanticAnalyzer::inferTypeFromSuffix(TokenType suffix) {
     switch (suffix) {
         case TokenType::TYPE_INT:    return VariableType::INT;
+        case TokenType::PERCENT:     return VariableType::INT;    // % suffix
+        case TokenType::AMPERSAND:   return VariableType::INT;    // & suffix (LONG — lossy, but best legacy enum can do)
         case TokenType::TYPE_FLOAT:  return VariableType::FLOAT;
+        case TokenType::EXCLAMATION: return VariableType::FLOAT;  // ! suffix
         case TokenType::TYPE_DOUBLE: return VariableType::DOUBLE;
         case TokenType::TYPE_STRING: 
             // Return UNICODE type if in Unicode mode

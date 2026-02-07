@@ -3414,8 +3414,8 @@ StatementPtr Parser::parseDimStatement() {
                         advance(); // consume element type keyword
                         // Encode element type in asTypeName as "LIST OF <ELEMTYPE>"
                         listTypeName = "LIST OF " + std::string(tokenTypeToString(elemKeyword));
-                    } else if (current().type == TokenType::IDENTIFIER) {
-                        // LIST OF <user-type> (e.g., LIST OF ANY)
+                    } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                        // LIST OF <user-type> (e.g., LIST OF ANY, LIST OF Circle)
                         std::string elemName = current().value;
                         advance();
                         // Convert to uppercase for matching
@@ -3445,8 +3445,8 @@ StatementPtr Parser::parseDimStatement() {
                     TokenType convertedType = asTypeToSuffix(asType);
                     stmt->arrays.back().typeSuffix = mergeTypes(suffix, convertedType, varName);
                 }
-            } else if (current().type == TokenType::IDENTIFIER) {
-                // User-defined type
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // User-defined type (or keyword used as type name, e.g., Circle, Base)
                 std::string userTypeName = current().value;
                 advance();
                 
@@ -3652,8 +3652,8 @@ StatementPtr Parser::parseDecStatement() {
 StatementPtr Parser::parseTypeDeclarationStatement() {
     advance(); // consume TYPE
     
-    // Expect type name
-    if (current().type != TokenType::IDENTIFIER) {
+    // Expect type name (allow keywords like Circle, Base, etc. as type names)
+    if (current().type != TokenType::IDENTIFIER && !current().isKeyword()) {
         error("Expected type name after TYPE");
         return std::make_unique<RemStatement>(""); // Return dummy statement
     }
@@ -3723,8 +3723,8 @@ StatementPtr Parser::parseTypeDeclarationStatement() {
             builtInType = current().type;
             fieldTypeName = current().value;
             advance();
-        } else if (current().type == TokenType::IDENTIFIER) {
-            // User-defined type
+        } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+            // User-defined type (or keyword used as type name, e.g., Circle, Base)
             isBuiltIn = false;
             fieldTypeName = current().value;
             advance();
@@ -3752,8 +3752,8 @@ StatementPtr Parser::parseClassDeclaration() {
     auto loc = current().location;
     advance(); // consume CLASS
     
-    // Expect class name
-    if (current().type != TokenType::IDENTIFIER) {
+    // Expect class name (allow keywords like Base, Empty, etc. as class names)
+    if (current().type != TokenType::IDENTIFIER && !current().isKeyword()) {
         error("Expected class name after CLASS");
         return std::make_unique<RemStatement>("");
     }
@@ -3767,7 +3767,7 @@ StatementPtr Parser::parseClassDeclaration() {
     // Optional EXTENDS clause
     if (current().type == TokenType::EXTENDS) {
         advance(); // consume EXTENDS
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER && !current().isKeyword()) {
             error("Expected parent class name after EXTENDS");
             return std::make_unique<RemStatement>("");
         }
@@ -3870,7 +3870,8 @@ StatementPtr Parser::parseClassDeclaration() {
                 builtInType = current().type;
                 fieldTypeName = current().value;
                 advance();
-            } else if (current().type == TokenType::IDENTIFIER) {
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // User-defined type (or keyword used as type name, e.g., Circle, Base)
                 isBuiltIn = false;
                 fieldTypeName = current().value;
                 advance();
@@ -4186,7 +4187,7 @@ ExpressionPtr Parser::parseNewExpression() {
     auto loc = current().location;
     advance(); // consume NEW
     
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER && !current().isKeyword()) {
         error("Expected class name after NEW");
         return std::make_unique<NumberExpression>(0);
     }
@@ -4253,8 +4254,8 @@ StatementPtr Parser::parseLocalStatement() {
                 if (!stmt->variables.empty()) {
                     stmt->variables.back().typeSuffix = mergeTypes(suffix, convertedType, varName);
                 }
-            } else if (current().type == TokenType::IDENTIFIER) {
-                // User-defined type
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // User-defined type (or keyword used as type name, e.g., Circle, Base)
                 std::string userTypeName = current().value;
                 advance();
                 
@@ -4319,8 +4320,8 @@ StatementPtr Parser::parseGlobalStatement() {
                 if (!stmt->variables.empty()) {
                     stmt->variables.back().typeSuffix = mergeTypes(suffix, convertedType, varName);
                 }
-            } else if (current().type == TokenType::IDENTIFIER) {
-                // User-defined type
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // User-defined type (or keyword used as type name, e.g., Circle, Base)
                 std::string userTypeName = current().value;
                 advance();
                 
@@ -4380,8 +4381,8 @@ StatementPtr Parser::parseSharedStatement() {
                 if (!stmt->variables.empty()) {
                     stmt->variables.back().typeSuffix = mergeTypes(suffix, convertedType, varName);
                 }
-            } else if (current().type == TokenType::IDENTIFIER) {
-                // User-defined type
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // User-defined type (or keyword used as type name, e.g., Circle, Base)
                 std::string userTypeName = current().value;
                 advance();
                 
@@ -5692,8 +5693,8 @@ ExpressionPtr Parser::parseComparison() {
                 advance(); // consume NOTHING
                 expr = std::make_unique<IsTypeExpression>(std::move(expr), "", true);
                 expr->location = loc;
-            } else if (current().type == TokenType::IDENTIFIER) {
-                // obj IS ClassName — runtime type check
+            } else if (current().type == TokenType::IDENTIFIER || current().isKeyword()) {
+                // obj IS ClassName — runtime type check (keyword may be used as class name)
                 std::string className = current().value;
                 auto loc = current().location;
                 advance(); // consume class name
@@ -6458,6 +6459,7 @@ bool Parser::isAssignment() const {
 
 bool Parser::isMethodCall() const {
     // Look ahead to see if this is a method call: identifier.METHOD(...)
+    // Also handles: identifier(index).METHOD(...) (method call on array element)
     size_t lookAhead = m_currentIndex + 1;
 
     // Skip type suffix if present
@@ -6470,8 +6472,19 @@ bool Parser::isMethodCall() const {
         }
     }
 
-    // Check for DOT token
-    if (lookAhead < m_tokens->size() && (*m_tokens)[lookAhead].type == TokenType::DOT) {
+    // Skip array indices if present: identifier(...)
+    if (lookAhead < m_tokens->size() && (*m_tokens)[lookAhead].type == TokenType::LPAREN) {
+        int depth = 1;
+        lookAhead++;
+        while (lookAhead < m_tokens->size() && depth > 0) {
+            if ((*m_tokens)[lookAhead].type == TokenType::LPAREN) depth++;
+            if ((*m_tokens)[lookAhead].type == TokenType::RPAREN) depth--;
+            lookAhead++;
+        }
+    }
+
+    // Check for DOT token (possibly after chained member access: identifier.member1.method())
+    while (lookAhead < m_tokens->size() && (*m_tokens)[lookAhead].type == TokenType::DOT) {
         lookAhead++; // skip DOT
         
         // Check for method name (IDENTIFIER or method keywords)
@@ -6507,6 +6520,8 @@ bool Parser::isMethodCall() const {
                     (*m_tokens)[lookAhead].type == TokenType::LPAREN) {
                     return true;
                 }
+                // Not a method call at this level, but could be chained: obj.member.method()
+                // Continue the while loop to check the next DOT
             }
         }
     }

@@ -564,6 +564,22 @@ ProgramCFG* CFGBuilder::buildProgramCFG(const Program& program) {
                 continue;
             }
             
+            if (auto* labelStmt = dynamic_cast<const LabelStatement*>(stmt.get())) {
+                // Labels start a new basic block and register the label→block mapping
+                BasicBlock* labelBlock = createBlock("Label_" + labelStmt->labelName);
+                if (!isTerminated(currentBlock)) {
+                    addUnconditionalEdge(currentBlock->id, labelBlock->id);
+                }
+                registerLabel(labelStmt->labelName, labelBlock->id);
+                addStatementToBlock(labelBlock, stmt.get(), line->lineNumber);
+                currentBlock = labelBlock;
+                if (m_debugMode) {
+                    std::cout << "[CFG] Top-level label '" << labelStmt->labelName 
+                              << "' -> block " << labelBlock->id << std::endl;
+                }
+                continue;
+            }
+            
             if (auto* gotoStmt = dynamic_cast<const GotoStatement*>(stmt.get())) {
                 currentBlock = handleGoto(*gotoStmt, currentBlock);
                 continue;
