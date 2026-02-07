@@ -15,18 +15,25 @@
 #include <string.h>
 
 // ---------------------------------------------------------------------------
-// SAMM auto-tracking helper
+// Centralised descriptor allocation via SAMM
 // ---------------------------------------------------------------------------
 // Every leaf string allocation function (string_new_ascii, string_new_utf8,
-// string_new_capacity, etc.) calls this before returning a freshly allocated
-// StringDescriptor.  When SAMM is enabled the descriptor is registered in the
-// current scope so that it is automatically released (via string_release) when
-// the scope exits.  When SAMM is disabled this is a no-op.
+// string_new_capacity, etc.) obtains a fresh StringDescriptor through this
+// helper.  It delegates to samm_alloc_string() which:
+//   1. calloc's a zeroed descriptor (refcount=1, dirty=1)
+//   2. auto-tracks it in the current SAMM scope so it is released on exit
+//
+// By routing ALL descriptor allocation through this single point we:
+//   - Eliminate the class of bugs where a code path forgets to track
+//   - Provide one place to swap in pool-based allocation later
+//   - Keep string_release() as the single matching deallocation path
+//
+// When SAMM is disabled, samm_alloc_string() still allocates via calloc
+// but skips scope tracking — strings must then be released manually (the
+// same behaviour as before).
 // ---------------------------------------------------------------------------
-static inline void samm_auto_track(StringDescriptor* desc) {
-    if (desc && samm_is_enabled()) {
-        samm_track_string(desc);
-    }
+static inline StringDescriptor* alloc_descriptor(void) {
+    return (StringDescriptor*)samm_alloc_string();
 }
 
 // Helper macros for encoding-aware data access
@@ -175,25 +182,23 @@ int64_t utf32_to_utf8(const uint32_t* utf32_data, int64_t length,
 // Create new ASCII string from 7-bit ASCII C string
 StringDescriptor* string_new_ascii(const char* ascii_str) {
     if (!ascii_str || *ascii_str == '\0') {
-        StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+        StringDescriptor* desc = alloc_descriptor();
         if (desc) {
-            desc->refcount = 1;
             desc->encoding = STRING_ENCODING_ASCII;
-            desc->dirty = 1;
         }
         return desc;
     }
     
     size_t len = strlen(ascii_str);
     
-    // Allocate descriptor
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    // Allocate descriptor (tracked by SAMM automatically)
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     // Allocate ASCII buffer (1 byte per char)
     desc->data = (uint8_t*)malloc(len);
     if (!desc->data) {
-        free(desc);
+        string_release(desc);
         return NULL;
     }
     
@@ -201,46 +206,35 @@ StringDescriptor* string_new_ascii(const char* ascii_str) {
     memcpy(desc->data, ascii_str, len);
     desc->length = len;
     desc->capacity = len;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_ASCII;
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
 // Create new ASCII string from buffer and length
 StringDescriptor* string_new_ascii_len(const uint8_t* data, int64_t length) {
     if (!data || length <= 0) {
-        StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+        StringDescriptor* desc = alloc_descriptor();
         if (desc) {
-            desc->refcount = 1;
             desc->encoding = STRING_ENCODING_ASCII;
-            desc->dirty = 1;
         }
-        samm_auto_track(desc);
         return desc;
     }
     
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     desc->data = (uint8_t*)malloc(length * sizeof(uint8_t));
     if (!desc->data) {
-        free(desc);
+        string_release(desc);
         return NULL;
     }
     
     memcpy(desc->data, data, length * sizeof(uint8_t));
     desc->length = length;
     desc->capacity = length;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_ASCII;
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
@@ -248,13 +242,10 @@ StringDescriptor* string_new_ascii_len(const uint8_t* data, int64_t length) {
 StringDescriptor* string_new_utf8(const char* utf8_str) {
     if (!utf8_str || *utf8_str == '\0') {
         // Empty string - default to UTF-32
-        StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+        StringDescriptor* desc = alloc_descriptor();
         if (desc) {
-            desc->refcount = 1;
             desc->encoding = STRING_ENCODING_UTF32;
-            desc->dirty = 1;
         }
-        samm_auto_track(desc);
         return desc;
     }
     
@@ -268,7 +259,7 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
     }
     
     // If pure ASCII, use ASCII encoding for efficiency
-    // (string_new_ascii auto-tracks via samm_auto_track)
+    // (string_new_ascii allocates via alloc_descriptor, already tracked)
     if (is_ascii) {
         return string_new_ascii(utf8_str);
     }
@@ -277,24 +268,21 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
     // Get length in code points
     int64_t cp_len = utf8_length_in_codepoints(utf8_str);
     if (cp_len == 0) {
-        StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+        StringDescriptor* desc = alloc_descriptor();
         if (desc) {
-            desc->refcount = 1;
             desc->encoding = STRING_ENCODING_UTF32;
-            desc->dirty = 1;
         }
-        samm_auto_track(desc);
         return desc;
     }
     
-    // Allocate descriptor
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    // Allocate descriptor (tracked by SAMM automatically)
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     // Allocate UTF-32 buffer
     desc->data = (uint32_t*)malloc(cp_len * sizeof(uint32_t));
     if (!desc->data) {
-        free(desc);
+        string_release(desc);
         return NULL;
     }
     
@@ -302,93 +290,72 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
     int64_t converted = utf8_to_utf32(utf8_str, desc->data, cp_len);
     desc->length = converted;
     desc->capacity = cp_len;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_UTF32;
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
 // Create new string from UTF-32 data
 StringDescriptor* string_new_utf32(const uint32_t* data, int64_t length) {
     if (!data || length <= 0) {
-        StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+        StringDescriptor* desc = alloc_descriptor();
         if (desc) {
-            desc->refcount = 1;
             desc->encoding = STRING_ENCODING_UTF32;
-            desc->dirty = 1;
         }
-        samm_auto_track(desc);
         return desc;
     }
     
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     desc->data = (uint32_t*)malloc(length * sizeof(uint32_t));
     if (!desc->data) {
-        free(desc);
+        string_release(desc);
         return NULL;
     }
     
     memcpy(desc->data, data, length * sizeof(uint32_t));
     desc->length = length;
     desc->capacity = length;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_UTF32;
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
 // Create empty string with reserved capacity
 StringDescriptor* string_new_capacity(int64_t capacity) {
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     if (capacity > 0) {
         desc->data = (uint32_t*)malloc(capacity * sizeof(uint32_t));
         if (!desc->data) {
-            free(desc);
+            string_release(desc);
             return NULL;
         }
         desc->capacity = capacity;
     }
     
-    desc->length = 0;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_UTF32;  // Default to UTF-32 (caller can override)
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
 StringDescriptor* string_new_ascii_capacity(int64_t capacity) {
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    StringDescriptor* desc = alloc_descriptor();
     if (!desc) return NULL;
     
     if (capacity > 0) {
         desc->data = (uint8_t*)malloc(capacity * sizeof(uint8_t));
         if (!desc->data) {
-            free(desc);
+            string_release(desc);
             return NULL;
         }
         desc->capacity = capacity;
     }
     
-    desc->length = 0;
-    desc->refcount = 1;
     desc->encoding = STRING_ENCODING_ASCII;
-    desc->dirty = 1;
-    desc->utf8_cache = NULL;
     
-    samm_auto_track(desc);
     return desc;
 }
 
