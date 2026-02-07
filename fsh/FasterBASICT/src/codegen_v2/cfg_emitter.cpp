@@ -267,8 +267,10 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                     } else if (size == 4) {
                         builder_.emitRaw("    storew " + qbeParam + ", " + mangledName);
                     } else if (size == 8) {
-                        if (typeManager_.isString(varType) || typeManager_.isIntegral(varType)) {
-                            // Strings, LONG, ULONG — store as 64-bit integer / pointer
+                        if (typeManager_.isString(varType) || typeManager_.isIntegral(varType) ||
+                            varType == BaseType::CLASS_INSTANCE || varType == BaseType::OBJECT ||
+                            varType == BaseType::POINTER || varType == BaseType::ARRAY_DESC) {
+                            // Strings, LONG, ULONG, CLASS instances, OBJECTs, pointers — store as 64-bit integer / pointer
                             builder_.emitRaw("    storel " + qbeParam + ", " + mangledName);
                         } else {
                             // DOUBLE — store as 64-bit float

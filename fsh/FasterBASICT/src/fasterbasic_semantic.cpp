@@ -1097,13 +1097,19 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
                 paramType = VariableType::INT;
                 paramTypeName = "";
             } else {
-                // User-defined type - validate it exists
-                if (m_symbolTable.types.find(paramTypeName) == m_symbolTable.types.end()) {
+                // User-defined type - validate it exists (check both TYPEs and CLASSes)
+                if (m_symbolTable.types.find(paramTypeName) != m_symbolTable.types.end()) {
+                    paramType = VariableType::USER_DEFINED;
+                } else if (m_symbolTable.classes.find(upperTypeName) != m_symbolTable.classes.end()) {
+                    // CLASS instance parameter — will be handled as CLASS_INSTANCE
+                    // in the TypeDescriptor below
+                    paramType = VariableType::USER_DEFINED;  // legacy enum; overridden below
+                } else {
                     error(SemanticErrorType::TYPE_ERROR,
                           "Unknown type '" + paramTypeName + "' in parameter " + stmt.parameters[i],
                           stmt.location);
+                    paramType = VariableType::USER_DEFINED;
                 }
-                paramType = VariableType::USER_DEFINED;
             }
         } else if (i < stmt.parameterTypes.size()) {
             // Has type suffix
@@ -1116,10 +1122,22 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
         debugFile.close();
         
         // Build TypeDescriptor for this parameter
-        TypeDescriptor paramTypeDesc = legacyTypeToDescriptor(paramType);
+        TypeDescriptor paramTypeDesc;
         if (paramType == VariableType::USER_DEFINED && !paramTypeName.empty()) {
-            paramTypeDesc.udtName = paramTypeName;
-            paramTypeDesc.udtTypeId = m_symbolTable.allocateTypeId(paramTypeName);
+            // Check if this is a CLASS type
+            std::string upperParamTypeName = paramTypeName;
+            std::transform(upperParamTypeName.begin(), upperParamTypeName.end(), upperParamTypeName.begin(), ::toupper);
+            if (m_symbolTable.classes.find(upperParamTypeName) != m_symbolTable.classes.end()) {
+                // CLASS instance parameter — pointer semantics
+                paramTypeDesc = TypeDescriptor::makeClassInstance(upperParamTypeName);
+            } else {
+                // Regular UDT parameter
+                paramTypeDesc = legacyTypeToDescriptor(paramType);
+                paramTypeDesc.udtName = paramTypeName;
+                paramTypeDesc.udtTypeId = m_symbolTable.allocateTypeId(paramTypeName);
+            }
+        } else {
+            paramTypeDesc = legacyTypeToDescriptor(paramType);
         }
         sym.parameterTypeDescs.push_back(paramTypeDesc);
     }
@@ -1149,15 +1167,23 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
             sym.returnTypeDesc = TypeDescriptor(BaseType::LONG);
             sym.returnTypeName = "";
         } else {
-            // User-defined type - validate it exists
-            if (m_symbolTable.types.find(sym.returnTypeName) == m_symbolTable.types.end()) {
+            // User-defined type - check both TYPEs and CLASSes
+            if (m_symbolTable.classes.find(upperReturnType) != m_symbolTable.classes.end()) {
+                // CLASS instance return type — pointer semantics with SAMM RETAIN
+                sym.returnTypeDesc = TypeDescriptor::makeClassInstance(upperReturnType);
+                // Keep returnTypeName so codegen can identify the class
+            } else if (m_symbolTable.types.find(sym.returnTypeName) != m_symbolTable.types.end()) {
+                // Regular UDT return type
+                sym.returnTypeDesc = TypeDescriptor(BaseType::USER_DEFINED);
+                sym.returnTypeDesc.udtName = sym.returnTypeName;
+            } else {
                 error(SemanticErrorType::TYPE_ERROR,
                       "Unknown return type '" + sym.returnTypeName + "' for function " + stmt.functionName,
                       stmt.location);
+                // Fallback to USER_DEFINED so compilation can continue
+                sym.returnTypeDesc = TypeDescriptor(BaseType::USER_DEFINED);
+                sym.returnTypeDesc.udtName = sym.returnTypeName;
             }
-            // Keep returnTypeName for user-defined types
-            sym.returnTypeDesc = TypeDescriptor(BaseType::USER_DEFINED);
-            sym.returnTypeDesc.udtName = sym.returnTypeName;
         }
     } else {
         sym.returnTypeDesc = legacyTypeToDescriptor(inferTypeFromSuffix(stmt.returnTypeSuffix));
@@ -1174,6 +1200,10 @@ void SemanticAnalyzer::processFunctionStatement(const FunctionStatement& stmt) {
     
     VariableSymbol returnVar(normalizedReturnVarName, sym.returnTypeDesc, funcScope, true);
     returnVar.firstUse = stmt.location;
+    // For CLASS_INSTANCE return types, set typeName so codegen can identify the class
+    if (sym.returnTypeDesc.isClassInstance() && !sym.returnTypeDesc.className.empty()) {
+        returnVar.typeName = sym.returnTypeDesc.className;
+    }
     m_symbolTable.insertVariable(normalizedReturnVarName, returnVar);
     
     // Add parameters to symbol table as variables in function scope

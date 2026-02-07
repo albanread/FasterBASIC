@@ -1072,8 +1072,16 @@ void CFGBuilder::processFunctionStatement(const FunctionStatement& stmt, BasicBl
                 vt = VariableType::STRING;
             } else if (upperType == "LONG") {
                 vt = VariableType::INT;
+            } else {
+                // User-defined type (TYPE or CLASS) - treat as pointer (INT/LONG)
+                if (m_symbols) {
+                    if (m_symbols->classes.find(upperType) != m_symbols->classes.end()) {
+                        vt = VariableType::INT;  // CLASS instance = pointer
+                    } else if (m_symbols->types.find(asType) != m_symbols->types.end()) {
+                        vt = VariableType::USER_DEFINED;
+                    }
+                }
             }
-            // TODO: Handle user-defined types
         } else if (i < stmt.parameterTypes.size()) {
             // Check type suffix
             switch (stmt.parameterTypes[i]) {
@@ -1090,8 +1098,28 @@ void CFGBuilder::processFunctionStatement(const FunctionStatement& stmt, BasicBl
     
     // Set return type
     if (stmt.hasReturnAsType) {
-        // TODO: Map returnTypeAsName to VariableType
-        funcCFG->returnType = VariableType::INT; // Default for now
+        std::string retTypeName = stmt.returnTypeAsName;
+        std::string upperRetType = retTypeName;
+        std::transform(upperRetType.begin(), upperRetType.end(), upperRetType.begin(), ::toupper);
+        
+        if (upperRetType == "INTEGER" || upperRetType == "INT") {
+            funcCFG->returnType = VariableType::INT;
+        } else if (upperRetType == "DOUBLE") {
+            funcCFG->returnType = VariableType::DOUBLE;
+        } else if (upperRetType == "SINGLE" || upperRetType == "FLOAT") {
+            funcCFG->returnType = VariableType::FLOAT;
+        } else if (upperRetType == "STRING") {
+            funcCFG->returnType = VariableType::STRING;
+        } else if (upperRetType == "LONG") {
+            funcCFG->returnType = VariableType::INT;
+        } else if (m_symbols && m_symbols->classes.find(upperRetType) != m_symbols->classes.end()) {
+            // CLASS instance return — pointer semantics (non-VOID so generateFunction is used)
+            funcCFG->returnType = VariableType::INT;
+        } else if (m_symbols && m_symbols->types.find(retTypeName) != m_symbols->types.end()) {
+            funcCFG->returnType = VariableType::USER_DEFINED;
+        } else {
+            funcCFG->returnType = VariableType::INT; // Default fallback
+        }
     } else {
         switch (stmt.returnTypeSuffix) {
             case TokenType::TYPE_INT: funcCFG->returnType = VariableType::INT; break;
