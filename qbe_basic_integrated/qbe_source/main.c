@@ -625,6 +625,7 @@ main(int ac, char *av[])
 			"basic_data.c",
 			"plugin_context_runtime.c",
 			"class_runtime.c",
+			"samm_pool.c",
 			"samm_core.c",
 			"list_ops.c",
 			NULL

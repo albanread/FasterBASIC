@@ -4131,6 +4131,39 @@ void ASTEmitter::emitCallStatement(const CallStatement* stmt) {
         return;
     }
     
+    // --- Built-in SLEEP command ---
+    // SLEEP <seconds> → basic_sleep_ms((int32_t)(seconds * 1000))
+    // Handled directly rather than via plugin path because the command
+    // registry entry has no functionPtr (definition-only registration).
+    {
+        std::string upperCheck = stmt->subName;
+        std::transform(upperCheck.begin(), upperCheck.end(), upperCheck.begin(), ::toupper);
+        if (upperCheck == "SLEEP" && stmt->arguments.size() >= 1) {
+            builder_.emitComment("SLEEP (built-in)");
+            std::string argTemp = emitExpression(stmt->arguments[0].get());
+            BaseType argType = getExpressionType(stmt->arguments[0].get());
+            // Convert argument to double (seconds)
+            std::string secTemp = argTemp;
+            if (typeManager_.isIntegral(argType)) {
+                secTemp = emitTypeConversion(argTemp, argType, BaseType::DOUBLE);
+            } else if (argType == BaseType::SINGLE) {
+                secTemp = builder_.newTemp();
+                builder_.emitRaw("    " + secTemp + " =d ftos " + argTemp);
+            }
+            // Multiply by 1000 to get milliseconds
+            std::string thousand = builder_.newTemp();
+            builder_.emitRaw("    " + thousand + " =d copy d_1000.0");
+            std::string msDouble = builder_.newTemp();
+            builder_.emitRaw("    " + msDouble + " =d mul " + secTemp + ", " + thousand);
+            // Convert to int32
+            std::string msInt = builder_.newTemp();
+            builder_.emitRaw("    " + msInt + " =w dtosi " + msDouble);
+            // Call basic_sleep_ms(int32_t)
+            builder_.emitCall("", "", "basic_sleep_ms", "w " + msInt);
+            return;
+        }
+    }
+
     // Check for plugin commands first
     std::string upperName = stmt->subName;
     std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);

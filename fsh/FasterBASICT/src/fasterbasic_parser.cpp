@@ -937,6 +937,17 @@ StatementPtr Parser::parseStatement() {
             return parsePrintAtStatement();
         case TokenType::INPUT_AT:  // Special command with INPUT-style syntax
             return parseInputAtStatement();
+        case TokenType::SLEEP:
+        {
+            // SLEEP <seconds> — pause execution
+            // Parsed as a CallStatement so the codegen can emit
+            // a direct call to basic_sleep_ms().
+            advance(); // consume SLEEP
+            auto arg = parseExpression();
+            auto stmt = std::make_unique<CallStatement>("SLEEP");
+            stmt->addArgument(std::move(arg));
+            return stmt;
+        }
         case TokenType::REGISTRY_COMMAND:
             return parseRegistryCommandStatement();
         case TokenType::TCHAR:

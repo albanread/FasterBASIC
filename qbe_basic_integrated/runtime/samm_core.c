@@ -13,7 +13,7 @@
  *
  * Components:
  *   1. Scope Stack    — fixed-depth array of dynamic pointer vectors
- *   2. Bloom Filter   — 96M-bit (12 MB) double-free detector
+ *   2. Bloom Filter   — lazily allocated double-free detector (Phase 4)
  *   3. Cleanup Queue  — bounded ring buffer of pointer batches
  *   4. Background Worker — pthread that drains the cleanup queue
  *   5. Metrics        — atomic counters for diagnostics
@@ -22,7 +22,9 @@
  *   - scope_mutex_   protects the scope stack (hot path, minimal hold time)
  *   - queue_mutex_   protects the cleanup queue (producer/consumer)
  *   - Bloom filter writes are protected by scope_mutex_ (freed pointers
- *     are only added during samm_free_object or background cleanup)
+ *     are only added during samm_free_object or background cleanup).
+ *     The filter is lazily allocated on first overflow-class object
+ *     free — programs with no >1024 B objects never allocate it.
  *
  * Build:
  *   cc -O2 -c samm_core.c -o samm_core.o -lpthread
@@ -32,16 +34,18 @@
 #include "samm_bridge.h"
 #include "string_descriptor.h"
 #include "list_ops.h"
+#include "string_pool.h"
+#include "samm_pool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <inttypes.h>
 
-/* Forward-declare string_release so we can call it from cleanup without
- * pulling in the full string_pool.h header chain (which is only needed
- * for pool-based allocation, not for release). string_release is defined
- * in string_utf32.c and declared in string_descriptor.h (included above). */
+/* string_release is defined in string_utf32.c and declared in
+ * string_descriptor.h (included via string_pool.h above).
+ * string_pool.h provides string_desc_alloc/free wrappers around
+ * g_string_desc_pool (SammSlabPool) used by samm_alloc_string(). */
 
 /* ========================================================================= */
 /* Platform: stdatomic vs __sync builtins                                     */
@@ -70,17 +74,20 @@ typedef volatile int      samm_atomic_int;
 /* ========================================================================= */
 
 typedef struct {
-    void**        ptrs;       /* Heap-allocated array of tracked pointers    */
-    SAMMAllocType* types;     /* Parallel array: alloc type per pointer      */
-    size_t        count;      /* Number of pointers currently tracked        */
-    size_t        capacity;   /* Allocated capacity                          */
+    void**        ptrs;         /* Heap-allocated array of tracked pointers    */
+    SAMMAllocType* types;       /* Parallel array: alloc type per pointer      */
+    uint8_t*      size_classes; /* Parallel array: pool size class (Phase 3)   */
+                                /* 0–5 = object pool index, 0xFF = malloc/NA   */
+    size_t        count;        /* Number of pointers currently tracked        */
+    size_t        capacity;     /* Allocated capacity                          */
 } SAMMScope;
 
 static void scope_init(SAMMScope* s) {
-    s->ptrs     = NULL;
-    s->types    = NULL;
-    s->count    = 0;
-    s->capacity = 0;
+    s->ptrs         = NULL;
+    s->types        = NULL;
+    s->size_classes = NULL;
+    s->count        = 0;
+    s->capacity     = 0;
 }
 
 static void scope_ensure_capacity(SAMMScope* s) {
@@ -88,40 +95,53 @@ static void scope_ensure_capacity(SAMMScope* s) {
     size_t new_cap = (s->capacity == 0) ? SAMM_SCOPE_INITIAL_CAPACITY : s->capacity * 2;
     void** new_ptrs  = (void**)realloc(s->ptrs, new_cap * sizeof(void*));
     SAMMAllocType* new_types = (SAMMAllocType*)realloc(s->types, new_cap * sizeof(SAMMAllocType));
-    if (!new_ptrs || !new_types) {
+    uint8_t* new_sc  = (uint8_t*)realloc(s->size_classes, new_cap * sizeof(uint8_t));
+    if (!new_ptrs || !new_types || !new_sc) {
         fprintf(stderr, "SAMM FATAL: scope realloc failed (cap=%zu)\n", new_cap);
         abort();
     }
-    s->ptrs     = new_ptrs;
-    s->types    = new_types;
-    s->capacity = new_cap;
+    s->ptrs         = new_ptrs;
+    s->types        = new_types;
+    s->size_classes = new_sc;
+    s->capacity     = new_cap;
 }
 
-static void scope_push(SAMMScope* s, void* ptr, SAMMAllocType type) {
+static void scope_push(SAMMScope* s, void* ptr, SAMMAllocType type, uint8_t size_class) {
     scope_ensure_capacity(s);
-    s->ptrs[s->count]  = ptr;
-    s->types[s->count] = type;
+    s->ptrs[s->count]         = ptr;
+    s->types[s->count]        = type;
+    s->size_classes[s->count] = size_class;
     s->count++;
 }
 
-/* Remove first occurrence of ptr from scope. Returns 1 if found, 0 if not. */
-static int scope_remove(SAMMScope* s, void* ptr) {
+/* Remove first occurrence of ptr from scope.  Returns 1 if found, 0 if not.
+ * If out_size_class is non-NULL, stores the removed entry's size class. */
+static int scope_remove(SAMMScope* s, void* ptr, uint8_t* out_size_class) {
     for (size_t i = 0; i < s->count; i++) {
         if (s->ptrs[i] == ptr) {
+            if (out_size_class) {
+                *out_size_class = s->size_classes[i];
+            }
             /* Swap with last element for O(1) removal */
             s->count--;
-            s->ptrs[i]  = s->ptrs[s->count];
-            s->types[i] = s->types[s->count];
+            s->ptrs[i]         = s->ptrs[s->count];
+            s->types[i]        = s->types[s->count];
+            s->size_classes[i] = s->size_classes[s->count];
             return 1;
         }
     }
     return 0;
 }
 
-/* Find the type for a given pointer. Returns SAMM_ALLOC_UNKNOWN if not found. */
-static SAMMAllocType scope_find_type(SAMMScope* s, void* ptr) {
+/* Find the type and size class for a given pointer.
+ * Returns SAMM_ALLOC_UNKNOWN if not found.
+ * If out_size_class is non-NULL, stores the entry's size class. */
+static SAMMAllocType scope_find_type(SAMMScope* s, void* ptr, uint8_t* out_size_class) {
     for (size_t i = 0; i < s->count; i++) {
         if (s->ptrs[i] == ptr) {
+            if (out_size_class) {
+                *out_size_class = s->size_classes[i];
+            }
             return s->types[i];
         }
     }
@@ -131,10 +151,12 @@ static SAMMAllocType scope_find_type(SAMMScope* s, void* ptr) {
 static void scope_destroy(SAMMScope* s) {
     free(s->ptrs);
     free(s->types);
-    s->ptrs     = NULL;
-    s->types    = NULL;
-    s->count    = 0;
-    s->capacity = 0;
+    free(s->size_classes);
+    s->ptrs         = NULL;
+    s->types        = NULL;
+    s->size_classes = NULL;
+    s->count        = 0;
+    s->capacity     = 0;
 }
 
 /* ========================================================================= */
@@ -144,16 +166,27 @@ static void scope_destroy(SAMMScope* s) {
 typedef struct {
     void**        ptrs;
     SAMMAllocType* types;
+    uint8_t*      size_classes;   /* Parallel array: pool size class (Phase 3) */
     size_t        count;
 } SAMMCleanupBatch;
 
 /* ========================================================================= */
-/* Bloom Filter (fixed 96M bits, 10 hash functions)                           */
+/* Bloom Filter — Lazily Allocated (Phase 4)                                  */
+/*                                                                            */
+/* Only needed for overflow-class objects (> 1024 B) that go through malloc.  */
+/* Pool-managed types (strings, lists, objects <= 1024 B) don't need the      */
+/* filter because their pools own the address space and detect double-free    */
+/* via the in_use counter.                                                    */
+/*                                                                            */
+/* The filter is NOT allocated at init.  bloom_ensure_allocated() creates it  */
+/* on first use.  Programs with no overflow objects pay zero memory cost.     */
 /* ========================================================================= */
 
 typedef struct {
-    uint8_t* bits;          /* Heap-allocated bit array (SAMM_BLOOM_BYTES)   */
-    size_t   items_added;   /* Approximate number of items inserted          */
+    uint8_t* bits;          /* Heap-allocated bit array, or NULL if lazy    */
+    size_t   size_bits;     /* Actual number of bits (0 when not allocated) */
+    size_t   size_bytes;    /* Actual byte size of bits[] array             */
+    size_t   items_added;   /* Approximate number of items inserted         */
 } SAMMBloomFilter;
 
 static uint64_t bloom_fnv1a(const void* data, size_t len) {
@@ -166,32 +199,55 @@ static uint64_t bloom_fnv1a(const void* data, size_t len) {
     return hash;
 }
 
-static void bloom_generate_hashes(const void* ptr, uint64_t* hashes) {
+static void bloom_generate_hashes(const SAMMBloomFilter* bf, const void* ptr,
+                                  uint64_t* hashes) {
     uint64_t h1 = bloom_fnv1a(&ptr, sizeof(void*));
     uint64_t h2 = bloom_fnv1a(&h1, sizeof(uint64_t));
     for (int i = 0; i < SAMM_BLOOM_HASH_COUNT; i++) {
-        hashes[i] = (h1 + (uint64_t)i * h2) % SAMM_BLOOM_BITS;
+        hashes[i] = (h1 + (uint64_t)i * h2) % bf->size_bits;
     }
 }
 
+/* Lazy init: just zero everything, no allocation */
 static void bloom_init(SAMMBloomFilter* bf) {
-    bf->bits = (uint8_t*)calloc(1, SAMM_BLOOM_BYTES);
+    bf->bits        = NULL;
+    bf->size_bits   = 0;
+    bf->size_bytes  = 0;
+    bf->items_added = 0;
+}
+
+/* Allocate the filter on first use.  Called under scope_mutex. */
+static void bloom_ensure_allocated(SAMMBloomFilter* bf) {
+    if (bf->bits) return;  /* Already allocated */
+
+    bf->size_bits  = SAMM_BLOOM_BITS;
+    bf->size_bytes = SAMM_BLOOM_BYTES;
+    bf->bits = (uint8_t*)calloc(1, bf->size_bytes);
     if (!bf->bits) {
-        fprintf(stderr, "SAMM FATAL: Bloom filter alloc failed (%d bytes)\n", SAMM_BLOOM_BYTES);
-        abort();
+        fprintf(stderr, "SAMM WARNING: Bloom filter alloc failed (%zu bytes), "
+                "double-free detection disabled for overflow objects\n",
+                bf->size_bytes);
+        bf->size_bits  = 0;
+        bf->size_bytes = 0;
+        return;
     }
     bf->items_added = 0;
 }
 
 static void bloom_destroy(SAMMBloomFilter* bf) {
     free(bf->bits);
-    bf->bits = NULL;
+    bf->bits        = NULL;
+    bf->size_bits   = 0;
+    bf->size_bytes  = 0;
     bf->items_added = 0;
 }
 
 static void bloom_add(SAMMBloomFilter* bf, const void* ptr) {
+    bloom_ensure_allocated(bf);
+    if (!bf->bits) return;  /* Alloc failed — silently skip */
+
     uint64_t hashes[SAMM_BLOOM_HASH_COUNT];
-    bloom_generate_hashes(ptr, hashes);
+    bloom_generate_hashes(bf, ptr, hashes);
     for (int i = 0; i < SAMM_BLOOM_HASH_COUNT; i++) {
         size_t byte_idx = (size_t)(hashes[i] / 8);
         size_t bit_off  = (size_t)(hashes[i] % 8);
@@ -201,9 +257,9 @@ static void bloom_add(SAMMBloomFilter* bf, const void* ptr) {
 }
 
 static int bloom_check(const SAMMBloomFilter* bf, const void* ptr) {
-    if (!bf->bits) return 0;
+    if (!bf->bits) return 0;  /* Not allocated → definitely not freed */
     uint64_t hashes[SAMM_BLOOM_HASH_COUNT];
-    bloom_generate_hashes(ptr, hashes);
+    bloom_generate_hashes(bf, ptr, hashes);
     for (int i = 0; i < SAMM_BLOOM_HASH_COUNT; i++) {
         size_t byte_idx = (size_t)(hashes[i] / 8);
         size_t bit_off  = (size_t)(hashes[i] % 8);
@@ -225,7 +281,7 @@ typedef struct {
     int             peak_scope_depth;
     pthread_mutex_t scope_mutex;
 
-    /* --- Bloom filter --- */
+    /* --- Bloom filter (lazily allocated — see Phase 4) --- */
     SAMMBloomFilter bloom;
 
     /* --- Cleanup queue (bounded ring buffer) --- */
@@ -273,7 +329,12 @@ static SAMMState g_samm = {0};
 
 /*
  * Default cleanup for CLASS objects: read vtable[3] (destructor pointer)
- * and call it if non-NULL, then free the memory.
+ * and call it if non-NULL.
+ *
+ * Phase 3: This function NO LONGER calls free().  The caller
+ * (cleanup_batch) handles returning the object shell to the correct
+ * size-class pool (or calling free for overflow objects) using the
+ * size_class stored in the SAMMScope / SAMMCleanupBatch.
  *
  * VTable Layout:
  *   [0] class_id          (int64)
@@ -295,8 +356,7 @@ static void default_object_cleanup(void* ptr) {
         }
     }
 
-    /* Free the object memory */
-    free(ptr);
+    /* Phase 3: do NOT free here — caller returns to pool or frees */
 }
 
 static void default_generic_cleanup(void* ptr) {
@@ -313,6 +373,8 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
         if (!ptr) continue;
 
         SAMMAllocType type = batch->types[i];
+        uint8_t sc = batch->size_classes ? batch->size_classes[i]
+                                         : SAMM_SIZE_CLASS_NONE;
 
         /* Use registered cleanup function if available */
         samm_cleanup_fn fn = NULL;
@@ -326,19 +388,36 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
             /* Fallback: type-specific default cleanup */
             switch (type) {
                 case SAMM_ALLOC_OBJECT:
+                    /* Phase 3: run destructor via vtable (does NOT free).
+                     * Pool return / free happens below based on size class. */
                     default_object_cleanup(ptr);
+
+                    /* Return object shell to size-class pool or free */
+                    if (sc < SAMM_OBJECT_SIZE_CLASSES) {
+                        uint32_t slot_sz = samm_object_slot_sizes[sc];
+                        SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_freed, (uint64_t)slot_sz);
+                        samm_slab_pool_free(&g_object_pools[sc], ptr);
+                    } else {
+                        /* Overflow object (> 1024 B) — return to system */
+                        free(ptr);
+                    }
                     break;
                 case SAMM_ALLOC_LIST:
-                    /* Call list_free which releases all atoms (and their
-                     * string/list payloads) then frees the header.
-                     * Phase 5 will add freelist recycling. */
+                    /* Phase 2: list_free_from_samm() zeroes the header
+                     * and returns the descriptor shell to g_list_header_pool
+                     * via samm_slab_pool_free().  Atoms are cleaned up
+                     * independently by their own SAMM_ALLOC_LIST_ATOM
+                     * tracking entries. */
                     list_free_from_samm(ptr);
+                    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_freed, (uint64_t)sizeof(ListHeader));
                     break;
                 case SAMM_ALLOC_LIST_ATOM:
-                    /* Release the atom's payload (string_release for strings,
-                     * recursive list_free for nested lists) then free the
-                     * atom struct itself.  Phase 5 will return to freelist. */
+                    /* Phase 2: list_atom_free_from_samm() releases the
+                     * atom's payload (string_release for strings, recursive
+                     * list_free for nested lists) then returns the atom
+                     * shell to g_list_atom_pool via samm_slab_pool_free(). */
                     list_atom_free_from_samm(ptr);
+                    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_freed, (uint64_t)sizeof(ListAtom));
                     break;
                 case SAMM_ALLOC_STRING:
                     /* Call string_release which decrements the refcount and
@@ -355,10 +434,14 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
             }
         }
 
-        /* Mark as freed in Bloom filter */
-        pthread_mutex_lock(&g_samm.scope_mutex);
-        bloom_add(&g_samm.bloom, ptr);
-        pthread_mutex_unlock(&g_samm.scope_mutex);
+        /* Mark as freed in Bloom filter — only for overflow-class objects.
+         * Pool-managed types don't need the filter (their pools detect
+         * double-free via the in_use counter). */
+        if (type == SAMM_ALLOC_OBJECT && sc >= SAMM_OBJECT_SIZE_CLASSES) {
+            pthread_mutex_lock(&g_samm.scope_mutex);
+            bloom_add(&g_samm.bloom, ptr);
+            pthread_mutex_unlock(&g_samm.scope_mutex);
+        }
 
         SAMM_ATOMIC_INC(g_samm.stat_objects_cleaned);
     }
@@ -366,9 +449,11 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
     /* Free the batch arrays */
     free(batch->ptrs);
     free(batch->types);
-    batch->ptrs  = NULL;
-    batch->types = NULL;
-    batch->count = 0;
+    free(batch->size_classes);
+    batch->ptrs         = NULL;
+    batch->types        = NULL;
+    batch->size_classes = NULL;
+    batch->count        = 0;
 }
 
 /* ========================================================================= */
@@ -384,9 +469,10 @@ static void* samm_worker_fn(void* arg) {
 
     while (1) {
         SAMMCleanupBatch batch;
-        batch.ptrs  = NULL;
-        batch.types = NULL;
-        batch.count = 0;
+        batch.ptrs         = NULL;
+        batch.types        = NULL;
+        batch.size_classes = NULL;
+        batch.count        = 0;
 
         /* Wait for work */
         pthread_mutex_lock(&g_samm.queue_mutex);
@@ -402,9 +488,10 @@ static void* samm_worker_fn(void* arg) {
         /* Dequeue one batch */
         batch = g_samm.queue[g_samm.queue_head];
         /* Clear the slot */
-        g_samm.queue[g_samm.queue_head].ptrs  = NULL;
-        g_samm.queue[g_samm.queue_head].types = NULL;
-        g_samm.queue[g_samm.queue_head].count = 0;
+        g_samm.queue[g_samm.queue_head].ptrs         = NULL;
+        g_samm.queue[g_samm.queue_head].types        = NULL;
+        g_samm.queue[g_samm.queue_head].size_classes = NULL;
+        g_samm.queue[g_samm.queue_head].count        = 0;
         g_samm.queue_head = (g_samm.queue_head + 1) % SAMM_MAX_QUEUE_DEPTH;
         g_samm.queue_count--;
         pthread_mutex_unlock(&g_samm.queue_mutex);
@@ -447,10 +534,12 @@ static void* samm_worker_fn(void* arg) {
 /* Internal: enqueue a scope's pointers for background cleanup                */
 /* ========================================================================= */
 
-static void enqueue_for_cleanup(void** ptrs, SAMMAllocType* types, size_t count) {
+static void enqueue_for_cleanup(void** ptrs, SAMMAllocType* types,
+                                uint8_t* size_classes, size_t count) {
     if (count == 0) {
         free(ptrs);
         free(types);
+        free(size_classes);
         return;
     }
 
@@ -465,18 +554,20 @@ static void enqueue_for_cleanup(void** ptrs, SAMMAllocType* types, size_t count)
         }
 
         SAMMCleanupBatch batch;
-        batch.ptrs  = ptrs;
-        batch.types = types;
-        batch.count = count;
+        batch.ptrs         = ptrs;
+        batch.types        = types;
+        batch.size_classes = size_classes;
+        batch.count        = count;
         cleanup_batch(&batch);
         SAMM_ATOMIC_INC(g_samm.stat_cleanup_batches);
         return;
     }
 
     int slot = g_samm.queue_tail;
-    g_samm.queue[slot].ptrs  = ptrs;
-    g_samm.queue[slot].types = types;
-    g_samm.queue[slot].count = count;
+    g_samm.queue[slot].ptrs         = ptrs;
+    g_samm.queue[slot].types        = types;
+    g_samm.queue[slot].size_classes = size_classes;
+    g_samm.queue[slot].count        = count;
     g_samm.queue_tail = (g_samm.queue_tail + 1) % SAMM_MAX_QUEUE_DEPTH;
     g_samm.queue_count++;
 
@@ -491,9 +582,10 @@ static void enqueue_for_cleanup(void** ptrs, SAMMAllocType* types, size_t count)
 static void drain_queue_sync(void) {
     while (1) {
         SAMMCleanupBatch batch;
-        batch.ptrs  = NULL;
-        batch.types = NULL;
-        batch.count = 0;
+        batch.ptrs         = NULL;
+        batch.types        = NULL;
+        batch.size_classes = NULL;
+        batch.count        = 0;
 
         pthread_mutex_lock(&g_samm.queue_mutex);
         if (g_samm.queue_count == 0) {
@@ -501,9 +593,10 @@ static void drain_queue_sync(void) {
             break;
         }
         batch = g_samm.queue[g_samm.queue_head];
-        g_samm.queue[g_samm.queue_head].ptrs  = NULL;
-        g_samm.queue[g_samm.queue_head].types = NULL;
-        g_samm.queue[g_samm.queue_head].count = 0;
+        g_samm.queue[g_samm.queue_head].ptrs         = NULL;
+        g_samm.queue[g_samm.queue_head].types        = NULL;
+        g_samm.queue[g_samm.queue_head].size_classes = NULL;
+        g_samm.queue[g_samm.queue_head].count        = 0;
         g_samm.queue_head = (g_samm.queue_head + 1) % SAMM_MAX_QUEUE_DEPTH;
         g_samm.queue_count--;
         pthread_mutex_unlock(&g_samm.queue_mutex);
@@ -529,8 +622,50 @@ void samm_init(void) {
     pthread_mutex_init(&g_samm.queue_mutex, NULL);
     pthread_cond_init(&g_samm.queue_cv, NULL);
 
-    /* Initialise Bloom filter */
+    /* Initialise Bloom filter (lazy — no memory allocated until first
+     * overflow-class object is freed via DELETE or scope cleanup) */
     bloom_init(&g_samm.bloom);
+
+    /* Initialise string descriptor pool (Phase 4: migrated to SammSlabPool).
+     *   StringDescriptor: 40-byte slots, 256 per slab (~10 KB)
+     * Replaces the legacy StringDescriptorPool with unified pool infra. */
+    samm_slab_pool_init(&g_string_desc_pool,
+                        STRING_DESC_POOL_SLOT_SIZE,
+                        STRING_DESC_POOL_SLOTS_PER_SLAB,
+                        "StringDesc");
+
+    /* Initialise list pools (Phase 2: pool-based allocation for lists)
+     *   ListHeader: 32-byte slots, 256 per slab (~8 KB)
+     *   ListAtom:   24-byte slots, 512 per slab (~12 KB)
+     * These pools eliminate malloc/free overhead and Bloom false positives
+     * for the two most frequently allocated list descriptor types. */
+    samm_slab_pool_init(&g_list_header_pool,
+                        LIST_HEADER_POOL_SLOT_SIZE,
+                        LIST_HEADER_POOL_SLOTS_PER_SLAB,
+                        "ListHeader");
+    samm_slab_pool_init(&g_list_atom_pool,
+                        LIST_ATOM_POOL_SLOT_SIZE,
+                        LIST_ATOM_POOL_SLOTS_PER_SLAB,
+                        "ListAtom");
+
+    /* Initialise object size-class pools (Phase 3: pool-based allocation
+     * for CLASS instances).
+     *
+     *   Class  Slot Size  Covers         Slots/Slab
+     *     0      32 B     17–32 B        128
+     *     1      64 B     33–64 B        128
+     *     2     128 B     65–128 B       128
+     *     3     256 B     129–256 B      128
+     *     4     512 B     257–512 B       64
+     *     5    1024 B     513–1024 B      32
+     *
+     * Objects > 1024 B fall back to malloc (size_class = 0xFF). */
+    for (int sc = 0; sc < SAMM_OBJECT_SIZE_CLASSES; sc++) {
+        samm_slab_pool_init(&g_object_pools[sc],
+                            samm_object_slot_sizes[sc],
+                            samm_object_slots_per_slab[sc],
+                            samm_object_pool_names[sc]);
+    }
 
     /* Initialise global scope (depth 0) */
     scope_init(&g_samm.scopes[0]);
@@ -565,8 +700,8 @@ void samm_init(void) {
     g_samm.trace = (getenv("SAMM_TRACE") != NULL) ? 1 : 0;
 
     if (g_samm.trace) {
-        fprintf(stderr, "SAMM: Initialised (Bloom filter: %d bytes, max scopes: %d)\n",
-                SAMM_BLOOM_BYTES, SAMM_MAX_SCOPE_DEPTH);
+        fprintf(stderr, "SAMM: Initialised (Bloom filter: lazy, max scopes: %d)\n",
+                SAMM_MAX_SCOPE_DEPTH);
     }
 }
 
@@ -610,15 +745,17 @@ void samm_shutdown(void) {
             /* Take ownership of the arrays — detach from scope first
              * so scope_remove() during cleanup finds nothing to mutate. */
             SAMMCleanupBatch batch;
-            batch.ptrs  = s->ptrs;
-            batch.types = s->types;
-            batch.count = s->count;
+            batch.ptrs         = s->ptrs;
+            batch.types        = s->types;
+            batch.size_classes = s->size_classes;
+            batch.count        = s->count;
 
             /* Detach scope (same pattern as samm_exit_scope) */
-            s->ptrs     = NULL;
-            s->types    = NULL;
-            s->count    = 0;
-            s->capacity = 0;
+            s->ptrs         = NULL;
+            s->types        = NULL;
+            s->size_classes = NULL;
+            s->count        = 0;
+            s->capacity     = 0;
 
             cleanup_batch(&batch);
             /* cleanup_batch freed the detached arrays */
@@ -633,6 +770,37 @@ void samm_shutdown(void) {
      *   SAMM_STATS=1 ./my_program        */
     if (g_samm.trace || getenv("SAMM_STATS")) {
         samm_print_stats();
+    }
+
+    /* Destroy string descriptor pool (Phase 4: migrated to SammSlabPool).
+     * All scopes have been cleaned up above, so any remaining
+     * descriptors are leaks — samm_slab_pool_destroy will report them. */
+    if (g_samm.trace || getenv("SAMM_STATS")) {
+        samm_slab_pool_print_stats(&g_string_desc_pool);
+    }
+    samm_slab_pool_destroy(&g_string_desc_pool);
+
+    /* Destroy list pools (Phase 2).
+     * Print pool stats if tracing/stats enabled, then destroy.
+     * Any remaining in-use slots are leaks — the destroy call
+     * will report them via samm_slab_pool_destroy(). */
+    if (g_samm.trace || getenv("SAMM_STATS")) {
+        samm_slab_pool_print_stats(&g_list_header_pool);
+        samm_slab_pool_print_stats(&g_list_atom_pool);
+        for (int sc = 0; sc < SAMM_OBJECT_SIZE_CLASSES; sc++) {
+            if (g_object_pools[sc].total_allocs > 0) {
+                samm_slab_pool_print_stats(&g_object_pools[sc]);
+            }
+        }
+    }
+    samm_slab_pool_destroy(&g_list_header_pool);
+    samm_slab_pool_destroy(&g_list_atom_pool);
+
+    /* Destroy object size-class pools (Phase 3).
+     * Any remaining in-use slots are leaks — the destroy call
+     * will report them. */
+    for (int sc = 0; sc < SAMM_OBJECT_SIZE_CLASSES; sc++) {
+        samm_slab_pool_destroy(&g_object_pools[sc]);
     }
 
     /* Destroy Bloom filter */
@@ -699,6 +867,7 @@ void samm_exit_scope(void) {
 
     void**        ptrs_to_clean  = NULL;
     SAMMAllocType* types_to_clean = NULL;
+    uint8_t*      sc_to_clean    = NULL;
     size_t        count_to_clean = 0;
 
     pthread_mutex_lock(&g_samm.scope_mutex);
@@ -718,13 +887,15 @@ void samm_exit_scope(void) {
         /* Take ownership of the arrays — the queue/worker will free them */
         ptrs_to_clean  = s->ptrs;
         types_to_clean = s->types;
+        sc_to_clean    = s->size_classes;
         count_to_clean = s->count;
 
         /* Detach from scope (don't free here, queue takes ownership) */
-        s->ptrs     = NULL;
-        s->types    = NULL;
-        s->count    = 0;
-        s->capacity = 0;
+        s->ptrs         = NULL;
+        s->types        = NULL;
+        s->size_classes = NULL;
+        s->count        = 0;
+        s->capacity     = 0;
     } else {
         scope_destroy(s);
     }
@@ -743,13 +914,15 @@ void samm_exit_scope(void) {
     /* Enqueue for background cleanup (or sync if no worker) */
     if (count_to_clean > 0) {
         if (g_samm.worker_running) {
-            enqueue_for_cleanup(ptrs_to_clean, types_to_clean, count_to_clean);
+            enqueue_for_cleanup(ptrs_to_clean, types_to_clean,
+                                sc_to_clean, count_to_clean);
         } else {
             /* No worker — clean synchronously */
             SAMMCleanupBatch batch;
-            batch.ptrs  = ptrs_to_clean;
-            batch.types = types_to_clean;
-            batch.count = count_to_clean;
+            batch.ptrs         = ptrs_to_clean;
+            batch.types        = types_to_clean;
+            batch.size_classes = sc_to_clean;
+            batch.count        = count_to_clean;
             cleanup_batch(&batch);
             SAMM_ATOMIC_INC(g_samm.stat_cleanup_batches);
         }
@@ -766,11 +939,33 @@ int samm_scope_depth(void) {
 }
 
 /* ========================================================================= */
-/* Public API: Object Allocation                                               */
+/* Public API: Object Allocation (Phase 3: size-class pools)                   */
 /* ========================================================================= */
 
+/*
+ * Last object size class allocated — used to communicate the size class
+ * from samm_alloc_object() to samm_track_object() without changing the
+ * public API.  This is safe because alloc+track are always called
+ * sequentially on the main thread (the background worker only frees).
+ */
+static uint8_t g_last_object_size_class = SAMM_SIZE_CLASS_NONE;
+
 void* samm_alloc_object(size_t size) {
-    void* ptr = calloc(1, size);
+    void* ptr;
+    int sc = samm_size_to_class(size);
+
+    if (sc >= 0) {
+        /* Allocate from size-class pool.
+         * samm_slab_pool_alloc returns a zeroed block of
+         * samm_object_slot_sizes[sc] bytes (>= size). */
+        ptr = samm_slab_pool_alloc(&g_object_pools[sc]);
+        g_last_object_size_class = (uint8_t)sc;
+    } else {
+        /* Overflow object (> 1024 B) — fall back to calloc */
+        ptr = calloc(1, size);
+        g_last_object_size_class = SAMM_SIZE_CLASS_NONE;
+    }
+
     if (ptr) {
         SAMM_ATOMIC_INC(g_samm.stat_objects_allocated);
         SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_allocated, (uint64_t)size);
@@ -781,40 +976,73 @@ void* samm_alloc_object(size_t size) {
 void samm_free_object(void* ptr) {
     if (!ptr) return;
 
-    /* Check Bloom filter for double-free */
+    uint8_t sc = SAMM_SIZE_CLASS_NONE;
+
     if (g_samm.enabled) {
         pthread_mutex_lock(&g_samm.scope_mutex);
-        int probably_freed = bloom_check(&g_samm.bloom, ptr);
-        pthread_mutex_unlock(&g_samm.scope_mutex);
 
-        if (probably_freed) {
-            SAMM_ATOMIC_INC(g_samm.stat_double_free_attempts);
-            if (g_samm.trace) {
-                fprintf(stderr, "SAMM WARNING: Possible double-free on %p (Bloom filter hit)\n", ptr);
-            }
-            /* Don't free — it's probably already freed.
-             * For safety, we log and skip. */
-            return;
-        }
-
-        /* Untrack from whichever scope owns this pointer (it may have
-         * been allocated in a parent scope).  Search from innermost
-         * scope outward, matching the strategy in samm_untrack(). */
-        pthread_mutex_lock(&g_samm.scope_mutex);
+        /* Try to untrack from whichever scope owns this pointer.
+         * Search from innermost scope outward, matching samm_untrack().
+         * scope_remove now outputs the size class so we know which
+         * pool to return the object to. */
+        int found = 0;
         for (int d = g_samm.scope_depth; d >= 0; d--) {
-            if (scope_remove(&g_samm.scopes[d], ptr)) {
+            if (scope_remove(&g_samm.scopes[d], ptr, &sc)) {
                 if (g_samm.trace) {
-                    fprintf(stderr, "SAMM: samm_free_object untracked %p from scope %d\n", ptr, d);
+                    fprintf(stderr, "SAMM: samm_free_object untracked %p from scope %d (sc=%u)\n",
+                            ptr, d, (unsigned)sc);
                 }
+                found = 1;
                 break;
             }
         }
-        /* Add to Bloom filter */
-        bloom_add(&g_samm.bloom, ptr);
+
+        if (!found) {
+            /* Pointer is not tracked in any scope.  For overflow objects
+             * (malloc'd, sc == SAMM_SIZE_CLASS_NONE), consult the Bloom
+             * filter for double-free detection.  Pool-managed objects
+             * don't need this — the pool detects double-free via the
+             * in_use counter. */
+            if (sc == SAMM_SIZE_CLASS_NONE) {
+                int probably_freed = bloom_check(&g_samm.bloom, ptr);
+                if (probably_freed) {
+                    pthread_mutex_unlock(&g_samm.scope_mutex);
+                    SAMM_ATOMIC_INC(g_samm.stat_double_free_attempts);
+                    if (g_samm.trace) {
+                        fprintf(stderr, "SAMM WARNING: Possible double-free on %p "
+                                "(Bloom filter hit, not tracked)\n", ptr);
+                    }
+                    return;
+                }
+            }
+            /* Not tracked and not in Bloom — could be an untracked
+             * allocation (e.g. from before SAMM was enabled).  Proceed
+             * with the free but log if tracing. */
+            if (g_samm.trace) {
+                fprintf(stderr, "SAMM: samm_free_object freeing untracked %p\n", ptr);
+            }
+        }
+
+        /* Record in Bloom filter — only for overflow-class objects */
+        if (sc == SAMM_SIZE_CLASS_NONE) {
+            bloom_add(&g_samm.bloom, ptr);
+        }
         pthread_mutex_unlock(&g_samm.scope_mutex);
     }
 
-    free(ptr);
+    /* Do NOT run the destructor here — class_object_delete() already
+     * calls the destructor before calling samm_free_object().  The
+     * destructor-then-free split is only done in default_object_cleanup()
+     * (the scope-exit / cleanup_batch path). */
+
+    /* Return object to correct size-class pool, or free for overflow */
+    if (sc < SAMM_OBJECT_SIZE_CLASSES) {
+        uint32_t slot_sz = samm_object_slot_sizes[sc];
+        SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_freed, (uint64_t)slot_sz);
+        samm_slab_pool_free(&g_object_pools[sc], ptr);
+    } else {
+        free(ptr);
+    }
     SAMM_ATOMIC_INC(g_samm.stat_objects_freed);
 }
 
@@ -827,7 +1055,8 @@ void samm_track(void* ptr, SAMMAllocType type) {
 
     pthread_mutex_lock(&g_samm.scope_mutex);
     if (g_samm.scope_depth >= 0 && g_samm.scope_depth < SAMM_MAX_SCOPE_DEPTH) {
-        scope_push(&g_samm.scopes[g_samm.scope_depth], ptr, type);
+        scope_push(&g_samm.scopes[g_samm.scope_depth], ptr, type,
+                    SAMM_SIZE_CLASS_NONE);
         if (g_samm.trace) {
             fprintf(stderr, "SAMM: Tracked %p (type=%d) in scope %d (scope size: %zu)\n",
                     ptr, (int)type, g_samm.scope_depth,
@@ -837,8 +1066,25 @@ void samm_track(void* ptr, SAMMAllocType type) {
     pthread_mutex_unlock(&g_samm.scope_mutex);
 }
 
-void samm_track_object(void* ptr) {
-    samm_track(ptr, SAMM_ALLOC_OBJECT);
+void samm_track_object(void* obj) {
+    if (!g_samm.enabled || !obj) return;
+
+    /* Read the size class stashed by samm_alloc_object().
+     * This is safe because alloc+track are always called sequentially
+     * on the main thread. */
+    uint8_t sc = g_last_object_size_class;
+
+    pthread_mutex_lock(&g_samm.scope_mutex);
+    if (g_samm.scope_depth >= 0 && g_samm.scope_depth < SAMM_MAX_SCOPE_DEPTH) {
+        scope_push(&g_samm.scopes[g_samm.scope_depth], obj,
+                    SAMM_ALLOC_OBJECT, sc);
+        if (g_samm.trace) {
+            fprintf(stderr, "SAMM: Tracked object %p (sc=%u) in scope %d (scope size: %zu)\n",
+                    obj, (unsigned)sc, g_samm.scope_depth,
+                    g_samm.scopes[g_samm.scope_depth].count);
+        }
+    }
+    pthread_mutex_unlock(&g_samm.scope_mutex);
 }
 
 void samm_untrack(void* ptr) {
@@ -847,7 +1093,7 @@ void samm_untrack(void* ptr) {
     pthread_mutex_lock(&g_samm.scope_mutex);
     /* Search from innermost scope outward */
     for (int d = g_samm.scope_depth; d >= 0; d--) {
-        if (scope_remove(&g_samm.scopes[d], ptr)) {
+        if (scope_remove(&g_samm.scopes[d], ptr, NULL)) {
             if (g_samm.trace) {
                 fprintf(stderr, "SAMM: Untracked %p from scope %d\n", ptr, d);
             }
@@ -871,11 +1117,12 @@ void samm_retain(void* ptr, int parent_offset) {
     /* Find and remove from current scope */
     int current = g_samm.scope_depth;
     SAMMAllocType type = SAMM_ALLOC_UNKNOWN;
+    uint8_t sc = SAMM_SIZE_CLASS_NONE;
     int found = 0;
 
     if (current >= 0) {
-        type = scope_find_type(&g_samm.scopes[current], ptr);
-        found = scope_remove(&g_samm.scopes[current], ptr);
+        type = scope_find_type(&g_samm.scopes[current], ptr, &sc);
+        found = scope_remove(&g_samm.scopes[current], ptr, NULL);
     }
 
     if (found) {
@@ -883,7 +1130,7 @@ void samm_retain(void* ptr, int parent_offset) {
         int target = current - parent_offset;
         if (target < 0) target = 0;  /* Clamp to global scope */
 
-        scope_push(&g_samm.scopes[target], ptr, type);
+        scope_push(&g_samm.scopes[target], ptr, type, sc);
 
         if (g_samm.trace) {
             fprintf(stderr, "SAMM: Retained %p from scope %d to scope %d\n",
@@ -893,11 +1140,11 @@ void samm_retain(void* ptr, int parent_offset) {
         /* Pointer wasn't in current scope — might be in an outer scope already.
          * Search outward and move it if found. */
         for (int d = current - 1; d >= 0; d--) {
-            type = scope_find_type(&g_samm.scopes[d], ptr);
-            if (scope_remove(&g_samm.scopes[d], ptr)) {
+            type = scope_find_type(&g_samm.scopes[d], ptr, &sc);
+            if (scope_remove(&g_samm.scopes[d], ptr, NULL)) {
                 int target = d - parent_offset;
                 if (target < 0) target = 0;
-                scope_push(&g_samm.scopes[target], ptr, type);
+                scope_push(&g_samm.scopes[target], ptr, type, sc);
                 if (g_samm.trace) {
                     fprintf(stderr, "SAMM: Retained %p from scope %d to scope %d (found in outer scope)\n",
                             ptr, d, target);
@@ -934,16 +1181,18 @@ int samm_is_probably_freed(void* ptr) {
 }
 
 /* ========================================================================= */
-/* Public API: List Support (Phase 4 stubs)                                    */
+/* Public API: List Support (Phase 2: pool-based allocation)                   */
 /* ========================================================================= */
 
 void* samm_alloc_list(void) {
-    /* Allocate a ListHeader. Phase 5 will use a freelist pool.
-     * For now, use malloc — the header is tracked as SAMM_ALLOC_LIST
-     * by the caller (list_create). */
-    void* ptr = malloc(sizeof(ListHeader));
+    /* Allocate a ListHeader from the slab pool (Phase 2).
+     * samm_slab_pool_alloc() pops from the free list (O(1)), zeroes the
+     * slot, and is thread-safe.  Pool-allocated addresses are never
+     * returned to the system allocator, eliminating Bloom false positives
+     * from malloc address reuse. */
+    void* ptr = samm_slab_pool_alloc(&g_list_header_pool);
     if (!ptr) return NULL;
-    memset(ptr, 0, sizeof(ListHeader));
+    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_allocated, (uint64_t)sizeof(ListHeader));
     return ptr;
 }
 
@@ -953,12 +1202,11 @@ void samm_track_list(void* list_header_ptr) {
 }
 
 void* samm_alloc_list_atom(void) {
-    /* Allocate a ListAtom. Phase 5 will use a freelist pool.
-     * For now, use malloc — the atom is tracked as SAMM_ALLOC_LIST_ATOM
-     * by the caller (atom_alloc in list_ops.c). */
-    void* ptr = malloc(sizeof(ListAtom));
+    /* Allocate a ListAtom from the slab pool (Phase 2).
+     * Same pool pattern as ListHeader above. */
+    void* ptr = samm_slab_pool_alloc(&g_list_atom_pool);
     if (!ptr) return NULL;
-    memset(ptr, 0, sizeof(ListAtom));
+    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_allocated, (uint64_t)sizeof(ListAtom));
     return ptr;
 }
 
@@ -977,13 +1225,16 @@ void samm_track_string(void* string_desc_ptr) {
 /* ========================================================================= */
 
 void* samm_alloc_string(void) {
-    /* Allocate a zeroed StringDescriptor via calloc (same strategy as
-     * string_new_* functions in string_utf32.c) and track it in the
-     * current SAMM scope so it is automatically released on scope exit. */
-    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    /* Allocate a StringDescriptor from the slab pool (Phase 4: SammSlabPool).
+     * string_desc_alloc() pops from the free list (O(1)), sets non-zero
+     * defaults (refcount=1, dirty=1, encoding=ASCII), and is thread-safe.
+     *
+     * Pool-allocated addresses are never returned to the system allocator
+     * during normal operation, which eliminates Bloom-filter false
+     * positives caused by malloc address reuse. */
+    StringDescriptor* desc = string_desc_alloc();
     if (!desc) return NULL;
-    desc->refcount = 1;
-    desc->dirty    = 1;
+    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_allocated, (uint64_t)sizeof(StringDescriptor));
     if (g_samm.enabled) {
         samm_track_string(desc);
     }
@@ -1026,7 +1277,7 @@ void samm_get_stats(SAMMStats* out) {
     out->peak_scope_depth    = g_samm.peak_scope_depth;
     pthread_mutex_unlock(&g_samm.scope_mutex);
 
-    out->bloom_memory_bytes        = g_samm.bloom.bits ? SAMM_BLOOM_BYTES : 0;
+    out->bloom_memory_bytes        = g_samm.bloom.size_bytes;
 
     pthread_mutex_lock(&g_samm.queue_mutex);
     out->total_cleanup_time_ms     = g_samm.stat_total_cleanup_time_ms;
@@ -1055,8 +1306,12 @@ void samm_print_stats(void) {
     fprintf(stderr, "  Bytes freed:          %" PRIu64 "\n", s.total_bytes_freed);
     fprintf(stderr, "  Current scope depth:  %d\n", s.current_scope_depth);
     fprintf(stderr, "  Peak scope depth:     %d\n", s.peak_scope_depth);
-    fprintf(stderr, "  Bloom filter memory:  %zu bytes (%.1f MB)\n",
-            s.bloom_memory_bytes, (double)s.bloom_memory_bytes / (1024.0 * 1024.0));
+    if (s.bloom_memory_bytes > 0) {
+        fprintf(stderr, "  Bloom filter memory:  %zu bytes (%.1f KB)\n",
+                s.bloom_memory_bytes, (double)s.bloom_memory_bytes / 1024.0);
+    } else {
+        fprintf(stderr, "  Bloom filter:         not allocated (no overflow objects)\n");
+    }
     fprintf(stderr, "  Cleanup time:         %.3f ms\n", s.total_cleanup_time_ms);
     fprintf(stderr, "  Background worker:    %s\n",
             s.background_worker_active ? "active" : "stopped");
@@ -1091,4 +1346,8 @@ void samm_wait(void) {
     if (g_samm.trace) {
         fprintf(stderr, "SAMM: All pending cleanup complete\n");
     }
+}
+
+void samm_record_bytes_freed(uint64_t bytes) {
+    SAMM_ATOMIC_ADD(g_samm.stat_total_bytes_freed, bytes);
 }

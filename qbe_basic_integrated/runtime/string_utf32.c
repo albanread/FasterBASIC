@@ -10,6 +10,7 @@
 #include "array_descriptor.h"
 #include "basic_runtime.h"
 #include "samm_bridge.h"
+#include "string_pool.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -463,13 +464,18 @@ void string_release(StringDescriptor* str) {
         // already been moved out of the scope, so samm_untrack is a
         // harmless no-op.
         samm_untrack(str);
-        if (str->data) {
-            free(str->data);
-        }
-        if (str->utf8_cache) {
-            free(str->utf8_cache);
-        }
-        free(str);
+
+        // Free variable-size data buffers back to the system allocator,
+        // then return the fixed-size descriptor shell to the slab pool.
+        // string_desc_free_data NULLs the pointers after freeing, so
+        // string_desc_free's safety-net free calls are harmless no-ops.
+        string_desc_free_data(str);
+        string_desc_free(str);
+
+        // Record the recycled descriptor bytes in SAMM stats.
+        // This is the single point where descriptor shells are freed
+        // (both scope-exit via cleanup_batch and explicit release).
+        samm_record_bytes_freed((uint64_t)sizeof(StringDescriptor));
     }
 }
 

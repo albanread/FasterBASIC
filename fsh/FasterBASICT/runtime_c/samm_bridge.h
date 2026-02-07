@@ -305,7 +305,7 @@ typedef void (*samm_cleanup_fn)(void* ptr);
 /**
  * Register a custom cleanup function for a given allocation type.
  * This overrides the default cleanup strategy (which is type-specific:
- * objects use vtable[3], strings use string_pool_free, etc.).
+ * objects use vtable[3], strings use string_release, etc.).
  *
  * @param type        Allocation type to register for
  * @param cleanup_fn  Function to call before freeing. NULL to use default.
@@ -367,6 +367,15 @@ void samm_set_trace(int enabled);
  */
 void samm_wait(void);
 
+/**
+ * Record that bytes have been freed (or recycled back to a pool).
+ * Called from type-specific release functions (e.g. string_release)
+ * that live outside samm_core.c but need to update the byte counters.
+ *
+ * @param bytes  Number of bytes freed/recycled
+ */
+void samm_record_bytes_freed(uint64_t bytes);
+
 /* ========================================================================= */
 /* Constants                                                                  */
 /* ========================================================================= */
@@ -381,14 +390,25 @@ void samm_wait(void);
 #define SAMM_MAX_QUEUE_DEPTH        1024
 
 /**
- * Bloom filter configuration.
- * 96M bits = 12 MB, 10 hash functions.
- * Supports ~10M freed addresses at <0.1% false-positive rate.
- * On M1 systems with 8+ GB RAM, 12 MB is negligible (0.15%).
+ * Bloom filter configuration — LAZY allocation (Phase 4).
+ *
+ * The Bloom filter is only needed for overflow-class objects (> 1024 B)
+ * that are allocated via malloc rather than from size-class pools.
+ * Pool-managed objects (strings, lists, objects ≤ 1024 B) don't need
+ * the filter because their pools own the address space and detect
+ * double-free via the in_use counter.
+ *
+ * The filter is NOT allocated at init time.  It is allocated on first
+ * use (first overflow-class DELETE or scope cleanup of an overflow
+ * object).  Programs that never create >1024 B objects pay zero cost.
+ *
+ * 512K bits = 64 KB, 7 hash functions.
+ * Supports ~55K freed overflow addresses at <1% false-positive rate.
+ * (Optimal k for m/n ≈ 9.4 is k ≈ 7; using 7 hash functions.)
  */
-#define SAMM_BLOOM_BITS             96000000
+#define SAMM_BLOOM_BITS             524288
 #define SAMM_BLOOM_BYTES            ((SAMM_BLOOM_BITS + 7) / 8)
-#define SAMM_BLOOM_HASH_COUNT       10
+#define SAMM_BLOOM_HASH_COUNT       7
 
 /* FNV-1a hash constants (64-bit) */
 #define SAMM_FNV_PRIME              0x00000100000001b3ULL

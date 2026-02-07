@@ -228,6 +228,7 @@ void Lexer::initializeKeywords() {
     s_keywords["PLAY_SOUND"] = TokenType::PLAY_SOUND;
     
 // Timing
+        s_keywords["SLEEP"] = TokenType::SLEEP;
         s_keywords["VSYNC"] = TokenType::VSYNC;
         s_keywords["AFTER"] = TokenType::AFTER;
         s_keywords["EVERY"] = TokenType::EVERY;

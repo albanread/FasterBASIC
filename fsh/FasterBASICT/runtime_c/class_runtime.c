@@ -103,16 +103,11 @@ void class_object_delete(void** obj_ref) {
     void* obj = *obj_ref;
     if (!obj) return;   /* DELETE on NOTHING is a no-op */
 
-    /* Double-free detection via SAMM Bloom filter.
-     * If the Bloom filter says this pointer was probably already freed,
-     * we skip the free to prevent heap corruption. */
-    if (samm_is_enabled() && samm_is_probably_freed(obj)) {
-        fprintf(stderr,
-                "WARNING: Possible double-free on object at %p "
-                "(DELETE on already-freed object)\n", obj);
-        *obj_ref = NULL;
-        return;
-    }
+    /* NOTE: We no longer check the Bloom filter here.  The Bloom filter
+     * can false-positive when malloc reuses a freed address for a new
+     * live object.  samm_free_object() now handles double-free detection
+     * correctly by first checking whether the pointer is tracked in a
+     * scope (tracked = definitely live, even if Bloom says "freed"). */
 
     /* Load vtable pointer from obj[0] */
     void** vtable = (void**)((void**)obj)[0];

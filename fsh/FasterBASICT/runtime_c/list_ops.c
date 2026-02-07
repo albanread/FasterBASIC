@@ -20,6 +20,7 @@
 #include "list_ops.h"
 #include "string_descriptor.h"
 #include "samm_bridge.h"
+#include "samm_pool.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,19 +32,35 @@
 /* ========================================================================= */
 
 /**
- * Allocate a new ListAtom. Uses malloc (Phase 5 will add freelist pooling).
- * The atom is SAMM-tracked as SAMM_ALLOC_LIST_ATOM.
+ * Allocate a new ListAtom from the slab pool (Phase 2).
+ *
+ * When SAMM is enabled, uses samm_alloc_list_atom() which allocates from
+ * g_list_atom_pool and records byte accounting.  SAMM tracking is done
+ * separately below via samm_track().  When SAMM is disabled, allocates
+ * directly from the pool (still benefits from pooling, just no scope
+ * tracking).
+ *
+ * The returned atom is zeroed by the pool allocator; we set the sentinel
+ * type explicitly for clarity.
  */
 static ListAtom* atom_alloc(void) {
-    ListAtom* atom = (ListAtom*)malloc(sizeof(ListAtom));
+    ListAtom* atom;
+
+    if (samm_is_enabled()) {
+        /* Pool alloc + byte accounting (tracking is separate below) */
+        atom = (ListAtom*)samm_alloc_list_atom();
+    } else {
+        /* Pool alloc only (no tracking) */
+        atom = (ListAtom*)samm_slab_pool_alloc(&g_list_atom_pool);
+    }
+
     if (!atom) {
         fprintf(stderr, "list_ops: out of memory allocating ListAtom\n");
         abort();
     }
+
+    /* Pool returns zeroed memory, but set sentinel explicitly for clarity */
     atom->type = ATOM_SENTINEL; /* Will be set by caller */
-    atom->pad  = 0;
-    atom->value.int_value = 0;
-    atom->next = NULL;
 
     /* Track in SAMM so scope exit cleans up if needed */
     if (samm_is_enabled()) {
@@ -85,18 +102,25 @@ static void atom_release_payload(ListAtom* atom) {
 }
 
 /**
- * Free a single atom: release payload, then free the struct.
+ * Free a single atom: release payload, then return shell to pool.
+ *
+ * Phase 2: the atom struct is returned to g_list_atom_pool via
+ * samm_slab_pool_free() instead of system free().  The payload
+ * (string data, nested list) is released first via atom_release_payload().
  */
 static void atom_free(ListAtom* atom) {
     if (!atom) return;
     atom_release_payload(atom);
-    /* Untrack from SAMM before freeing so that SAMM's scope-exit
-     * cleanup won't try to list_atom_free_from_samm on an
-     * already-freed atom (double-free). */
+    /* Untrack from SAMM before returning to pool so that SAMM's
+     * scope-exit cleanup won't try to list_atom_free_from_samm on an
+     * already-recycled atom (double-free). */
     if (samm_is_enabled()) {
         samm_untrack(atom);
     }
-    free(atom);
+    /* Record bytes freed for SAMM accounting */
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    /* Return atom shell to pool */
+    samm_slab_pool_free(&g_list_atom_pool, atom);
 }
 
 /**
@@ -204,18 +228,29 @@ static void list_insert_atom(ListHeader* list, int64_t pos, ListAtom* atom) {
 /* ========================================================================= */
 
 ListHeader* list_create(void) {
-    ListHeader* h = (ListHeader*)malloc(sizeof(ListHeader));
+    ListHeader* h;
+
+    if (samm_is_enabled()) {
+        /* Pool alloc + byte accounting (tracking is separate below) */
+        h = (ListHeader*)samm_alloc_list();
+    } else {
+        /* Pool alloc only (no tracking) */
+        h = (ListHeader*)samm_slab_pool_alloc(&g_list_header_pool);
+    }
+
     if (!h) {
         fprintf(stderr, "list_ops: out of memory allocating ListHeader\n");
         abort();
     }
+
+    /* Pool returns zeroed memory; set fields explicitly for clarity */
     h->type   = ATOM_SENTINEL;
     h->flags  = LIST_FLAG_ELEM_ANY;
     h->length = 0;
     h->head   = NULL;
     h->tail   = NULL;
 
-    /* Track in SAMM */
+    /* Track in SAMM so scope exit cleans up if needed */
     if (samm_is_enabled()) {
         samm_track_list((void*)h);
     }
@@ -234,7 +269,14 @@ ListHeader* list_create_typed(int32_t elem_type_flag) {
 void list_free(ListHeader* list) {
     if (!list) return;
 
-    /* Free all atoms */
+    /* Untrack the header from SAMM before recycling so that scope-exit
+     * cleanup won't try to list_free_from_samm() on the recycled slot
+     * (which may already be reused for a new list). */
+    if (samm_is_enabled()) {
+        samm_untrack(list);
+    }
+
+    /* Free all atoms (returns each to g_list_atom_pool) */
     ListAtom* curr = list->head;
     while (curr) {
         ListAtom* next = curr->next;
@@ -246,8 +288,10 @@ void list_free(ListHeader* list) {
     list->tail   = NULL;
     list->length = 0;
 
-    /* Free the header itself */
-    free(list);
+    /* Record bytes freed for SAMM accounting */
+    samm_record_bytes_freed((uint64_t)sizeof(ListHeader));
+    /* Return header shell to pool */
+    samm_slab_pool_free(&g_list_header_pool, list);
 }
 
 /* ========================================================================= */
@@ -431,9 +475,10 @@ int64_t list_shift_int(ListHeader* list) {
     ListAtom* atom = list_shift_atom(list);
     if (!atom) return 0;
     int64_t val = atom->value.int_value;
-    /* Don't release payload for INT — just free struct */
+    /* Don't release payload for INT — just return shell to pool */
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -442,7 +487,8 @@ double list_shift_float(ListHeader* list) {
     if (!atom) return 0.0;
     double val = atom->value.float_value;
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -452,7 +498,8 @@ void* list_shift_ptr(ListHeader* list) {
     void* val = atom->value.ptr_value;
     /* Don't release the string/list — caller now owns the reference */
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -509,7 +556,8 @@ int64_t list_pop_int(ListHeader* list) {
     if (!atom) return 0;
     int64_t val = atom->value.int_value;
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -518,7 +566,8 @@ double list_pop_float(ListHeader* list) {
     if (!atom) return 0.0;
     double val = atom->value.float_value;
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -528,7 +577,8 @@ void* list_pop_ptr(ListHeader* list) {
     void* val = atom->value.ptr_value;
     /* Caller now owns the reference */
     if (samm_is_enabled()) samm_untrack(atom);
-    free(atom);
+    samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
+    samm_slab_pool_free(&g_list_atom_pool, atom);
     return val;
 }
 
@@ -1027,12 +1077,13 @@ void list_free_from_samm(void* header_ptr) {
      * Therefore we must NOT walk the atom chain here. The atoms are
      * (or will be) freed by their own SAMM_ALLOC_LIST_ATOM cleanup calls.
      *
-     * We just zero out the header and free the struct.
+     * We just zero out the header and return the shell to the pool.
+     * (Phase 2: pool-based recycling instead of system free.)
      */
     list->head   = NULL;
     list->tail   = NULL;
     list->length = 0;
-    free(list);
+    samm_slab_pool_free(&g_list_header_pool, list);
 }
 
 void list_atom_free_from_samm(void* atom_ptr) {
@@ -1050,8 +1101,8 @@ void list_atom_free_from_samm(void* atom_ptr) {
      */
     atom_release_payload(atom);
 
-    /* Free the atom struct itself */
-    free(atom);
+    /* Return atom shell to pool (Phase 2: pool-based recycling) */
+    samm_slab_pool_free(&g_list_atom_pool, atom);
 }
 
 /* ========================================================================= */

@@ -213,6 +213,7 @@ enum class TokenType {
     PLAY_SOUND,      // PLAY_SOUND (play sound from slot with optional fade)
     
     // Keywords - Timing
+    SLEEP,           // SLEEP (pause execution for seconds)
     VSYNC,           // VSYNC (wait for frame)
     AFTER,           // AFTER (one-shot timer event)
     EVERY,           // EVERY (repeating timer event)
@@ -534,6 +535,7 @@ inline const char* tokenTypeToString(TokenType type) {
         case TokenType::REM: return "REM";
         case TokenType::CLS: return "CLS";
         case TokenType::COLOR: return "COLOR";
+        case TokenType::SLEEP: return "SLEEP";
         case TokenType::WAIT: return "WAIT";
         case TokenType::PSET: return "PSET";
         case TokenType::LINE: return "LINE";
