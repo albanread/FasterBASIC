@@ -42,6 +42,12 @@ cd /path/to/FBCQBE
 
 ### Utility Scripts
 
+- **create_release.sh** - Create GitHub releases
+  - Interactive script to create and publish releases
+  - Creates git tags and pushes to GitHub
+  - Triggers automated builds and release creation
+  - Run from project root: `./scripts/create_release.sh [version]`
+
 - **generate_tests.sh** - Generate test cases
   - Creates test programs programmatically
   - Useful for regression testing
@@ -66,6 +72,12 @@ If you need to run other utility scripts:
 ```bash
 # Run from project root
 ./scripts/generate_tests.sh
+
+# Create a release (interactive)
+./scripts/create_release.sh
+
+# Create a release (with version)
+./scripts/create_release.sh 1.0.0
 ```
 
 ## Building the Compiler
@@ -78,6 +90,28 @@ cd qbe_basic_integrated
 ```
 
 See [../BUILD.md](../BUILD.md) for detailed build instructions.
+
+## Creating Releases
+
+To create a new release:
+
+```bash
+# Interactive mode (recommended)
+./scripts/create_release.sh
+
+# Or specify version directly
+./scripts/create_release.sh 1.0.0
+```
+
+The script will:
+1. Check for uncommitted changes
+2. Validate version format
+3. Prompt for release notes
+4. Create an annotated git tag
+5. Push the tag to GitHub
+6. Trigger automated builds for macOS ARM64, macOS x86_64, and Linux x86_64
+
+GitHub Actions will automatically create the release with binaries.
 
 ## Test Organization
 
