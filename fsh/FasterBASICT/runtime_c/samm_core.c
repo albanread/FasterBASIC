@@ -797,10 +797,17 @@ void samm_free_object(void* ptr) {
             return;
         }
 
-        /* Untrack from current scope (if it's being explicitly DELETEd) */
+        /* Untrack from whichever scope owns this pointer (it may have
+         * been allocated in a parent scope).  Search from innermost
+         * scope outward, matching the strategy in samm_untrack(). */
         pthread_mutex_lock(&g_samm.scope_mutex);
-        if (g_samm.scope_depth >= 0) {
-            scope_remove(&g_samm.scopes[g_samm.scope_depth], ptr);
+        for (int d = g_samm.scope_depth; d >= 0; d--) {
+            if (scope_remove(&g_samm.scopes[d], ptr)) {
+                if (g_samm.trace) {
+                    fprintf(stderr, "SAMM: samm_free_object untracked %p from scope %d\n", ptr, d);
+                }
+                break;
+            }
         }
         /* Add to Bloom filter */
         bloom_add(&g_samm.bloom, ptr);
