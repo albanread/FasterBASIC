@@ -21,9 +21,6 @@
 // Current line number (for error reporting)
 static int32_t g_current_line = 0;
 
-// Random number generator state
-static bool g_rnd_initialized = false;
-
 // Arena allocator for temporary values
 #define ARENA_SIZE (1024 * 1024)  // 1 MB
 static char* g_arena = NULL;
@@ -59,11 +56,9 @@ void basic_runtime_init(void) {
     }
     g_arena_offset = 0;
     
-    // Initialize random number generator
-    if (!g_rnd_initialized) {
-        srand((unsigned int)time(NULL));
-        g_rnd_initialized = true;
-    }
+    // NOTE: RNG initialisation is handled lazily by math_ops.c (basic_rnd,
+    // basic_rnd_int) on first use.  Calling srand() here would reset the
+    // seed when a program calls RANDOMIZE before its first RND().
     
     // Initialize program start time
     g_program_start_ms = basic_timer_ms();
