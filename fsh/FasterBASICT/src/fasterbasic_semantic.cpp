@@ -491,20 +491,50 @@ void SemanticAnalyzer::collectDimStatements(Program& program) {
             // Also process DIM statements inside FUNCTION bodies
             else if (stmt->getType() == ASTNodeType::STMT_FUNCTION) {
                 const FunctionStatement* funcStmt = static_cast<const FunctionStatement*>(stmt.get());
+                
+                // Temporarily enter function scope so DIM variables are
+                // registered with the correct function scope (not global)
+                FunctionScope prevScope = m_currentFunctionScope;
+                std::string prevFuncName = m_currentFunctionName;
+                m_currentFunctionScope = FunctionScope();
+                m_currentFunctionScope.inFunction = true;
+                m_currentFunctionScope.functionName = funcStmt->functionName;
+                m_currentFunctionScope.isSub = false;
+                m_currentFunctionName = funcStmt->functionName;
+                
                 for (const auto& bodyStmt : funcStmt->body) {
                     if (bodyStmt->getType() == ASTNodeType::STMT_DIM) {
                         processDimStatement(static_cast<const DimStatement&>(*bodyStmt));
                     }
                 }
+                
+                // Restore previous scope
+                m_currentFunctionScope = prevScope;
+                m_currentFunctionName = prevFuncName;
             }
             // Also process DIM statements inside SUB bodies
             else if (stmt->getType() == ASTNodeType::STMT_SUB) {
                 const SubStatement* subStmt = static_cast<const SubStatement*>(stmt.get());
+                
+                // Temporarily enter SUB scope so DIM variables are
+                // registered with the correct function scope (not global)
+                FunctionScope prevScope = m_currentFunctionScope;
+                std::string prevFuncName = m_currentFunctionName;
+                m_currentFunctionScope = FunctionScope();
+                m_currentFunctionScope.inFunction = true;
+                m_currentFunctionScope.functionName = subStmt->subName;
+                m_currentFunctionScope.isSub = true;
+                m_currentFunctionName = subStmt->subName;
+                
                 for (const auto& bodyStmt : subStmt->body) {
                     if (bodyStmt->getType() == ASTNodeType::STMT_DIM) {
                         processDimStatement(static_cast<const DimStatement&>(*bodyStmt));
                     }
                 }
+                
+                // Restore previous scope
+                m_currentFunctionScope = prevScope;
+                m_currentFunctionName = prevFuncName;
             }
         }
     }
@@ -1917,6 +1947,46 @@ void SemanticAnalyzer::validateStatement(const Statement& stmt) {
         case ASTNodeType::STMT_CIRCLEF:
             validateExpressionStatement(static_cast<const ExpressionStatement&>(stmt));
             break;
+        case ASTNodeType::STMT_DIM: {
+            // DIM inside a FUNCTION/SUB body — register the declared variables
+            // as local so validateVariableInFunction() accepts them.
+            if (m_currentFunctionScope.inFunction) {
+                const DimStatement& dimStmt = static_cast<const DimStatement&>(stmt);
+                for (const auto& arrayDim : dimStmt.arrays) {
+                    // Register the bare name
+                    m_currentFunctionScope.localVariables.insert(arrayDim.name);
+                    
+                    // Also register normalized (suffixed) variants so that
+                    // lookups like "temp_INT" succeed.
+                    TypeDescriptor td;
+                    if (arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
+                        std::string upper = arrayDim.asTypeName;
+                        std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
+                        if (upper == "INTEGER" || upper == "INT") td = TypeDescriptor(BaseType::INTEGER);
+                        else if (upper == "LONG") td = TypeDescriptor(BaseType::LONG);
+                        else if (upper == "DOUBLE") td = TypeDescriptor(BaseType::DOUBLE);
+                        else if (upper == "SINGLE" || upper == "FLOAT") td = TypeDescriptor(BaseType::SINGLE);
+                        else if (upper == "STRING") td = TypeDescriptor(BaseType::STRING);
+                        else if (upper == "SHORT") td = TypeDescriptor(BaseType::SHORT);
+                        else if (upper == "BYTE") td = TypeDescriptor(BaseType::BYTE);
+                        else if (m_symbolTable.classes.find(upper) != m_symbolTable.classes.end()) {
+                            td = TypeDescriptor::makeClassInstance(upper);
+                        } else {
+                            td = TypeDescriptor(BaseType::USER_DEFINED);
+                            td.udtName = arrayDim.asTypeName;
+                        }
+                    } else {
+                        td = inferTypeFromSuffixD(arrayDim.typeSuffix);
+                        if (td.baseType == BaseType::UNKNOWN) {
+                            td = inferTypeFromNameD(arrayDim.name);
+                        }
+                    }
+                    std::string normalized = normalizeVariableName(arrayDim.name, td);
+                    m_currentFunctionScope.localVariables.insert(normalized);
+                }
+            }
+            break;
+        }
         case ASTNodeType::STMT_FUNCTION: {
             const FunctionStatement& funcStmt = static_cast<const FunctionStatement&>(stmt);
             std::string prevFuncName = m_currentFunctionName;
@@ -3527,6 +3597,17 @@ VariableType SemanticAnalyzer::inferVariableType(const VariableExpression& expr)
             const VariableSymbol* paramSym = lookupVariableScoped(expr.name, m_currentFunctionScope.functionName);
             if (paramSym) {
                 return descriptorToLegacyType(paramSym->typeDesc);
+            }
+            // Try suffixed variants (DIM x AS INTEGER stores as x_INT)
+            {
+                static const char* suffixes[] = {"_INT", "_LONG", "_DOUBLE", "_FLOAT", "_STRING", "_BYTE", "_SHORT"};
+                Scope funcScope = Scope::makeFunction(m_currentFunctionScope.functionName);
+                for (const char* s : suffixes) {
+                    const VariableSymbol* suffixed = m_symbolTable.lookupVariable(expr.name + s, funcScope);
+                    if (suffixed) {
+                        return descriptorToLegacyType(suffixed->typeDesc);
+                    }
+                }
             }
             // Fall back to name-based inference
             return inferTypeFromName(expr.name);
@@ -5616,6 +5697,17 @@ TypeDescriptor SemanticAnalyzer::inferVariableTypeD(const VariableExpression& ex
             const VariableSymbol* paramSym = lookupVariableScoped(expr.name, m_currentFunctionScope.functionName);
             if (paramSym) {
                 return paramSym->typeDesc;
+            }
+            // Try suffixed variants (DIM x AS INTEGER stores as x_INT)
+            {
+                static const char* suffixes[] = {"_INT", "_LONG", "_DOUBLE", "_FLOAT", "_STRING", "_BYTE", "_SHORT"};
+                Scope funcScope = Scope::makeFunction(m_currentFunctionScope.functionName);
+                for (const char* s : suffixes) {
+                    const VariableSymbol* suffixed = m_symbolTable.lookupVariable(expr.name + s, funcScope);
+                    if (suffixed) {
+                        return suffixed->typeDesc;
+                    }
+                }
             }
             // Fall back to name-based inference
             return inferTypeFromNameD(expr.name);
