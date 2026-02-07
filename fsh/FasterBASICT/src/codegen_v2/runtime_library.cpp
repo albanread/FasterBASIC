@@ -56,18 +56,20 @@ std::string RuntimeLibrary::emitStringConcat(const std::string& left, const std:
 }
 
 std::string RuntimeLibrary::emitStringLen(const std::string& stringPtr) {
-    // BasicString struct layout:
-    //   offset 0: char* data
-    //   offset 8: size_t length (8 bytes on 64-bit)
-    //   offset 16: size_t capacity
-    //   offset 24: int32_t refcount
-    // We want to load the length field at offset 8
+    // StringDescriptor layout (string_descriptor.h):
+    //   offset 0:  void*   data        (8 bytes)
+    //   offset 8:  int64_t length      (8 bytes) — length in characters
+    //   offset 16: int64_t capacity    (8 bytes)
+    //   offset 24: int32_t refcount    (4 bytes)
+    //   offset 28: uint8_t encoding    (1 byte)
+    //   ...
+    // We load the length field at offset 8.
     
     std::string lengthAddr = builder_.newTemp();
     builder_.emitBinary(lengthAddr, "l", "add", stringPtr, "8");
     
     std::string lengthVal = builder_.newTemp();
-    builder_.emitLoad(lengthVal, "l", lengthAddr);  // Load size_t (64-bit)
+    builder_.emitLoad(lengthVal, "l", lengthAddr);  // Load int64_t length
     
     // Truncate to 32-bit for BASIC INTEGER compatibility
     std::string result = builder_.newTemp();
@@ -187,9 +189,11 @@ std::string RuntimeLibrary::emitAbs(const std::string& value, BasicType valueTyp
     if (typeManager_.isIntegral(valueType)) {
         return emitRuntimeCall("basic_abs_int", "w", "w " + value);
     } else if (valueType == BasicType::SINGLE) {
-        return emitRuntimeCall("basic_abs_float", "s", "s " + value);
+        // Use C standard library fabsf (no basic_abs_float wrapper needed)
+        return emitRuntimeCall("fabsf", "s", "s " + value);
     } else {
-        return emitRuntimeCall("basic_abs_double", "d", "d " + value);
+        // Use C standard library fabs (basic_abs_double is just a wrapper)
+        return emitRuntimeCall("fabs", "d", "d " + value);
     }
 }
 
