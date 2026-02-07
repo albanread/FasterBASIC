@@ -1,29 +1,79 @@
-# FBCQBE - FasterBASIC QBE Backend
+# FasterBASIC
 
-## 🎉 Latest Feature: UDT Assignment (February 2025)
+[![Build Status](https://github.com/albanread/FasterBASIC/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FasterBASIC/actions)
 
-**NEW:** Complete UDT-to-UDT whole-struct assignment is now implemented!
+A modern, compiled BASIC dialect that generates native machine code for AMD64, ARM64, and RISC-V architectures.
+
+## 🎉 Latest Features (February 2025)
+
+### Object-Oriented Programming
+**NEW:** Full CLASS system with inheritance, polymorphism, and virtual dispatch!
 
 ```basic
-TYPE Person
+CLASS Animal
   Name AS STRING
-  Age AS INTEGER
-END TYPE
+  CONSTRUCTOR(n AS STRING)
+    ME.Name = n
+  END CONSTRUCTOR
+  METHOD Speak() AS STRING
+    RETURN "..."
+  END METHOD
+END CLASS
 
-DIM P1 AS Person, P2 AS Person
-P1.Name = "Alice"
-P1.Age = 30
+CLASS Dog EXTENDS Animal
+  METHOD Speak() AS STRING
+    RETURN "Woof!"
+  END METHOD
+END CLASS
 
-P2 = P1  ' ← Complete struct copy with string refcounting!
+DIM pet AS Dog = NEW Dog("Rex")
+PRINT pet.Speak()  ' Output: Woof!
 ```
 
-See [docs/UDT_ASSIGNMENT_GUIDE.md](docs/UDT_ASSIGNMENT_GUIDE.md) for full documentation.
+### HashMaps
+**NEW:** Native hashmap support for key-value storage!
+
+```basic
+DIM users AS HASHMAP
+users("alice") = "Alice Smith"
+users("bob") = "Bob Jones"
+PRINT users("alice")  ' Output: Alice Smith
+```
+
+### Lists with Pattern Matching
+**NEW:** Dynamic lists with type-safe pattern matching!
+
+```basic
+DIM items AS LIST OF ANY
+items.APPEND(42)
+items.APPEND("Hello")
+
+FOR EACH item IN items
+  MATCH TYPE item
+    CASE INTEGER n
+      PRINT "Integer: "; n
+    CASE STRING s
+      PRINT "String: "; s
+  END MATCH
+NEXT
+```
+
+### NEON SIMD Acceleration
+**NEW:** Automatic vectorization for ARM64 platforms!
+
+```basic
+TYPE Vec4
+  X AS SINGLE
+  Y AS SINGLE
+  Z AS SINGLE
+  W AS SINGLE
+END TYPE
+
+DIM v1 AS Vec4, v2 AS Vec4, result AS Vec4
+result = v1 + v2  ' ← Compiles to NEON SIMD instructions!
+```
 
 ---
-
-[![Build Status](https://github.com/albanread/FBCQBE/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FBCQBE/actions)
-
-A native-code ahead-of-time (AOT) compiler backend for FasterBASIC using the QBE intermediate language.
 
 > **⚠️ Important Build Note:** This project has a single build location. Always build using:
 > ```bash
@@ -36,29 +86,68 @@ A native-code ahead-of-time (AOT) compiler backend for FasterBASIC using the QBE
 
 ## Overview
 
-FBCQBE compiles FasterBASIC programs to native machine code through the QBE (Quick Backend) SSA-based intermediate representation. This provides:
+FasterBASIC is a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, and SIMD acceleration. It compiles to native machine code through the QBE (Quick Backend) intermediate representation.
 
-- **Native performance**: Compiled to machine code, not interpreted
-- **Strict correctness**: QBE's SSA form enforces proper control flow
-- **Platform support**: Works on x86-64, ARM64, and RISC-V via QBE
-- **Modern toolchain**: Integrates with standard C compilers and assemblers
+### Key Features
+
+- **Native Compilation** - Compiles to machine code, not interpreted
+- **Object-Oriented** - Classes, inheritance, polymorphism, virtual dispatch
+- **Modern Collections** - Lists, HashMaps, pattern matching
+- **Exception Handling** - TRY/CATCH/FINALLY blocks
+- **SIMD Acceleration** - Automatic NEON vectorization on ARM64
+- **Event-Driven** - Timer events and event loop support
+- **Graphics & Multimedia** - Built-in sprites, graphics, audio
+- **Plugin System** - Extensible with C/C++ plugins
+- **Cross-Platform** - AMD64, ARM64, RISC-V support
+
+### Documentation
+
+📚 **[Visit the Wiki](https://github.com/albanread/FasterBASIC/wiki)** for comprehensive documentation:
+
+- **[Quick Reference](https://github.com/albanread/FasterBASIC/wiki/Quick-Reference)** - Syntax cheat sheet
+- **[Language Summary](https://github.com/albanread/FasterBASIC/wiki/Language-Summary)** - Complete language reference
+- **[Classes and Objects](https://github.com/albanread/FasterBASIC/wiki/Classes-and-Objects)** - OOP guide
+- **[Lists and Pattern Matching](https://github.com/albanread/FasterBASIC/wiki/Lists-and-Pattern-Matching)** - Collections guide
+- **[NEON SIMD Support](https://github.com/albanread/FasterBASIC/wiki/NEON-SIMD-Support)** - Performance optimization
+- **[BNF Grammar](https://github.com/albanread/FasterBASIC/wiki/BNF-Grammar)** - Formal specification
 
 ## Project Status
 
-**Latest Update (February 2025)**: UDT-to-UDT whole-struct assignment with proper string refcounting, nested UDT support, and memory safety. See [docs/UDT_ASSIGNMENT_STATUS.md](docs/UDT_ASSIGNMENT_STATUS.md) for details.
+**Latest Update (February 2025)**: Full object-oriented programming with classes, inheritance, and polymorphism. HashMaps, Lists with pattern matching, NEON SIMD acceleration, and a comprehensive plugin system.
 
-**Previous Update (January 2025)**: Complete exception handling (TRY/CATCH/FINALLY/THROW) and dynamic array operations (ERASE/REDIM/REDIM PRESERVE) with comprehensive test coverage. String array support with read/write access and string slicing functionality.
+### ✅ Core Language Features
 
-### ✅ Working Features
+**Object-Oriented Programming:**
+- ✅ CLASS/END CLASS declarations
+- ✅ Fields (all primitive types + class references)
+- ✅ CONSTRUCTOR with parameters
+- ✅ DESTRUCTOR with automatic cleanup
+- ✅ METHOD with return values
+- ✅ ME keyword for self-reference
+- ✅ Inheritance with EXTENDS
+- ✅ SUPER() for parent constructor calls
+- ✅ Virtual dispatch (polymorphism)
+- ✅ IS operator for type checking
+- ✅ DELETE for explicit object destruction
+- ✅ SAMM (Scope-Aware Memory Manager) for automatic cleanup
+
+**Collections:**
+- ✅ LIST OF type (typed lists)
+- ✅ LIST OF ANY (heterogeneous lists)
+- ✅ List methods: APPEND, PREPEND, POP, SHIFT, GET, LENGTH, etc.
+- ✅ HASHMAP type for key-value storage
+- ✅ HashMap operations: assignment, lookup, iteration
+- ✅ FOR EACH loops for lists and hashmaps
+- ✅ MATCH TYPE for type dispatch on LIST OF ANY
 
 **User-Defined Types (UDTs):**
 - ✅ TYPE/END TYPE declarations
 - ✅ UDT member access (read/write)
-- ✅ **NEW: UDT-to-UDT assignment (P2 = P1)**
+- ✅ UDT-to-UDT assignment with proper string refcounting
 - ✅ String fields with proper refcounting
 - ✅ Nested UDTs (recursive field access)
 - ✅ Arrays of UDTs
-- ✅ Memory safety and independence
+- ✅ SIMD optimization for homogeneous numeric UDTs
 
 **Exception Handling:**
 - ✅ TRY/CATCH/FINALLY/THROW structured exception handling
@@ -136,41 +225,87 @@ FBCQBE compiles FasterBASIC programs to native machine code through the QBE (Qui
 - ✅ Function calls (user-defined and runtime)
 - ✅ Type-appropriate QBE instructions
 
+**Graphics & Multimedia:**
+- ✅ Graphics primitives (PSET, LINE, RECT, CIRCLE, etc.)
+- ✅ Sprite system (SPRLOAD, SPRSHOW, SPRHIDE, SPRPOS, etc.)
+- ✅ Text layer (TEXTPUT, TCHAR, TGRID, TSCROLL)
+- ✅ Audio support (PLAY, PLAY_SOUND)
+- ✅ Color management (COLOR, GCLS, CLS)
+
+**Event System:**
+- ✅ Timer events (AFTER, EVERY, AFTERFRAMES, EVERYFRAME)
+- ✅ Inline event handlers with DO...DONE
+- ✅ Event loop (RUN, RUN UNTIL)
+- ✅ Frame synchronization (VSYNC, WAIT, WAIT_MS)
+- ✅ Timer control (TIMER STOP)
+
+**Plugin System:**
+- ✅ C/C++ plugin architecture
+- ✅ Automatic loading from plugins/enabled/
+- ✅ Plugin commands integrated into language
+- ✅ Command registry system
+
+**Performance:**
+- ✅ NEON SIMD acceleration for ARM64
+- ✅ Automatic vectorization for UDT operations
+- ✅ SIMD test suite and verification
+- ✅ Optional SIMD disable (OPTION NO_NEON)
+
 ### 🚧 In Progress
 
-- **Type system**: Full type inference and conversion throughout expressions
-- **DEF FN**: Complete implementation with proper typing
-- **Arrays**: Full runtime integration for multi-dimensional arrays and numeric types
-- **String operations**: Advanced string functions (LEN, MID, INSTR, etc.)
-- **LIST type**: Linked-list collection with typed and heterogeneous variants
+- **Advanced string functions**: Additional string manipulation functions
+- **File I/O**: Expanded file handling capabilities
+- **Optimization passes**: Additional peephole optimizations
 
 ### 📋 Planned
 
-- **Optimization passes**: Peephole optimization, constant folding
-- **Debug info**: Source maps and line number tracking
-- **Error handling**: Better error messages with source context
-- **Standard library**: Expanded runtime functions (math, string, file I/O)
+- **Debug info**: Enhanced debugging support with source maps
+- **Additional platforms**: Windows support
+- **Standard library**: Expanded built-in functions
 
 ## Quick Start
 
-### Using the Integrated Compiler (Recommended)
-
-The integrated `qbe_basic` compiler combines FasterBASIC and QBE into a single executable with automatic runtime management:
+### Installation
 
 ```bash
-# Build the integrated compiler
+git clone https://github.com/albanread/FasterBASIC.git
+cd FasterBASIC
 cd qbe_basic_integrated
 ./build_qbe_basic.sh
+```
 
-# Compile to executable (one command!)
-./qbe_basic -o myprogram ../tests/exceptions/test_try_catch_basic.bas
-./myprogram
+### Your First Program
 
-# Or generate QBE IL only
+Create `hello.bas`:
+
+```basic
+PRINT "Hello, FasterBASIC!"
+END
+```
+
+Compile and run:
+
+```bash
+./qbe_basic -o hello hello.bas
+./hello
+```
+
+### Using the Compiler
+
+The integrated `qbe_basic` compiler provides single-command compilation:
+
+```bash
+# Compile to executable
+./qbe_basic -o program input.bas
+
+# Generate QBE IL only (for debugging)
 ./qbe_basic -i -o output.qbe input.bas
 
-# Or generate assembly only
+# Generate assembly only
 ./qbe_basic -c -o output.s input.bas
+
+# Target specific architecture
+./qbe_basic -t arm64_apple -o program input.bas
 ```
 
 **Features:**
@@ -179,32 +314,81 @@ cd qbe_basic_integrated
 - Smart runtime caching (10x faster on subsequent builds)
 - Self-contained with bundled runtime library
 
-### Alternative: Separate Tools
+### Examples
 
-For development or debugging, you can use the separate tools:
+```basic
+' Object-Oriented Programming
+CLASS Rectangle
+  Width AS DOUBLE
+  Height AS DOUBLE
+  
+  CONSTRUCTOR(w AS DOUBLE, h AS DOUBLE)
+    ME.Width = w
+    ME.Height = h
+  END CONSTRUCTOR
+  
+  METHOD Area() AS DOUBLE
+    RETURN ME.Width * ME.Height
+  END METHOD
+END CLASS
 
-```bash
-# Build FasterBASIC compiler
-cd fsh
-./build_fbc_qbe.sh
+DIM r AS Rectangle = NEW Rectangle(10.0, 5.0)
+PRINT "Area: "; r.Area()
 
-# Compile and run with the wrapper
-./basic --run ../tests/exceptions/test_try_catch_basic.bas
+' Lists and Pattern Matching
+DIM items AS LIST OF ANY
+items.APPEND(42)
+items.APPEND("Hello")
+items.APPEND(3.14)
+
+FOR EACH item IN items
+  MATCH TYPE item
+    CASE INTEGER n
+      PRINT "Integer: "; n * 2
+    CASE STRING s
+      PRINT "String: "; s
+    CASE DOUBLE d
+      PRINT "Double: "; d
+  END MATCH
+NEXT
+
+' HashMaps
+DIM scores AS HASHMAP
+scores("Alice") = "95"
+scores("Bob") = "87"
+scores("Charlie") = "92"
+
+FOR EACH name IN scores
+  PRINT name; ": "; scores(name)
+NEXT
+
+' Exception Handling
+TRY
+  THROW 100
+CATCH 100
+  PRINT "Caught error: "; ERR()
+FINALLY
+  PRINT "Cleanup"
+END TRY
 ```
 
-### Testing & Verification
+### Testing
 
 ```bash
 # Run the full test suite
-./test_basic_suite.sh
+./scripts/run_tests_simple.sh
 
-# Verify implementation integrity
-./verify_implementation.sh
+# Run specific test categories
+./scripts/run_tests_simple.sh classes
+./scripts/run_tests_simple.sh lists
 ```
 
-**New to the project?** See [START_HERE.md](START_HERE.md) for a comprehensive developer guide.
+### Developer Resources
 
-**⚠️ Working on exceptions or arrays?** See [docs/CRITICAL_IMPLEMENTATION_NOTES.md](docs/CRITICAL_IMPLEMENTATION_NOTES.md) for essential technical details.
+- **[START_HERE.md](START_HERE.md)** - Comprehensive developer guide
+- **[docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md)** - Repository organization
+- **[docs/CRITICAL_IMPLEMENTATION_NOTES.md](docs/CRITICAL_IMPLEMENTATION_NOTES.md)** - Technical details
+- **[BUILD.md](BUILD.md)** - Detailed build instructions
 
 ## Platform Support
 
@@ -731,19 +915,27 @@ Comprehensive C runtime (`fsh/FasterBASICT/runtime_c/`) provides:
 
 ## Contributing
 
-This is a research/educational project exploring:
-- SSA-based compilation of BASIC
-- Control flow graph construction for unstructured languages
-- Integration of modern compilation techniques with retro languages
-- Exception handling via setjmp/longjmp in compiler-generated code
-- Dynamic memory management for arrays with proper cleanup
+FasterBASIC explores modern compiler techniques applied to a classic language:
+- Object-oriented programming in BASIC with virtual dispatch
+- SSA-based compilation via QBE backend
+- SIMD optimization for ARM64 NEON
+- Pattern matching and type dispatch for heterogeneous collections
+- Scope-aware memory management (SAMM)
+- Plugin architecture for extensibility
 
 **Before contributing:**
-1. Read [START_HERE.md](START_HERE.md)
-2. If working on exceptions or arrays, read [docs/CRITICAL_IMPLEMENTATION_NOTES.md](docs/CRITICAL_IMPLEMENTATION_NOTES.md)
-3. Run `./verify_implementation.sh` before committing
-4. Run `./test_basic_suite.sh` to ensure all tests pass
+1. Read [START_HERE.md](START_HERE.md) for project overview
+2. Check [docs/CRITICAL_IMPLEMENTATION_NOTES.md](docs/CRITICAL_IMPLEMENTATION_NOTES.md) for technical details
+3. Review the [Wiki](https://github.com/albanread/FasterBASIC/wiki) for language documentation
+4. Run `./scripts/run_tests_simple.sh` to ensure all tests pass
 5. Add tests for new features
+
+**Areas for contribution:**
+- Additional language features and standard library functions
+- Plugin development (see `plugins/` directory)
+- Platform support (Windows, additional architectures)
+- Optimization passes and performance improvements
+- Documentation and examples
 
 ## License
 
@@ -772,11 +964,11 @@ SOFTWARE.
 ## Acknowledgments
 
 - **QBE** by Quentin Carbonneaux for the excellent SSA backend
-- **FasterBASIC** for the language specification and parser foundation
 - Classic BASIC implementations (GW-BASIC, QuickBASIC, BBC BASIC) for inspiration
+- The BASIC programming community for continued enthusiasm
 
 ## References
 
-- QBE IL Documentation: https://c9x.me/compile/doc/il.html
-- FasterBASIC: [project link]
-- Classic BASIC FOR loop semantics and edge cases
+- **[Project Wiki](https://github.com/albanread/FasterBASIC/wiki)** - Complete documentation
+- **[QBE IL Documentation](https://c9x.me/compile/doc/il.html)** - Backend reference
+- **[GitHub Repository](https://github.com/albanread/FasterBASIC)** - Source code
