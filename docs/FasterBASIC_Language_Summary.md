@@ -332,52 +332,9 @@ s$ = "Hello World"
 MID$(s$, 1, 5) = "Greet"  ' "Greetings World"
 ```
 
-### 8. Graphics and Multimedia
+### 8. Graphics and Multimedia (Future)
 
-#### Basic Graphics
-```basic
-CLS              ' Clear screen
-GCLS             ' Clear graphics layer
-COLOR 15, 0      ' Set foreground, background
-
-PSET (100, 100), color
-LINE (10, 10) - (100, 100), color
-RECT x, y, width, height, color
-RECTF x, y, width, height, color  ' Filled
-CIRCLE x, y, radius, color
-CIRCLEF x, y, radius, color       ' Filled
-HLINE x, y, length, color
-VLINE x, y, length, color
-```
-
-#### Text Layer
-```basic
-TEXTPUT x, y, "Text", fg, bg
-TCHAR x, y, char_code, fg, bg
-TGRID width, height
-TSCROLL direction
-TCLEAR x, y, width, height
-```
-
-#### Sprites
-```basic
-SPRLOAD sprite_id, "filename.png"
-SPRSHOW sprite_id
-SPRHIDE sprite_id
-SPRMOVE sprite_id, dx, dy
-SPRPOS sprite_id, x, y, angle, scale_x, scale_y
-SPRTINT sprite_id, color
-SPRSCALE sprite_id, scale_x, scale_y
-SPRROT sprite_id, angle
-SPREXPLODE sprite_id, pieces, duration
-SPRFREE sprite_id
-```
-
-#### Audio
-```basic
-PLAY "music.ogg", "ogg"
-PLAY_SOUND sound_id, volume
-```
+> **Note:** Graphics, sprites, and audio capabilities will be provided through integration with the [Superterminal](https://github.com/albanread/Superterminal) project. This integration is planned for a future release.
 
 ### 9. Timer Events and Event Loop
 
@@ -650,17 +607,23 @@ DONE
 RUN  ' Enter event loop
 ```
 
-### Graphics Example
+### List and Pattern Matching Example
 ```basic
-GCLS
-COLOR 15
+DIM items AS LIST OF ANY
+items.APPEND(42)
+items.APPEND("Hello")
+items.APPEND(3.14)
 
-FOR i = 0 TO 100
-  CIRCLE 320, 240, i, i MOD 16
-NEXT i
-
-PRINT_AT 10, 10, "Press any key..."
-INPUT dummy$
+FOR EACH item IN items
+  MATCH TYPE item
+    CASE INTEGER n
+      PRINT "Integer: "; n * 2
+    CASE STRING s
+      PRINT "String: "; s
+    CASE DOUBLE d
+      PRINT "Double: "; d
+  END MATCH
+NEXT
 END
 ```
 
@@ -696,7 +659,7 @@ fbc_qbe program.bas -o program
 2. **Performance** - Compiled to native code, not interpreted
 3. **Modern Features** - Exception handling, UDTs, events
 4. **Extensibility** - Modular command registry system
-5. **Multimedia** - Built-in graphics, sprites, audio
+5. **Extensibility** - Plugin system for adding capabilities
 6. **Cross-Platform** - Multiple architecture support
 
 ## Differences from Traditional BASIC
@@ -712,7 +675,7 @@ fbc_qbe program.bas -o program
 - BYREF/BYVAL parameters
 - LOCAL/GLOBAL/SHARED scoping
 - Unicode support
-- Graphics and multimedia primitives
+- Plugin system for extensibility
 
 ### Compatibility Notes
 - Line numbers are optional

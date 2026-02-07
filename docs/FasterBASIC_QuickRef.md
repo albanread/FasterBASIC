@@ -409,86 +409,9 @@ RESTORE        ' Reset to first
 RESTORE 100    ' Restore to line
 ```
 
-## Graphics
+## Graphics, Sprites & Audio (Future)
 
-```basic
-' Screen
-CLS              ' Clear screen
-GCLS             ' Clear graphics
-COLOR fg, bg     ' Set colors
-
-' Primitives
-PSET (x, y), color
-LINE (x1, y1) - (x2, y2), color
-RECT x, y, w, h, color
-RECTF x, y, w, h, color    ' Filled
-CIRCLE x, y, r, color
-CIRCLEF x, y, r, color     ' Filled
-HLINE x, y, len, color
-VLINE x, y, len, color
-
-' Text layer
-TEXTPUT x, y, "Text", fg, bg
-TCHAR x, y, code, fg, bg
-TGRID w, h
-TSCROLL dir
-TCLEAR x, y, w, h
-```
-
-## Sprites
-
-```basic
-SPRLOAD id, "file.png"
-SPRSHOW id
-SPRHIDE id
-SPRMOVE id, dx, dy
-SPRPOS id, x, y, angle, sx, sy
-SPRTINT id, color
-SPRSCALE id, sx, sy
-SPRROT id, angle
-SPREXPLODE id, pieces, time
-SPRFREE id
-```
-
-## Timer Events
-
-```basic
-' One-shot timers
-AFTER 1000 MS GOSUB Handler
-AFTER 5 SECS CALL Function
-AFTERFRAMES 60 GOSUB Delayed
-
-' Repeating timers
-EVERY 100 MS GOSUB Loop
-EVERY 1 SECS CALL Update
-EVERYFRAME 1 GOSUB Render
-
-' Inline handlers
-EVERY 1000 MS DO
-  PRINT "Tick"
-DONE
-
-' Control
-TIMER STOP HandlerName
-TIMER STOP  ' Stop all
-
-' Event loop
-RUN              ' Run forever
-RUN UNTIL done%  ' Run with condition
-
-' Synchronization
-VSYNC            ' Wait 1 frame
-VSYNC 2          ' Wait 2 frames
-WAIT 10          ' Wait 10 frames
-WAIT_MS 1000     ' Wait milliseconds
-```
-
-## Audio
-
-```basic
-PLAY "music.ogg", "ogg"
-PLAY_SOUND id, volume
-```
+> **Note:** Graphics, sprites, and audio capabilities will be provided through integration with the [Superterminal](https://github.com/albanread/Superterminal) project. This integration is planned for a future release.
 
 ## Utility Statements
 

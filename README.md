@@ -95,10 +95,10 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - **Modern Collections** - Lists, HashMaps, pattern matching
 - **Exception Handling** - TRY/CATCH/FINALLY blocks
 - **SIMD Acceleration** - Automatic NEON vectorization on ARM64
-- **Event-Driven** - Timer events and event loop support
-- **Graphics & Multimedia** - Built-in sprites, graphics, audio
 - **Plugin System** - Extensible with C/C++ plugins
 - **Cross-Platform** - AMD64, ARM64, RISC-V support
+
+> **Note on Graphics & Multimedia:** FasterBASIC will integrate with the [Superterminal](https://github.com/albanread/Superterminal) project to provide advanced graphics, sprites, and audio capabilities in the future.
 
 ### Documentation
 
@@ -225,20 +225,6 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - ✅ Function calls (user-defined and runtime)
 - ✅ Type-appropriate QBE instructions
 
-**Graphics & Multimedia:**
-- ✅ Graphics primitives (PSET, LINE, RECT, CIRCLE, etc.)
-- ✅ Sprite system (SPRLOAD, SPRSHOW, SPRHIDE, SPRPOS, etc.)
-- ✅ Text layer (TEXTPUT, TCHAR, TGRID, TSCROLL)
-- ✅ Audio support (PLAY, PLAY_SOUND)
-- ✅ Color management (COLOR, GCLS, CLS)
-
-**Event System:**
-- ✅ Timer events (AFTER, EVERY, AFTERFRAMES, EVERYFRAME)
-- ✅ Inline event handlers with DO...DONE
-- ✅ Event loop (RUN, RUN UNTIL)
-- ✅ Frame synchronization (VSYNC, WAIT, WAIT_MS)
-- ✅ Timer control (TIMER STOP)
-
 **Plugin System:**
 - ✅ C/C++ plugin architecture
 - ✅ Automatic loading from plugins/enabled/
@@ -253,12 +239,14 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 
 ### 🚧 In Progress
 
+- **Superterminal Integration**: Graphics, sprites, and audio via Superterminal project
 - **Advanced string functions**: Additional string manipulation functions
 - **File I/O**: Expanded file handling capabilities
 - **Optimization passes**: Additional peephole optimizations
 
 ### 📋 Planned
 
+- **Graphics & Multimedia**: Integration with Superterminal for advanced graphics, sprites, and audio
 - **Debug info**: Enhanced debugging support with source maps
 - **Additional platforms**: Windows support
 - **Standard library**: Expanded built-in functions
