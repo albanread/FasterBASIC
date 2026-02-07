@@ -10,5 +10,5 @@ repository = "https://github.com/albanread/FasterBASIC"
 
 [grammars.fasterbasic]
 repository = "https://github.com/albanread/FasterBASIC"
-rev = "a7b8bed3944fb2578f74ff21fdee0f0665fe80a5"
+rev = "b96430afb71f4b9da80421edbdba3484068df0e3"
 path = "fasterbasic-zed/grammars/fasterbasic"
