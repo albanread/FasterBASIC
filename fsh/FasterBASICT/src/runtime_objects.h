@@ -219,6 +219,7 @@ private:
     
     // Registration functions for specific object types
     void registerHashmapType();
+    void registerListType();
     // Future object types:
     // void registerFileType();
     // void registerSpriteType();

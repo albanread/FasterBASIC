@@ -108,6 +108,7 @@ void Lexer::initializeKeywords() {
         s_keywords["UINT"] = TokenType::KEYWORD_UINTEGER;  // Alias for UINTEGER
         s_keywords["ULONG"] = TokenType::KEYWORD_ULONG;
         s_keywords["HASHMAP"] = TokenType::KEYWORD_HASHMAP;
+        s_keywords["LIST"] = TokenType::KEYWORD_LIST;
     
         // Hashmap methods
         s_keywords["HASKEY"] = TokenType::HASKEY;
@@ -115,6 +116,30 @@ void Lexer::initializeKeywords() {
         s_keywords["SIZE"] = TokenType::SIZE;
         s_keywords["CLEAR"] = TokenType::CLEAR;
         s_keywords["REMOVE"] = TokenType::REMOVE;
+    
+        // List methods
+        s_keywords["APPEND"] = TokenType::APPEND;
+        s_keywords["PREPEND"] = TokenType::PREPEND;
+        s_keywords["HEAD"] = TokenType::HEAD;
+        s_keywords["TAIL"] = TokenType::TAIL;
+        s_keywords["REST"] = TokenType::REST;
+        s_keywords["LENGTH"] = TokenType::LENGTH;
+        s_keywords["EMPTY"] = TokenType::EMPTY;
+        s_keywords["CONTAINS"] = TokenType::CONTAINS;
+        s_keywords["INDEXOF"] = TokenType::INDEXOF;
+        s_keywords["JOIN"] = TokenType::JOIN;
+        s_keywords["COPY"] = TokenType::COPY;
+        s_keywords["REVERSE"] = TokenType::REVERSE;
+        s_keywords["SHIFT"] = TokenType::SHIFT;
+        s_keywords["POP"] = TokenType::POP;
+        s_keywords["EXTEND"] = TokenType::EXTEND;
+        s_keywords["INSERT"] = TokenType::INSERT;
+        s_keywords["GET"] = TokenType::GET;
+        s_keywords["TYPEOF"] = TokenType::TYPEOF_KW;
+    
+        // MATCH TYPE statement
+        s_keywords["MATCH"] = TokenType::MATCH;
+        s_keywords["ENDMATCH"] = TokenType::ENDMATCH;
     
         // Data
         s_keywords["DIM"] = TokenType::DIM;

@@ -15,6 +15,7 @@ void RuntimeObjectRegistry::initialize() {
     
     // Register all known runtime object types
     registerHashmapType();
+    registerListType();
     
     // Future object types can be registered here:
     // registerFileType();
@@ -111,6 +112,130 @@ void RuntimeObjectRegistry::registerHashmapType() {
     
     // Register the hashmap type
     registerObjectType(hashmap);
+}
+
+void RuntimeObjectRegistry::registerListType() {
+    ObjectTypeDescriptor list;
+    list.typeName = "LIST";
+    list.description = "Ordered, dynamically-sized collection (typed or heterogeneous)";
+
+    // Constructor: list_create() — no arguments
+    list.setConstructor("list_create", {});
+
+    // --- Mutating methods ---
+
+    // APPEND(value) — append element to end
+    // NOTE: actual runtime function is selected by codegen based on
+    //       argument type and list element type:
+    //       list_append_int / list_append_float / list_append_string / list_append_list
+    MethodSignature append("APPEND", BaseType::UNKNOWN, "list_append_int");
+    append.addParam("value", BaseType::LONG)
+          .withDescription("Append an element to the end of the list");
+    list.addMethod(append);
+
+    // PREPEND(value) — prepend element to beginning
+    MethodSignature prepend("PREPEND", BaseType::UNKNOWN, "list_prepend_int");
+    prepend.addParam("value", BaseType::LONG)
+           .withDescription("Prepend an element to the beginning of the list");
+    list.addMethod(prepend);
+
+    // INSERT(pos, value) — insert at 1-based position
+    MethodSignature insert("INSERT", BaseType::UNKNOWN, "list_insert_int");
+    insert.addParam("pos", BaseType::INTEGER)
+          .addParam("value", BaseType::LONG)
+          .withDescription("Insert an element at a 1-based position");
+    list.addMethod(insert);
+
+    // REMOVE(pos) — remove element at 1-based position
+    MethodSignature remove("REMOVE", BaseType::UNKNOWN, "list_remove");
+    remove.addParam("pos", BaseType::INTEGER)
+          .withDescription("Remove element at 1-based position");
+    list.addMethod(remove);
+
+    // CLEAR() — remove all elements
+    MethodSignature clear("CLEAR", BaseType::UNKNOWN, "list_clear");
+    clear.withDescription("Remove all elements");
+    list.addMethod(clear);
+
+    // EXTEND(other) — append all elements from another list
+    MethodSignature extend("EXTEND", BaseType::UNKNOWN, "list_extend");
+    extend.addParam("other", BaseType::OBJECT)
+          .withDescription("Append all elements from another list");
+    list.addMethod(extend);
+
+    // --- Accessor methods ---
+    // Return types shown here are defaults for LIST OF INTEGER.
+    // The codegen overrides based on the list's actual element type.
+
+    // HEAD() — get the first element's value
+    MethodSignature head("HEAD", BaseType::LONG, "list_head_int");
+    head.withDescription("Get the value of the first element");
+    list.addMethod(head);
+
+    // REST() — new list with all elements except the first
+    MethodSignature rest("REST", BaseType::OBJECT, "list_rest");
+    rest.withDescription("New list containing all elements except the first");
+    list.addMethod(rest);
+
+    // GET(pos) — get element value at 1-based position
+    MethodSignature get("GET", BaseType::LONG, "list_get_int");
+    get.addParam("pos", BaseType::INTEGER)
+       .withDescription("Get element value at 1-based position");
+    list.addMethod(get);
+
+    // LENGTH() — number of elements (O(1))
+    MethodSignature length("LENGTH", BaseType::LONG, "list_length");
+    length.withDescription("Number of elements (O(1))");
+    list.addMethod(length);
+
+    // EMPTY() — check if list is empty (1=yes, 0=no)
+    MethodSignature empty("EMPTY", BaseType::INTEGER, "list_empty");
+    empty.withDescription("Check if the list is empty (1=yes, 0=no)");
+    list.addMethod(empty);
+
+    // CONTAINS(value) — check if list contains value
+    MethodSignature contains("CONTAINS", BaseType::INTEGER, "list_contains_int");
+    contains.addParam("value", BaseType::LONG)
+            .withDescription("Check if the list contains a value");
+    list.addMethod(contains);
+
+    // INDEXOF(value) — find 1-based position (0=not found)
+    MethodSignature indexof("INDEXOF", BaseType::LONG, "list_indexof_int");
+    indexof.addParam("value", BaseType::LONG)
+           .withDescription("Find 1-based position of value (0=not found)");
+    list.addMethod(indexof);
+
+    // JOIN(separator) — join elements into a string
+    MethodSignature join("JOIN", BaseType::STRING, "list_join");
+    join.addParam("separator", BaseType::STRING)
+        .withDescription("Join elements into a string with separator");
+    list.addMethod(join);
+
+    // --- Methods returning new lists ---
+
+    // COPY() — deep copy of the list
+    MethodSignature copy("COPY", BaseType::OBJECT, "list_copy");
+    copy.withDescription("Create a deep copy of the list");
+    list.addMethod(copy);
+
+    // REVERSE() — new list in reversed order
+    MethodSignature reverse("REVERSE", BaseType::OBJECT, "list_reverse");
+    reverse.withDescription("Create a new list in reversed order");
+    list.addMethod(reverse);
+
+    // --- Stack/Queue methods ---
+
+    // SHIFT() — remove and return the first element
+    MethodSignature shift("SHIFT", BaseType::LONG, "list_shift_int");
+    shift.withDescription("Remove and return the first element");
+    list.addMethod(shift);
+
+    // POP() — remove and return the last element
+    MethodSignature pop("POP", BaseType::LONG, "list_pop_int");
+    pop.withDescription("Remove and return the last element");
+    list.addMethod(pop);
+
+    registerObjectType(list);
 }
 
 // =============================================================================

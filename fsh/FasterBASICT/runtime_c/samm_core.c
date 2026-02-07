@@ -31,6 +31,7 @@
 
 #include "samm_bridge.h"
 #include "string_descriptor.h"
+#include "list_ops.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -328,12 +329,16 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
                     default_object_cleanup(ptr);
                     break;
                 case SAMM_ALLOC_LIST:
-                    /* Phase 4: return to freelist. For now, just free. */
-                    free(ptr);
+                    /* Call list_free which releases all atoms (and their
+                     * string/list payloads) then frees the header.
+                     * Phase 5 will add freelist recycling. */
+                    list_free_from_samm(ptr);
                     break;
                 case SAMM_ALLOC_LIST_ATOM:
-                    /* Phase 4: return to atom freelist. For now, just free. */
-                    free(ptr);
+                    /* Release the atom's payload (string_release for strings,
+                     * recursive list_free for nested lists) then free the
+                     * atom struct itself.  Phase 5 will return to freelist. */
+                    list_atom_free_from_samm(ptr);
                     break;
                 case SAMM_ALLOC_STRING:
                     /* Call string_release which decrements the refcount and
@@ -587,7 +592,14 @@ void samm_shutdown(void) {
     /* Drain any remaining items in the queue synchronously */
     drain_queue_sync();
 
-    /* Clean up all remaining scopes (including global) */
+    /* Clean up all remaining scopes (including global).
+     *
+     * We detach each scope's arrays BEFORE calling cleanup_batch(), exactly
+     * as samm_exit_scope() does.  This way, if a cleanup function (e.g.
+     * string_release -> samm_untrack -> scope_remove) tries to mutate the
+     * scope, it finds an empty scope and harmlessly returns 0.  SAMM stays
+     * enabled throughout shutdown so tracking/untracking semantics remain
+     * correct for any nested operations triggered by cleanup. */
     for (int d = g_samm.scope_depth; d >= 0; d--) {
         SAMMScope* s = &g_samm.scopes[d];
         if (s->count > 0) {
@@ -595,17 +607,21 @@ void samm_shutdown(void) {
                 fprintf(stderr, "SAMM: Cleaning up %zu objects from scope depth %d\n",
                         s->count, d);
             }
-            /* Clean up directly (worker is stopped) */
+            /* Take ownership of the arrays — detach from scope first
+             * so scope_remove() during cleanup finds nothing to mutate. */
             SAMMCleanupBatch batch;
             batch.ptrs  = s->ptrs;
             batch.types = s->types;
             batch.count = s->count;
-            cleanup_batch(&batch);
-            /* cleanup_batch freed ptrs and types, clear the scope */
+
+            /* Detach scope (same pattern as samm_exit_scope) */
             s->ptrs     = NULL;
             s->types    = NULL;
             s->count    = 0;
             s->capacity = 0;
+
+            cleanup_batch(&batch);
+            /* cleanup_batch freed the detached arrays */
         } else {
             scope_destroy(s);
         }
@@ -915,9 +931,13 @@ int samm_is_probably_freed(void* ptr) {
 /* ========================================================================= */
 
 void* samm_alloc_list(void) {
-    /* Phase 4: allocate a ListHeader from the freelist.
-     * For now, return NULL — lists are not yet implemented. */
-    return NULL;
+    /* Allocate a ListHeader. Phase 5 will use a freelist pool.
+     * For now, use malloc — the header is tracked as SAMM_ALLOC_LIST
+     * by the caller (list_create). */
+    void* ptr = malloc(sizeof(ListHeader));
+    if (!ptr) return NULL;
+    memset(ptr, 0, sizeof(ListHeader));
+    return ptr;
 }
 
 void samm_track_list(void* list_header_ptr) {
@@ -926,9 +946,13 @@ void samm_track_list(void* list_header_ptr) {
 }
 
 void* samm_alloc_list_atom(void) {
-    /* Phase 4: allocate a ListAtom from the atom freelist.
-     * For now, return NULL. */
-    return NULL;
+    /* Allocate a ListAtom. Phase 5 will use a freelist pool.
+     * For now, use malloc — the atom is tracked as SAMM_ALLOC_LIST_ATOM
+     * by the caller (atom_alloc in list_ops.c). */
+    void* ptr = malloc(sizeof(ListAtom));
+    if (!ptr) return NULL;
+    memset(ptr, 0, sizeof(ListAtom));
+    return ptr;
 }
 
 /* ========================================================================= */

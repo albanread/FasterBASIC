@@ -551,6 +551,8 @@ This is general floating-point advice, not specific to NEON, but it becomes more
 
 ## Further Reading
 
+- **[Classes and Objects](classes-and-objects.md)** — The full CLASS system: fields, methods, inheritance, constructors, destructors, and virtual dispatch
+- **[Lists and MATCH TYPE](lists-and-match-type.md)** — Heterogeneous collections and safe type dispatch for mixed-type data
 - **[FasterBasicNeon.md](../FasterBasicNeon.md)** — Full technical design document with implementation details, QBE IL examples, and architecture diagrams
 - **[tests/neon/](../tests/neon/)** — Complete NEON test suite (19 test files, 244 assertions)
 - **[scripts/run_neon_tests.sh](../scripts/run_neon_tests.sh)** — Automated test runner with assembly verification and kill-switch testing

@@ -7,6 +7,7 @@
 //
 
 #include "basic_runtime.h"
+#include "samm_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -457,7 +458,7 @@ void array_redim(BasicArray* array, int32_t* new_bounds, bool preserve) {
         // Not preserving - free old data
         if (array->data) {
             if (array->type_suffix == '$') {
-                // Release all strings
+                // Release all strings — untrack from SAMM first to avoid double-free
                 size_t total_elements = 1;
                 for (int32_t i = 0; i < array->dimensions; i++) {
                     int32_t lower = array->bounds[i * 2];
@@ -468,6 +469,7 @@ void array_redim(BasicArray* array, int32_t* new_bounds, bool preserve) {
                 StringDescriptor** strings = (StringDescriptor**)array->data;
                 for (size_t i = 0; i < total_elements; i++) {
                     if (strings[i]) {
+                        samm_untrack(strings[i]);
                         string_release(strings[i]);
                     }
                 }
@@ -622,6 +624,7 @@ void array_redim(BasicArray* array, int32_t* new_bounds, bool preserve) {
         // Free old data (strings already handled by copy or will be released)
         if (array->type_suffix == '$') {
             // Release all strings from old array (copied ones have increased refcount)
+            // Untrack from SAMM first to avoid double-free at scope exit
             size_t old_total_elements = 1;
             for (int32_t i = 0; i < array->dimensions; i++) {
                 int32_t lower = old_bounds[i * 2];
@@ -632,6 +635,7 @@ void array_redim(BasicArray* array, int32_t* new_bounds, bool preserve) {
             StringDescriptor** strings = (StringDescriptor**)old_data;
             for (size_t i = 0; i < old_total_elements; i++) {
                 if (strings[i]) {
+                    samm_untrack(strings[i]);
                     string_release(strings[i]);
                 }
             }
@@ -756,6 +760,7 @@ void array_erase(BasicArray* array) {
     // Free the data
     if (array->data) {
         // If string array, release all strings first
+        // Untrack from SAMM before releasing to prevent double-free at scope exit
         if (array->type_suffix == '$') {
             size_t total_elements = 1;
             for (int32_t i = 0; i < array->dimensions; i++) {
@@ -767,6 +772,7 @@ void array_erase(BasicArray* array) {
             StringDescriptor** strings = (StringDescriptor**)array->data;
             for (size_t i = 0; i < total_elements; i++) {
                 if (strings[i]) {
+                    samm_untrack(strings[i]);
                     string_release(strings[i]);
                 }
             }

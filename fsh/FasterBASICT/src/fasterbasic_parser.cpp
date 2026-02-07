@@ -816,6 +816,8 @@ StatementPtr Parser::parseStatement() {
             }
         case TokenType::SELECT:
             return parseSelectCaseStatement();
+        case TokenType::MATCH:
+            return parseMatchTypeStatement();
         case TokenType::FOR:
             return parseForStatement();
         case TokenType::NEXT:
@@ -2379,6 +2381,264 @@ StatementPtr Parser::parseSelectCaseStatement() {
     return stmt;
 }
 
+// =============================================================================
+// MATCH TYPE Statement
+// =============================================================================
+// Syntax:
+//   MATCH TYPE expression
+//       CASE INTEGER n%
+//           ...
+//       CASE STRING s$
+//           ...
+//       CASE ELSE
+//           ...
+//   END MATCH
+// =============================================================================
+StatementPtr Parser::parseMatchTypeStatement() {
+    auto loc = current().location;
+    advance(); // consume MATCH
+
+    // Expect TYPE keyword after MATCH
+    if (current().type != TokenType::TYPE) {
+        error("Expected TYPE after MATCH (syntax: MATCH TYPE expression)");
+        return nullptr;
+    }
+    advance(); // consume TYPE
+
+    // Parse the expression to match on
+    auto stmt = std::make_unique<MatchTypeStatement>();
+    stmt->location = loc;
+    stmt->matchExpression = parseExpression();
+
+    // Expect end of line after MATCH TYPE expression
+    if (current().type != TokenType::END_OF_LINE && current().type != TokenType::COLON) {
+        error("Expected end of line after MATCH TYPE expression");
+        return nullptr;
+    }
+    skipToEndOfLine();
+    skipBlankLines();
+
+    // Track seen type keywords for duplicate detection
+    std::set<std::string> seenTypes;
+    bool hasCaseElse = false;
+
+    // Parse CASE arms until END MATCH
+    while (!isAtEnd()) {
+        skipOptionalLineNumber();
+        skipBlankLines();
+
+        if (isAtEnd()) break;
+
+        // Check for END MATCH
+        if (current().type == TokenType::END) {
+            if (peek().type == TokenType::MATCH) {
+                advance(); // consume END
+                advance(); // consume MATCH
+                break;
+            }
+            // Could be END without MATCH — error
+            error("Expected MATCH after END (to close MATCH TYPE block)");
+            return stmt;
+        }
+
+        // Check for ENDMATCH (single token variant)
+        if (current().type == TokenType::ENDMATCH) {
+            advance(); // consume ENDMATCH
+            break;
+        }
+
+        // Expect CASE keyword
+        if (current().type != TokenType::CASE) {
+            error("Expected CASE or END MATCH inside MATCH TYPE block, got: " + current().toString());
+            skipToEndOfLine();
+            skipBlankLines();
+            continue;
+        }
+        advance(); // consume CASE
+
+        // Check for CASE ELSE
+        if (current().type == TokenType::ELSE) {
+            advance(); // consume ELSE
+            hasCaseElse = true;
+
+            // Skip to end of line
+            if (current().type == TokenType::END_OF_LINE || current().type == TokenType::COLON) {
+                skipToEndOfLine();
+                skipBlankLines();
+            }
+
+            // Parse CASE ELSE body until END MATCH or next CASE
+            while (!isAtEnd()) {
+                skipOptionalLineNumber();
+
+                if (current().type == TokenType::END &&
+                    peek().type == TokenType::MATCH) {
+                    break;
+                }
+                if (current().type == TokenType::ENDMATCH) {
+                    break;
+                }
+                if (current().type == TokenType::CASE) {
+                    error("CASE ELSE must be the last arm in MATCH TYPE");
+                    break;
+                }
+                if (current().type == TokenType::END_OF_LINE) {
+                    advance();
+                    continue;
+                }
+
+                auto bodyStmt = parseStatement();
+                if (bodyStmt) {
+                    stmt->addCaseElseStatement(std::move(bodyStmt));
+                }
+            }
+            continue;
+        }
+
+        // Parse typed CASE arm: CASE <type-keyword> <binding-variable>
+        MatchTypeStatement::CaseArm arm;
+
+        // Parse the type keyword
+        std::string typeKeyword;
+        int atomTag = 0;
+        TokenType expectedSuffix = TokenType::UNKNOWN;
+
+        if (current().type == TokenType::KEYWORD_INTEGER) {
+            typeKeyword = "INTEGER"; atomTag = 1; expectedSuffix = TokenType::TYPE_INT;
+            advance();
+        } else if (current().type == TokenType::KEYWORD_LONG) {
+            typeKeyword = "LONG"; atomTag = 1; expectedSuffix = TokenType::AMPERSAND;
+            advance();
+        } else if (current().type == TokenType::KEYWORD_SINGLE) {
+            typeKeyword = "SINGLE"; atomTag = 2; expectedSuffix = TokenType::EXCLAMATION;
+            advance();
+        } else if (current().type == TokenType::KEYWORD_DOUBLE) {
+            typeKeyword = "DOUBLE"; atomTag = 2; expectedSuffix = TokenType::TYPE_DOUBLE;
+            advance();
+        } else if (current().type == TokenType::KEYWORD_STRING) {
+            typeKeyword = "STRING"; atomTag = 3; expectedSuffix = TokenType::TYPE_STRING;
+            advance();
+        } else if (current().type == TokenType::KEYWORD_LIST) {
+            typeKeyword = "LIST"; atomTag = 4; expectedSuffix = TokenType::UNKNOWN;
+            advance();
+        } else if (current().type == TokenType::IDENTIFIER) {
+            // Could be OBJECT (generic), a specific CLASS name, or a UDT TYPE name.
+            // The parser cannot resolve class vs UDT here (no symbol table access),
+            // so we store the identifier and mark it for resolution at codegen time.
+            // Codegen will check symbols_.classes first, then symbols_.types.
+            std::string upper = current().value;
+            for (auto& c : upper) c = toupper(c);
+            if (upper == "OBJECT") {
+                // Generic OBJECT match — matches any ATOM_OBJECT regardless of class
+                typeKeyword = "OBJECT"; atomTag = 5; expectedSuffix = TokenType::UNKNOWN;
+            } else {
+                // Specific class or UDT name — store for codegen resolution.
+                // At parse time we assume ATOM_OBJECT (class); codegen will
+                // refine this if it turns out to be a UDT.
+                typeKeyword = upper; atomTag = 5; expectedSuffix = TokenType::UNKNOWN;
+                arm.isClassMatch = true;
+                arm.matchClassName = upper;
+            }
+            advance();
+        } else {
+            error("Expected type keyword after CASE in MATCH TYPE "
+                  "(INTEGER, LONG, SINGLE, DOUBLE, STRING, LIST, OBJECT, or a CLASS/TYPE name)");
+            skipToEndOfLine();
+            skipBlankLines();
+            continue;
+        }
+
+        // Duplicate arm detection
+        // Map INTEGER and LONG to same key (both are ATOM_INT)
+        // Map SINGLE and DOUBLE to same key (both are ATOM_FLOAT)
+        // Class-specific and UDT-specific arms use "CLASS:<Name>" as the key
+        // so CASE Dog + CASE Cat are allowed, but two CASE Dog arms are not.
+        // Generic OBJECT uses "OBJECT" as key, which is distinct from any
+        // class-specific key.
+        std::string typeGroupKey = typeKeyword;
+        if (typeKeyword == "LONG") typeGroupKey = "INTEGER";
+        if (typeKeyword == "SINGLE") typeGroupKey = "DOUBLE";
+        if (arm.isClassMatch) typeGroupKey = "CLASS:" + arm.matchClassName;
+
+        if (seenTypes.count(typeGroupKey)) {
+            error("Duplicate CASE " + typeKeyword + " arm in MATCH TYPE (type already covered)");
+        }
+        seenTypes.insert(typeGroupKey);
+
+        arm.typeKeyword = typeKeyword;
+        arm.atomTypeTag = atomTag;
+
+        // Parse the binding variable name
+        if (current().type != TokenType::IDENTIFIER) {
+            error("Expected binding variable name after CASE " + typeKeyword);
+            skipToEndOfLine();
+            skipBlankLines();
+            continue;
+        }
+
+        TokenType suffix = TokenType::UNKNOWN;
+        std::string bindingVar = parseVariableName(suffix);
+        arm.bindingVariable = bindingVar;
+        arm.bindingSuffix = suffix;
+
+        // Validate sigil matches type keyword
+        if (suffix != TokenType::UNKNOWN && expectedSuffix != TokenType::UNKNOWN) {
+            // Check for mismatch
+            bool mismatch = false;
+            if (typeKeyword == "INTEGER" && suffix != TokenType::TYPE_INT && suffix != TokenType::PERCENT) {
+                mismatch = true;
+            } else if (typeKeyword == "LONG" && suffix != TokenType::AMPERSAND) {
+                mismatch = true;
+            } else if (typeKeyword == "DOUBLE" && suffix != TokenType::TYPE_DOUBLE && suffix != TokenType::HASH) {
+                mismatch = true;
+            } else if (typeKeyword == "SINGLE" && suffix != TokenType::EXCLAMATION) {
+                mismatch = true;
+            } else if (typeKeyword == "STRING" && suffix != TokenType::TYPE_STRING) {
+                mismatch = true;
+            }
+            if (mismatch) {
+                error("Binding variable sigil does not match CASE type in MATCH TYPE: CASE " +
+                      typeKeyword + " " + bindingVar);
+            }
+        }
+
+        // Skip to end of line after CASE arm header
+        if (current().type == TokenType::END_OF_LINE || current().type == TokenType::COLON) {
+            skipToEndOfLine();
+            skipBlankLines();
+        }
+
+        // Parse arm body until next CASE or END MATCH
+        while (!isAtEnd()) {
+            skipOptionalLineNumber();
+
+            if (current().type == TokenType::END &&
+                peek().type == TokenType::MATCH) {
+                break;
+            }
+            if (current().type == TokenType::ENDMATCH) {
+                break;
+            }
+            if (current().type == TokenType::CASE) {
+                break;
+            }
+            if (current().type == TokenType::END_OF_LINE) {
+                advance();
+                continue;
+            }
+
+            auto bodyStmt = parseStatement();
+            if (bodyStmt) {
+                arm.body.push_back(std::move(bodyStmt));
+            }
+        }
+
+        stmt->addCaseArm(std::move(arm));
+    }
+
+    return stmt;
+}
+
 StatementPtr Parser::parseForStatement() {
     advance(); // consume FOR
 
@@ -2416,11 +2676,39 @@ StatementPtr Parser::parseForStatement() {
             }
         }
 
+        // Check for two-variable form: FOR EACH T, E IN collection
+        // For LIST OF ANY: T = type tag, E = element value
+        // For typed lists: elem, idx = element value, index
+        std::string secondVarName;
+        if (current().type == TokenType::COMMA) {
+            advance(); // consume comma
+
+            if (current().type != TokenType::IDENTIFIER) {
+                error("Expected second variable name after comma in FOR EACH");
+                return nullptr;
+            }
+
+            secondVarName = current().value;
+            advance(); // consume second identifier
+
+            // Skip any type suffix token on second variable
+            if (current().type == TokenType::TYPE_INT || current().type == TokenType::TYPE_FLOAT ||
+                current().type == TokenType::TYPE_DOUBLE || current().type == TokenType::TYPE_STRING ||
+                current().type == TokenType::TYPE_BYTE || current().type == TokenType::TYPE_SHORT) {
+                advance(); // skip suffix
+            }
+        }
+
         // Require IN keyword
-        consume(TokenType::IN, "Expected IN after variable in FOR EACH statement");
+        consume(TokenType::IN, "Expected IN after variable(s) in FOR EACH statement");
 
         // Parse the array/collection expression
-        auto stmt = std::make_unique<ForInStatement>(varName);
+        std::unique_ptr<ForInStatement> stmt;
+        if (!secondVarName.empty()) {
+            stmt = std::make_unique<ForInStatement>(varName, secondVarName);
+        } else {
+            stmt = std::make_unique<ForInStatement>(varName);
+        }
         stmt->array = parseExpression();
 
         // Skip to next line
@@ -3113,7 +3401,37 @@ StatementPtr Parser::parseDimStatement() {
             advance(); // consume AS
             
             // Check if it's a built-in type or user-defined type
-            if (isTypeKeyword(current().type)) {
+            if (current().type == TokenType::KEYWORD_LIST) {
+                // LIST type — check for optional OF <element-type>
+                advance(); // consume LIST
+                
+                std::string listTypeName = "LIST";
+                if (current().type == TokenType::OF) {
+                    advance(); // consume OF
+                    // Parse element type keyword
+                    if (isTypeKeyword(current().type)) {
+                        TokenType elemKeyword = current().type;
+                        advance(); // consume element type keyword
+                        // Encode element type in asTypeName as "LIST OF <ELEMTYPE>"
+                        listTypeName = "LIST OF " + std::string(tokenTypeToString(elemKeyword));
+                    } else if (current().type == TokenType::IDENTIFIER) {
+                        // LIST OF <user-type> (e.g., LIST OF ANY)
+                        std::string elemName = current().value;
+                        advance();
+                        // Convert to uppercase for matching
+                        for (auto& c : elemName) c = toupper(c);
+                        listTypeName = "LIST OF " + elemName;
+                    } else {
+                        error("Expected type name after LIST OF");
+                    }
+                }
+                // Store as user-defined type name — semantic analysis will parse "LIST OF ..."
+                if (!stmt->arrays.empty()) {
+                    stmt->arrays.back().asTypeKeyword = TokenType::KEYWORD_LIST;
+                    stmt->arrays.back().hasAsType = true;
+                    stmt->arrays.back().asTypeName = listTypeName;
+                }
+            } else if (isTypeKeyword(current().type)) {
                 // Built-in type keyword (INT, FLOAT, DOUBLE, STRING, BYTE, SHORT, etc.)
                 TokenType asType = current().type;
                 advance();
@@ -5454,13 +5772,30 @@ ExpressionPtr Parser::parsePostfix() {
 
     // Handle member access and method calls (dot notation)
     while (match(TokenType::DOT)) {
-        // Accept IDENTIFIER or hashmap method keywords (HASKEY, KEYS, SIZE, CLEAR, REMOVE)
+        // Accept IDENTIFIER or object method keywords
         if (current().type != TokenType::IDENTIFIER &&
             current().type != TokenType::HASKEY &&
             current().type != TokenType::KEYS &&
             current().type != TokenType::SIZE &&
             current().type != TokenType::CLEAR &&
-            current().type != TokenType::REMOVE) {
+            current().type != TokenType::REMOVE &&
+            current().type != TokenType::APPEND &&
+            current().type != TokenType::PREPEND &&
+            current().type != TokenType::HEAD &&
+            current().type != TokenType::TAIL &&
+            current().type != TokenType::REST &&
+            current().type != TokenType::LENGTH &&
+            current().type != TokenType::EMPTY &&
+            current().type != TokenType::CONTAINS &&
+            current().type != TokenType::INDEXOF &&
+            current().type != TokenType::JOIN &&
+            current().type != TokenType::COPY &&
+            current().type != TokenType::REVERSE &&
+            current().type != TokenType::SHIFT &&
+            current().type != TokenType::POP &&
+            current().type != TokenType::EXTEND &&
+            current().type != TokenType::INSERT &&
+            current().type != TokenType::GET) {
             error("Expected member name after '.'");
             break;
         }
@@ -5504,6 +5839,34 @@ ExpressionPtr Parser::parsePrimary() {
         auto expr = std::make_unique<StringExpression>(current().value, current().hasNonASCII);
         advance();
         return expr;
+    }
+
+    // LIST(...) constructor expression — LIST(expr, expr, ...)
+    if (current().type == TokenType::KEYWORD_LIST) {
+        auto loc = current().location;
+        advance(); // consume LIST
+        
+        if (current().type == TokenType::LPAREN) {
+            advance(); // consume (
+            auto listExpr = std::make_unique<ListConstructorExpression>();
+            listExpr->location = loc;
+            
+            // Parse comma-separated element expressions (may be empty)
+            if (current().type != TokenType::RPAREN) {
+                do {
+                    listExpr->addElement(parseExpression());
+                } while (match(TokenType::COMMA));
+            }
+            
+            consume(TokenType::RPAREN, "Expected ')' after LIST(...) elements");
+            return listExpr;
+        } else {
+            // Bare LIST keyword used as identifier (e.g., variable named LIST)
+            // Shouldn't normally happen since LIST is a keyword, but be safe
+            auto expr = std::make_unique<VariableExpression>("LIST", TokenType::UNKNOWN);
+            expr->location = loc;
+            return expr;
+        }
     }
 
     // NEW ClassName(args...) — object instantiation
@@ -6119,7 +6482,24 @@ bool Parser::isMethodCall() const {
                 methodType == TokenType::KEYS ||
                 methodType == TokenType::SIZE ||
                 methodType == TokenType::CLEAR ||
-                methodType == TokenType::REMOVE) {
+                methodType == TokenType::REMOVE ||
+                methodType == TokenType::APPEND ||
+                methodType == TokenType::PREPEND ||
+                methodType == TokenType::HEAD ||
+                methodType == TokenType::TAIL ||
+                methodType == TokenType::REST ||
+                methodType == TokenType::LENGTH ||
+                methodType == TokenType::EMPTY ||
+                methodType == TokenType::CONTAINS ||
+                methodType == TokenType::INDEXOF ||
+                methodType == TokenType::JOIN ||
+                methodType == TokenType::COPY ||
+                methodType == TokenType::REVERSE ||
+                methodType == TokenType::SHIFT ||
+                methodType == TokenType::POP ||
+                methodType == TokenType::EXTEND ||
+                methodType == TokenType::INSERT ||
+                methodType == TokenType::GET) {
                 lookAhead++;
                 
                 // Check for opening parenthesis (method call)
@@ -6151,7 +6531,8 @@ bool Parser::isTypeKeyword(TokenType type) const {
            type == TokenType::KEYWORD_LONG || type == TokenType::KEYWORD_BYTE ||
            type == TokenType::KEYWORD_SHORT || type == TokenType::KEYWORD_UBYTE ||
            type == TokenType::KEYWORD_USHORT || type == TokenType::KEYWORD_UINTEGER ||
-           type == TokenType::KEYWORD_ULONG || type == TokenType::KEYWORD_HASHMAP;
+           type == TokenType::KEYWORD_ULONG || type == TokenType::KEYWORD_HASHMAP ||
+           type == TokenType::KEYWORD_LIST;
 }
 
 // Convert AS type keyword to equivalent type suffix
@@ -6169,6 +6550,7 @@ TokenType Parser::asTypeToSuffix(TokenType asType) const {
         case TokenType::KEYWORD_UINTEGER: return TokenType::TYPE_INT;  // Use same suffix, track unsigned in TypeDescriptor
         case TokenType::KEYWORD_ULONG:   return TokenType::TYPE_INT;   // Use same suffix, track unsigned in TypeDescriptor
         case TokenType::KEYWORD_HASHMAP: return TokenType::UNKNOWN;    // HASHMAP has no type suffix
+        case TokenType::KEYWORD_LIST:    return TokenType::UNKNOWN;    // LIST has no type suffix
         default: return TokenType::UNKNOWN;
     }
 }

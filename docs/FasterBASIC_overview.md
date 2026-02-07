@@ -4,7 +4,7 @@
 
 FasterBASIC is a modern, high-performance implementation of the BASIC programming language. Unlike traditional BASIC interpreters, FasterBASIC is a full AOT (Ahead-of-Time) compiler that leverages a sophisticated C++ frontend and the QBE (Quick Backend) compiler infrastructure to generate highly optimized native machine code.
 
-The project demonstrates a significant architectural shift with its "CodeGen V2" engine, moving towards a robust Control Flow Graph (CFG) based representation that enables advanced analysis and optimization before code generation.
+The project demonstrates a significant architectural shift with its "CodeGen V2" engine, moving towards a robust Control Flow Graph (CFG) based representation. Recent updates have introduced major features including **Object-Oriented Programming (Classes)**, **HashMaps**, **SIMD Acceleration (via NEON)**, and a modular **Plugin System**.
 
 ## Compiler Architecture
 

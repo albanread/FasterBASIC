@@ -46,7 +46,9 @@ p.X = 10
 p.Y = 20
 ```
 
-### 2. Variables and Arrays
+*Note: FasterBASIC automatically uses SIMD (NEON) instructions for UDTs with homogenous numeric fields (e.g., 4x FLOAT) on supported platforms.*
+
+### 2. Variables, Arrays, Lists, and Maps
 
 #### Variable Declaration
 ```basic
@@ -55,6 +57,33 @@ DIM name AS STRING
 LOCAL temp AS DOUBLE      ' Function/sub local
 GLOBAL config AS STRING   ' Global variable
 SHARED counter AS INTEGER ' Access global in sub/function
+```
+
+#### Lists (Dynamic Collections)
+```basic
+' Uniform List
+DIM nums AS LIST OF INTEGER
+nums.APPEND(10)
+nums.APPEND(20)
+PRINT nums.GET(1)  ' Method access: 10
+PRINT nums(1)      ' Array-style sugar: 10
+
+' Polymorphic List
+DIM objects AS LIST OF ANY
+objects.APPEND(42)
+objects.APPEND("Hello")
+
+' List Initializer
+DIM primes AS LIST OF INTEGER = LIST(2, 3, 5, 7)
+
+' Operations
+len = nums.LENGTH()
+head = nums.HEAD()
+found = nums.CONTAINS(20)
+idx = nums.INDEXOF(20)
+val = nums.POP()   ' Remove from end
+val = nums.SHIFT() ' Remove from start
+ERASE nums         ' Clear list
 ```
 
 #### Arrays
@@ -71,6 +100,20 @@ REDIM PRESERVE numbers%(30)
 
 ' Base index (0 or 1)
 OPTION BASE 0
+```
+
+#### HashMaps
+```basic
+' Declaration
+DIM map AS HASHMAP
+
+' Assignment & Retrieval
+map("name") = "Alice"
+map("score") = "100"
+PRINT map("name")
+
+' Updates
+map("score") = "101"
 ```
 
 ### 3. Control Flow
@@ -99,7 +142,29 @@ SELECT CASE score
     PRINT "B"
   CASE IS < 60
     PRINT "F"
-  OTHERWISE
+  FOR EACH (HashMap)
+FOR EACH key IN map
+  PRINT key
+NEXT
+
+' FOR Key, Value (HashMap)
+FOR k, v IN map
+  PRINT k; " => "; v
+NEXT
+
+' Type Pattern Matching (for LIST OF ANY)
+FOR EACH item IN objects
+  MATCH TYPE item
+    CASE INTEGER i
+      PRINT "Integer: "; i
+    CASE STRING s
+      PRINT "String: "; s
+    CASE ELSE
+      PRINT "Unknown type"
+  END MATCH
+NEXT
+
+' OTHERWISE
     PRINT "C or D"
 ENDCASE
 ```
@@ -355,7 +420,32 @@ WAIT_MS 1000  ' Wait 1000 milliseconds
 ```
 
 ### 10. Data Statements
+Object-Oriented Programming (Classes)
+```basic
+CLASS Animal
+  Name AS STRING
+  CONSTRUCTOR(n$)
+    ME.Name = n$
+  END CONSTRUCTOR
+  METHOD Speak()
+    PRINT ME.Name; " makes a sound."
+  END METHOD
+END CLASS
 
+CLASS Dog INHERITS Animal
+  METHOD Speak()
+    PRINT ME.Name; " says Woof!"
+  END METHOD
+END CLASS
+
+DIM d AS Dog = NEW Dog("Rex")
+d.Speak()
+```
+
+#### Plugins
+FasterBASIC supports a modular plugin system. C-native plugins placed in the `plugins/enabled/` directory are automatically loaded at compile time, making their commands available to your BASIC programs seamlessly.
+
+#### 
 ```basic
 DATA 10, 20, 30, 40
 DATA "Apple", "Banana", "Cherry"

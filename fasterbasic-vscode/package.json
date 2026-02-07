@@ -1,0 +1,36 @@
+{
+  "name": "fasterbasic",
+  "displayName": "FasterBASIC",
+  "description": "Language support for FasterBASIC",
+  "version": "1.0.0",
+  "engines": {
+    "vscode": "^1.70.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "fasterbasic",
+        "aliases": [
+          "FasterBASIC",
+          "fasterbasic"
+        ],
+        "extensions": [
+          ".bas",
+          ".bi",
+          ".fbas"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "fasterbasic",
+        "scopeName": "source.fasterbasic",
+        "path": "./syntaxes/fasterbasic.tmLanguage.json"
+      }
+    ]
+  }
+}

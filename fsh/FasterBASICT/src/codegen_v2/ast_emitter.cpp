@@ -64,6 +64,10 @@ std::string ASTEmitter::emitExpression(const Expression* expr) {
             
         case ASTNodeType::EXPR_MEMBER_ACCESS:
             return emitMemberAccessExpression(static_cast<const MemberAccessExpression*>(expr));
+        
+        // LIST constructor expression: LIST(expr, expr, ...)
+        case ASTNodeType::EXPR_LIST_CONSTRUCTOR:
+            return emitListConstructor(static_cast<const FasterBASIC::ListConstructorExpression*>(expr));
             
         // CLASS & Object System expressions
         case ASTNodeType::EXPR_NEW: {
@@ -387,6 +391,46 @@ std::string ASTEmitter::emitUnaryExpression(const UnaryExpression* expr) {
 }
 
 std::string ASTEmitter::emitArrayAccessExpression(const ArrayAccessExpression* expr) {
+    // --- LIST subscript sugar: myList(3) → list_get_*(listPtr, 3) ---
+    {
+        std::string currentFunc = symbolMapper_.getCurrentFunction();
+        const auto* varSym = semantic_.lookupVariableScoped(expr->name, currentFunc);
+        if (varSym && varSym->typeDesc.baseType == FasterBASIC::BaseType::OBJECT &&
+            varSym->typeDesc.objectTypeName == "LIST" &&
+            expr->indices.size() == 1) {
+
+            builder_.emitComment("LIST subscript sugar: " + expr->name + "(index) -> .GET(index)");
+
+            // Load the ListHeader* pointer
+            std::string listPtr = loadVariable(expr->name);
+
+            // Evaluate the index expression
+            std::string indexVal = emitExpression(expr->indices[0].get());
+
+            // Convert index to word type for list_get_* call
+            std::string idxW = builder_.newTemp();
+            builder_.emitRaw("    " + idxW + " =w copy " + indexVal + "\n");
+
+            // Determine element type and call appropriate list_get_* function
+            FasterBASIC::BaseType elemType = varSym->typeDesc.listElementType();
+
+            std::string result = builder_.newTemp();
+            if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                builder_.emitCall(result, "d", "list_get_float", "l " + listPtr + ", w " + idxW);
+            } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE) {
+                builder_.emitCall(result, "l", "list_get_ptr", "l " + listPtr + ", w " + idxW);
+            } else if (elemType == FasterBASIC::BaseType::UNKNOWN) {
+                // LIST OF ANY — return raw 64-bit value
+                builder_.emitCall(result, "l", "list_get_int", "l " + listPtr + ", w " + idxW);
+            } else {
+                // Integer types
+                builder_.emitCall(result, "l", "list_get_int", "l " + listPtr + ", w " + idxW);
+            }
+
+            return result;
+        }
+    }
+
     return loadArrayElement(expr->name, expr->indices);
 }
 
@@ -432,6 +476,35 @@ std::string ASTEmitter::emitMemberAccessExpression(const MemberAccessExpression*
                 auto mpTypeIt = methodParamTypes_.find(varExpr->name);
                 if (mpTypeIt != methodParamTypes_.end() &&
                     mpTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                    const auto& symbolTable = semantic_.getSymbolTable();
+                    auto cnIt = methodParamClassNames_.find(varExpr->name);
+                    if (cnIt != methodParamClassNames_.end()) {
+                        classSym = symbolTable.lookupClass(cnIt->second);
+                    }
+                    // Fallback: search all classes for one with this field
+                    if (!classSym) {
+                        for (const auto& pair : symbolTable.classes) {
+                            if (pair.second.findField(expr->memberName)) {
+                                classSym = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (classSym) {
+                        objPtr = loadVariable(varExpr->name);
+                    }
+                }
+            }
+            // --- MATCH TYPE binding variable fallback ---
+            // Binding variables created by MATCH TYPE CASE arms (e.g.
+            // CASE Dog d) are registered in forEachVarTypes_ with
+            // CLASS_INSTANCE type and in methodParamClassNames_ with the
+            // class name.  They are NOT in the semantic symbol table or
+            // in methodParamTypes_, so the checks above won't find them.
+            if (!classSym) {
+                auto feTypeIt = forEachVarTypes_.find(varExpr->name);
+                if (feTypeIt != forEachVarTypes_.end() &&
+                    feTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
                     const auto& symbolTable = semantic_.getSymbolTable();
                     auto cnIt = methodParamClassNames_.find(varExpr->name);
                     if (cnIt != methodParamClassNames_.end()) {
@@ -1399,6 +1472,65 @@ void ASTEmitter::clearMethodParams() {
     methodParamClassNames_.clear();
 }
 
+// =============================================================================
+// LIST Constructor Expression: LIST(expr1, expr2, ...)
+// =============================================================================
+
+std::string ASTEmitter::emitListConstructor(const FasterBASIC::ListConstructorExpression* expr) {
+    if (!expr) {
+        builder_.emitComment("ERROR: null list constructor expression");
+        return "0";
+    }
+    
+    builder_.emitComment("LIST(" + std::to_string(expr->elements.size()) + " elements)");
+    
+    // Create a new list
+    // Note: list_create() already calls samm_track_list() internally when
+    // SAMM is enabled — do NOT track again here to avoid double-tracking.
+    std::string headerPtr = builder_.newTemp();
+    builder_.emitCall(headerPtr, "l", "list_create", "");
+    
+    // Append each element
+    for (size_t i = 0; i < expr->elements.size(); ++i) {
+        const auto* elemExpr = expr->elements[i].get();
+        FasterBASIC::BaseType elemType = getExpressionType(elemExpr);
+        
+        std::string elemVal = emitExpression(elemExpr);
+        
+        // Select the correct list_append_* function based on element type
+        if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+            // Float/double: convert to double for list_append_float
+            std::string dblVal = elemVal;
+            if (elemType == FasterBASIC::BaseType::SINGLE) {
+                dblVal = builder_.newTemp();
+                builder_.emitRaw("    " + dblVal + " =d exts " + elemVal + "\n");
+            }
+            builder_.emitCall("", "", "list_append_float", "l " + headerPtr + ", d " + dblVal);
+        } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE) {
+            builder_.emitCall("", "", "list_append_string", "l " + headerPtr + ", l " + elemVal);
+        } else if (elemType == FasterBASIC::BaseType::CLASS_INSTANCE) {
+            // CLASS instance — store as ATOM_OBJECT so MATCH TYPE can dispatch on class
+            builder_.emitComment("list_append_object (CLASS_INSTANCE)");
+            builder_.emitCall("", "", "list_append_object", "l " + headerPtr + ", l " + elemVal);
+        } else if (elemType == FasterBASIC::BaseType::OBJECT) {
+            // Generic object pointer — store as ATOM_OBJECT
+            builder_.emitComment("list_append_object (OBJECT)");
+            builder_.emitCall("", "", "list_append_object", "l " + headerPtr + ", l " + elemVal);
+        } else {
+            // Integer types (INTEGER, LONG, BYTE, SHORT, etc.) — widen to 64-bit
+            std::string longVal = elemVal;
+            if (elemType == FasterBASIC::BaseType::INTEGER || elemType == FasterBASIC::BaseType::BYTE ||
+                elemType == FasterBASIC::BaseType::SHORT) {
+                longVal = builder_.newTemp();
+                builder_.emitRaw("    " + longVal + " =l extsw " + elemVal + "\n");
+            }
+            builder_.emitCall("", "", "list_append_int", "l " + headerPtr + ", l " + longVal);
+        }
+    }
+    
+    return headerPtr;
+}
+
 std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
     if (!expr || !expr->object) {
         builder_.emitComment("ERROR: invalid method call expression");
@@ -1462,6 +1594,34 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
                 if (mpTypeIt != methodParamTypes_.end() &&
                     mpTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
                     // Look up the CLASS name stored when the variable was DIM'd
+                    auto cnIt = methodParamClassNames_.find(varExpr->name);
+                    if (cnIt != methodParamClassNames_.end()) {
+                        classSym = symbolTable.lookupClass(cnIt->second);
+                    }
+                    // Fallback: search all classes for one that has the method
+                    if (!classSym) {
+                        for (const auto& pair : symbolTable.classes) {
+                            if (pair.second.findMethod(methodName)) {
+                                classSym = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (classSym) {
+                        objPtr = loadVariable(varExpr->name);
+                    }
+                }
+            }
+            // --- MATCH TYPE binding variable fallback ---
+            // Binding variables created by MATCH TYPE CASE arms (e.g.
+            // CASE Dog d) are registered in forEachVarTypes_ with
+            // CLASS_INSTANCE type and in methodParamClassNames_ with the
+            // class name.  They are NOT in the semantic symbol table or
+            // in methodParamTypes_, so the checks above won't find them.
+            if (!classSym) {
+                auto feTypeIt = forEachVarTypes_.find(varExpr->name);
+                if (feTypeIt != forEachVarTypes_.end() &&
+                    feTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
                     auto cnIt = methodParamClassNames_.find(varExpr->name);
                     if (cnIt != methodParamClassNames_.end()) {
                         classSym = symbolTable.lookupClass(cnIt->second);
@@ -1620,34 +1780,159 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
                            std::to_string(providedArgs));
     }
     
+    // === LIST type-aware method dispatch ===
+    // For LIST objects, select the correct runtime function based on the list's
+    // element type and/or the argument type (for LIST OF ANY).
+    std::string runtimeFunc = method->runtimeFunctionName;
+    std::string upperMethod = methodName;
+    std::transform(upperMethod.begin(), upperMethod.end(), upperMethod.begin(), ::toupper);
+    
+    if (objectTypeDesc.isList()) {
+        FasterBASIC::BaseType elemType = objectTypeDesc.listElementType();
+        
+        // For typed lists, dispatch based on element type
+        // For LIST OF ANY, dispatch based on argument type
+        FasterBASIC::BaseType dispatchType = elemType;
+        
+        if (upperMethod == "APPEND" || upperMethod == "PREPEND" || upperMethod == "INSERT" ||
+            upperMethod == "CONTAINS" || upperMethod == "INDEXOF") {
+            // These methods need type-aware function selection
+            if (elemType == FasterBASIC::BaseType::UNKNOWN && providedArgs > 0) {
+                // LIST OF ANY: dispatch by argument type
+                size_t valueArgIdx = (upperMethod == "INSERT") ? 1 : 0;
+                if (valueArgIdx < providedArgs) {
+                    dispatchType = getExpressionType(expr->arguments[valueArgIdx].get());
+                }
+            }
+            
+            std::string baseName;
+            if (upperMethod == "APPEND") baseName = "list_append";
+            else if (upperMethod == "PREPEND") baseName = "list_prepend";
+            else if (upperMethod == "INSERT") baseName = "list_insert";
+            else if (upperMethod == "CONTAINS") baseName = "list_contains";
+            else if (upperMethod == "INDEXOF") baseName = "list_indexof";
+            
+            if (dispatchType == FasterBASIC::BaseType::DOUBLE || dispatchType == FasterBASIC::BaseType::SINGLE) {
+                runtimeFunc = baseName + "_float";
+            } else if (dispatchType == FasterBASIC::BaseType::STRING || dispatchType == FasterBASIC::BaseType::UNICODE) {
+                runtimeFunc = baseName + "_string";
+            } else if (dispatchType == FasterBASIC::BaseType::OBJECT) {
+                if (upperMethod == "APPEND") runtimeFunc = "list_append_list";
+                else if (upperMethod == "PREPEND") runtimeFunc = "list_prepend_list";
+                else runtimeFunc = baseName + "_int"; // fallback
+            } else {
+                runtimeFunc = baseName + "_int";
+            }
+        } else if (upperMethod == "HEAD" || upperMethod == "GET" || upperMethod == "SHIFT" || upperMethod == "POP") {
+            // Return-value methods: dispatch by list element type
+            if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                if (upperMethod == "HEAD") runtimeFunc = "list_head_float";
+                else if (upperMethod == "GET") runtimeFunc = "list_get_float";
+                else if (upperMethod == "SHIFT") runtimeFunc = "list_shift_float";
+                else if (upperMethod == "POP") runtimeFunc = "list_pop_float";
+            } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE ||
+                       elemType == FasterBASIC::BaseType::OBJECT) {
+                if (upperMethod == "HEAD") runtimeFunc = "list_head_ptr";
+                else if (upperMethod == "GET") runtimeFunc = "list_get_ptr";
+                else if (upperMethod == "SHIFT") runtimeFunc = "list_shift_ptr";
+                else if (upperMethod == "POP") runtimeFunc = "list_pop_ptr";
+            }
+            // else: keep default _int functions
+        }
+        // LENGTH, EMPTY, CLEAR, REMOVE, EXTEND, REST, COPY, REVERSE, JOIN
+        // don't need type dispatch — they use the same function regardless of element type
+        
+        builder_.emitComment("LIST dispatch: " + runtimeFunc);
+    }
+    
     std::string argsStr = "l " + objectPtr;
     
     for (size_t i = 0; i < providedArgs && i < method->parameters.size(); ++i) {
         const auto& param = method->parameters[i];
-        std::string argValue = emitExpressionAs(expr->arguments[i].get(), param.type);
         
-        if (param.type == BaseType::STRING) {
-            std::string cStringPtr = builder_.newTemp();
-            builder_.emitCall(cStringPtr, "l", "string_to_utf8", "l " + argValue);
-            argsStr += ", l " + cStringPtr;
+        // For LIST methods, determine actual argument type for proper QBE type
+        FasterBASIC::BaseType actualParamType = param.type;
+        if (objectTypeDesc.isList()) {
+            FasterBASIC::BaseType elemType = objectTypeDesc.listElementType();
+            // For value parameters (APPEND, PREPEND, INSERT value, CONTAINS, INDEXOF),
+            // use the actual element type or argument expression type
+            bool isValueParam = false;
+            if (upperMethod == "APPEND" || upperMethod == "PREPEND" || 
+                upperMethod == "CONTAINS" || upperMethod == "INDEXOF") {
+                isValueParam = (i == 0);
+            } else if (upperMethod == "INSERT") {
+                isValueParam = (i == 1);
+            }
+            
+            if (isValueParam) {
+                FasterBASIC::BaseType dispType = (elemType != FasterBASIC::BaseType::UNKNOWN) 
+                    ? elemType : getExpressionType(expr->arguments[i].get());
+                if (dispType == FasterBASIC::BaseType::DOUBLE || dispType == FasterBASIC::BaseType::SINGLE) {
+                    actualParamType = FasterBASIC::BaseType::DOUBLE;
+                } else if (dispType == FasterBASIC::BaseType::STRING || dispType == FasterBASIC::BaseType::UNICODE) {
+                    actualParamType = FasterBASIC::BaseType::STRING;
+                } else {
+                    actualParamType = FasterBASIC::BaseType::LONG; // 64-bit int
+                }
+            }
+        }
+        
+        std::string argValue = emitExpressionAs(expr->arguments[i].get(), actualParamType);
+        
+        if (actualParamType == BaseType::STRING) {
+            if (objectTypeDesc.isList()) {
+                // LIST runtime functions (list_append_string, list_contains_string,
+                // list_indexof_string, list_join, etc.) expect StringDescriptor*,
+                // NOT a C-string (char*). Pass the descriptor pointer directly.
+                argsStr += ", l " + argValue;
+            } else {
+                // HASHMAP and other object types expect C-strings (char*)
+                std::string cStringPtr = builder_.newTemp();
+                builder_.emitCall(cStringPtr, "l", "string_to_utf8", "l " + argValue);
+                argsStr += ", l " + cStringPtr;
+            }
         } else {
-            std::string qbeType = typeManager_.getQBEType(param.type);
+            std::string qbeType = typeManager_.getQBEType(actualParamType);
             argsStr += ", " + qbeType + " " + argValue;
         }
     }
     
     if (method->returnType == BaseType::UNKNOWN) {
-        builder_.emitCall("", "", method->runtimeFunctionName, argsStr);
+        builder_.emitCall("", "", runtimeFunc, argsStr);
         return "0";
     } else {
-        std::string qbeReturnType = typeManager_.getQBEType(method->returnType);
-        std::string result = builder_.newTemp();
-        builder_.emitCall(result, qbeReturnType, method->runtimeFunctionName, argsStr);
+        // For LIST methods, determine actual return type based on element type
+        FasterBASIC::BaseType actualReturnType = method->returnType;
+        if (objectTypeDesc.isList()) {
+            FasterBASIC::BaseType elemType = objectTypeDesc.listElementType();
+            if (upperMethod == "HEAD" || upperMethod == "GET" || upperMethod == "SHIFT" || upperMethod == "POP") {
+                if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                    actualReturnType = FasterBASIC::BaseType::DOUBLE;
+                } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE) {
+                    // LIST OF STRING: return StringDescriptor* — mark as STRING so
+                    // the rest of the pipeline (PRINT, LET, etc.) treats the pointer
+                    // as a string descriptor rather than a raw integer.
+                    actualReturnType = FasterBASIC::BaseType::STRING;
+                } else if (elemType == FasterBASIC::BaseType::OBJECT) {
+                    actualReturnType = FasterBASIC::BaseType::LONG; // opaque pointer
+                }
+            } else if (upperMethod == "REST" || upperMethod == "COPY" || upperMethod == "REVERSE") {
+                actualReturnType = FasterBASIC::BaseType::LONG; // ListHeader pointer
+                // SAMM: track newly created lists returned by copy/reverse/rest
+                // (done after the call below)
+            }
+        }
         
-        if (method->returnType == BaseType::LONG && qbeReturnType == "l") {
-            std::string result32 = builder_.newTemp();
-            builder_.emitInstruction(result32 + " =w copy " + result);
-            return result32;
+        std::string qbeReturnType = typeManager_.getQBEType(actualReturnType);
+        std::string result = builder_.newTemp();
+        builder_.emitCall(result, qbeReturnType, runtimeFunc, argsStr);
+        
+        // Note: COPY, REVERSE, REST internally call list_create() which
+        // already calls samm_track_list() — do NOT track again here.
+        
+        if (actualReturnType == BaseType::LONG && qbeReturnType == "l") {
+            // Don't truncate if we actually need 64-bit (pointer or long int)
+            // Only truncate if the caller actually needs 32-bit
         }
         
         return result;
@@ -1880,8 +2165,12 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             emitEraseStatement(static_cast<const EraseStatement*>(stmt));
             break;
             
+        case ASTNodeType::STMT_MATCH_TYPE:
+            emitMatchTypeStatement(static_cast<const MatchTypeStatement*>(stmt));
+            break;
+            
         case ASTNodeType::STMT_FOR:
-            if (currentClassContext_) {
+            if (currentClassContext_ || inDirectEmitContext_) {
                 emitForDirect(static_cast<const ForStatement*>(stmt));
             } else {
                 emitForInit(static_cast<const ForStatement*>(stmt));
@@ -1893,7 +2182,7 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             break;
             
         case ASTNodeType::STMT_WHILE:
-            if (currentClassContext_) {
+            if (currentClassContext_ || inDirectEmitContext_) {
                 emitWhileDirect(static_cast<const WhileStatement*>(stmt));
             } else {
                 // WHILE condition is handled by CFG edges
@@ -1912,7 +2201,7 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             break;
             
         case ASTNodeType::STMT_IF:
-            if (currentClassContext_) {
+            if (currentClassContext_ || inDirectEmitContext_) {
                 emitIfDirect(static_cast<const IfStatement*>(stmt));
             } else {
                 // IF condition is handled by CFG edges
@@ -2944,24 +3233,68 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
                     builder_.emitComment("DIM " + arrayName + " AS " + objDesc->typeName);
                     
                     // Determine if variable is global or local
-                    // OBJECT types (hashmaps, etc.) are always treated as globals to avoid stack issues
+                    // OBJECT types (hashmaps, lists, etc.) are always treated as globals to avoid stack issues
                     // Also check for explicit GLOBAL keyword
                     bool isGlobal = varSym->isGlobal || (varSym->typeDesc.baseType == BaseType::OBJECT);
                     
                     // Get variable name (mangle it)
                     std::string varName = symbolMapper_.mangleVariableName(arrayName, isGlobal);
                     
-                    // Call constructor with default arguments
                     std::string objectPtr = builder_.newTemp();
                     
-                    // Build argument string from default args
-                    std::string argsStr;
-                    for (const auto& arg : objDesc->constructorDefaultArgs) {
-                        if (!argsStr.empty()) argsStr += ", ";
-                        argsStr += arg;
+                    // LIST type: use list_create_typed() for typed lists, list_create() for LIST OF ANY
+                    if (varSym->typeDesc.isList()) {
+                        FasterBASIC::BaseType elemType = varSym->typeDesc.listElementType();
+                        
+                        if (arrayDecl.initializer) {
+                            // Has initializer (e.g., DIM x AS LIST OF INTEGER = LIST(1,2,3))
+                            // Skip default list creation entirely — just emit the initializer.
+                            // emitListConstructor() already creates & SAMM-tracks the list.
+                            builder_.emitComment("DIM LIST with initializer — skip default construction");
+                            std::string initVal = emitExpression(arrayDecl.initializer.get());
+                            // Reassign objectPtr to the initializer result (SSA: use new temp name)
+                            objectPtr = initVal;
+                        } else if (elemType != FasterBASIC::BaseType::UNKNOWN) {
+                            // Typed list without initializer: list_create_typed(elem_flag)
+                            // Map BaseType to LIST_FLAG_ELEM_* values from list_ops.h
+                            int elemFlag = 0x00; // LIST_FLAG_ELEM_ANY
+                            if (elemType == FasterBASIC::BaseType::INTEGER || elemType == FasterBASIC::BaseType::LONG ||
+                                elemType == FasterBASIC::BaseType::BYTE || elemType == FasterBASIC::BaseType::SHORT) {
+                                elemFlag = 0x10; // LIST_FLAG_ELEM_INT
+                            } else if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                                elemFlag = 0x20; // LIST_FLAG_ELEM_FLOAT
+                            } else if (elemType == FasterBASIC::BaseType::STRING) {
+                                elemFlag = 0x30; // LIST_FLAG_ELEM_STRING
+                            } else if (elemType == FasterBASIC::BaseType::OBJECT) {
+                                elemFlag = 0x40; // LIST_FLAG_ELEM_LIST (or OBJECT)
+                            }
+                            builder_.emitComment("LIST OF " + std::string(
+                                elemType == FasterBASIC::BaseType::INTEGER ? "INTEGER" :
+                                elemType == FasterBASIC::BaseType::LONG ? "LONG" :
+                                elemType == FasterBASIC::BaseType::DOUBLE ? "DOUBLE" :
+                                elemType == FasterBASIC::BaseType::SINGLE ? "SINGLE" :
+                                elemType == FasterBASIC::BaseType::STRING ? "STRING" :
+                                elemType == FasterBASIC::BaseType::OBJECT ? "LIST/OBJECT" : "ANY"));
+                            builder_.emitCall(objectPtr, "l", "list_create_typed", "w " + std::to_string(elemFlag));
+                            // Note: list_create_typed() internally calls list_create() which
+                            // already calls samm_track_list() — do NOT track again here.
+                        } else {
+                            // LIST OF ANY without initializer
+                            builder_.emitComment("LIST OF ANY");
+                            builder_.emitCall(objectPtr, "l", "list_create", "");
+                            // Note: list_create() already calls samm_track_list() internally
+                            // — do NOT track again here.
+                        }
+                    } else {
+                        // Non-LIST object (HASHMAP, etc.)
+                        // Build argument string from default args
+                        std::string argsStr;
+                        for (const auto& arg : objDesc->constructorDefaultArgs) {
+                            if (!argsStr.empty()) argsStr += ", ";
+                            argsStr += arg;
+                        }
+                        builder_.emitCall(objectPtr, "l", objDesc->constructorFunction, argsStr);
                     }
-                    
-                    builder_.emitCall(objectPtr, "l", objDesc->constructorFunction, argsStr);
                     
                     // Store the object pointer in the variable
                     builder_.emitStore("l", objectPtr, varName);
@@ -3240,13 +3573,55 @@ void ASTEmitter::emitRedimStatement(const RedimStatement* stmt) {
 void ASTEmitter::emitEraseStatement(const EraseStatement* stmt) {
     // Invalidate array element cache - ERASE destroys arrays
     clearArrayElementCache();
-    // ERASE statement: deallocate array memory
+    // ERASE statement: deallocate array/list memory
     
     for (const std::string& arrayName : stmt->arrayNames) {
         builder_.emitComment("ERASE " + arrayName);
         
-        // Look up array symbol in semantic analyzer
         const auto& symbolTable = semantic_.getSymbolTable();
+
+        // --- Check if this is a LIST variable ---
+        {
+            std::string currentFunc = symbolMapper_.getCurrentFunction();
+            const auto* varSym = semantic_.lookupVariableScoped(arrayName, currentFunc);
+            if (varSym && varSym->typeDesc.baseType == FasterBASIC::BaseType::OBJECT &&
+                varSym->typeDesc.objectTypeName == "LIST") {
+                // LIST variable — call samm_untrack + list_free
+                builder_.emitComment("ERASE LIST: " + arrayName);
+
+                // Load the ListHeader* pointer
+                std::string listPtr = loadVariable(arrayName);
+
+                // Check for null before freeing
+                std::string isNull = builder_.newTemp();
+                builder_.emitRaw("    " + isNull + " =w ceql " + listPtr + ", 0\n");
+                int eraseId = builder_.getNextLabelId();
+                std::string skipLabel = "erase_skip_" + std::to_string(eraseId);
+                std::string freeLabel = "erase_free_" + std::to_string(eraseId);
+                builder_.emitBranch(isNull, skipLabel, freeLabel);
+
+                builder_.emitLabel(freeLabel);
+
+                // Untrack from SAMM before freeing
+                if (isSAMMEnabled()) {
+                    builder_.emitCall("", "", "samm_untrack", "l " + listPtr);
+                }
+
+                // Free the list (this frees all atoms and their contents)
+                builder_.emitCall("", "", "list_free", "l " + listPtr);
+
+                // Set the variable to NULL (0) so it's not used-after-free
+                storeVariable(arrayName, "0");
+
+                builder_.emitJump(skipLabel);
+                builder_.emitLabel(skipLabel);
+                builder_.emitBlankLine();
+                continue;
+            }
+        }
+
+        // --- Standard array ERASE path ---
+        // Look up array symbol in semantic analyzer
         auto it = symbolTable.arrays.find(arrayName);
         if (it == symbolTable.arrays.end()) {
             builder_.emitComment("ERROR: array not found in symbol table: " + arrayName);
@@ -3273,6 +3648,455 @@ void ASTEmitter::emitEraseStatement(const EraseStatement* stmt) {
         
         builder_.emitBlankLine();
     }
+}
+
+// =============================================================================
+// MATCH TYPE Statement — safe type dispatch for LIST OF ANY
+// =============================================================================
+void ASTEmitter::emitMatchTypeStatement(const MatchTypeStatement* stmt) {
+    builder_.emitComment("=== MATCH TYPE ===");
+
+    if (!stmt->matchExpression) {
+        builder_.emitComment("ERROR: MATCH TYPE has no expression");
+        return;
+    }
+
+    // --- Determine the source of the type tag and raw value ---
+    // Case 1: expression is a variable from FOR EACH over LIST OF ANY
+    // Case 2: expression is a method call result (e.g. mixed.SHIFT)
+    //         — need to emit paired type call
+
+    std::string typeTagVal;   // QBE temp holding the w-typed tag
+    std::string rawValueAddr; // QBE address holding the raw 64-bit value
+
+    bool fromForEachSlot = false;
+    std::string matchVarName;
+
+    if (stmt->matchExpression->getType() == ASTNodeType::EXPR_VARIABLE) {
+        const auto* varExpr = static_cast<const VariableExpression*>(stmt->matchExpression.get());
+        matchVarName = varExpr->name;
+
+        // Use currentForEachStmt_ (set by CFG emitter when entering a
+        // ForIn_Body block) to precisely determine whether we are inside
+        // a single-variable or two-variable FOR EACH loop.  This avoids
+        // ambiguity from stale forEachIsList_ entries when multiple loops
+        // reuse the same variable name (e.g. "E").
+        const FasterBASIC::ForInStatement* curLoop = currentForEachStmt_;
+
+        if (curLoop && !curLoop->indexVariable.empty() &&
+            curLoop->indexVariable == matchVarName &&
+            forEachIsList_.count(curLoop->variable) > 0) {
+            // --- Two-variable form: FOR EACH T, E IN listOfAny ---
+            // matchVarName is the indexVariable (E), curLoop->variable
+            // is the first variable (T).  Type tag lives in
+            // __foreach_type_<T>, element value in __foreach_slot_<E>.
+            std::string typeSlotKey = "__foreach_type_" + curLoop->variable;
+            auto typeIt = forLoopTempAddresses_.find(typeSlotKey);
+            if (typeIt != forLoopTempAddresses_.end()) {
+                typeTagVal = builder_.newTemp();
+                builder_.emitRaw("    " + typeTagVal + " =w loadw " + typeIt->second + "\n");
+                fromForEachSlot = true;
+            }
+
+            std::string elemSlotKey = "__foreach_slot_" + matchVarName;
+            auto elemIt = forLoopTempAddresses_.find(elemSlotKey);
+            if (elemIt != forLoopTempAddresses_.end()) {
+                rawValueAddr = elemIt->second;
+            }
+        } else if (curLoop && curLoop->indexVariable.empty() &&
+                   curLoop->variable == matchVarName &&
+                   forEachIsList_.count(matchVarName) > 0) {
+            // --- Single-variable form: FOR EACH E IN listOfAny ---
+            // Load type from the cursor via list_iter_type.
+            std::string cursorVar = "__foreach_cursor_" + matchVarName;
+            auto cursorIt = forLoopTempAddresses_.find(cursorVar);
+            if (cursorIt != forLoopTempAddresses_.end()) {
+                std::string cursor = builder_.newTemp();
+                builder_.emitRaw("    " + cursor + " =l loadl " + cursorIt->second + "\n");
+                typeTagVal = builder_.newTemp();
+                builder_.emitCall(typeTagVal, "w", "list_iter_type", "l " + cursor);
+                fromForEachSlot = true;
+            }
+
+            // Raw value address is __foreach_slot_<E>
+            std::string slotKey = "__foreach_slot_" + matchVarName;
+            auto slotIt = forLoopTempAddresses_.find(slotKey);
+            if (slotIt != forLoopTempAddresses_.end()) {
+                rawValueAddr = slotIt->second;
+            } else {
+                auto gIt = globalVarAddresses_.find(matchVarName);
+                if (gIt != globalVarAddresses_.end()) {
+                    rawValueAddr = gIt->second;
+                }
+            }
+        } else {
+            // --- Fallback: no currentForEachStmt_ context ---
+            // Try the two-variable scan first (more specific), then
+            // single-variable.  This path handles edge cases where
+            // currentForEachStmt_ is not set.
+
+            // Two-variable scan
+            {
+                std::string elemSlotKey = "__foreach_slot_" + matchVarName;
+                auto elemIt = forLoopTempAddresses_.find(elemSlotKey);
+                if (elemIt != forLoopTempAddresses_.end() &&
+                    forEachVarTypes_.count(matchVarName) > 0) {
+                    for (const auto& kv : forLoopTempAddresses_) {
+                        if (kv.first.substr(0, 15) == "__foreach_type_") {
+                            std::string firstVar = kv.first.substr(15);
+                            if (forEachIsList_.count(firstVar) > 0) {
+                                rawValueAddr = elemIt->second;
+                                typeTagVal = builder_.newTemp();
+                                builder_.emitRaw("    " + typeTagVal + " =w loadw " + kv.second + "\n");
+                                fromForEachSlot = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Single-variable check
+            if (!fromForEachSlot && forEachIsList_.count(matchVarName) > 0) {
+                std::string cursorVar = "__foreach_cursor_" + matchVarName;
+                auto cursorIt = forLoopTempAddresses_.find(cursorVar);
+                if (cursorIt != forLoopTempAddresses_.end()) {
+                    std::string cursor = builder_.newTemp();
+                    builder_.emitRaw("    " + cursor + " =l loadl " + cursorIt->second + "\n");
+                    typeTagVal = builder_.newTemp();
+                    builder_.emitCall(typeTagVal, "w", "list_iter_type", "l " + cursor);
+                    fromForEachSlot = true;
+                }
+
+                std::string slotKey = "__foreach_slot_" + matchVarName;
+                auto slotIt = forLoopTempAddresses_.find(slotKey);
+                if (slotIt != forLoopTempAddresses_.end()) {
+                    rawValueAddr = slotIt->second;
+                } else {
+                    auto gIt = globalVarAddresses_.find(matchVarName);
+                    if (gIt != globalVarAddresses_.end()) {
+                        rawValueAddr = gIt->second;
+                    }
+                }
+            }
+        }
+    }
+
+    // If we couldn't resolve from FOR EACH slots, emit the expression
+    // and try to get a type tag from a runtime call
+    if (typeTagVal.empty()) {
+        // Evaluate the expression to get the raw value
+        std::string rawVal = emitExpression(stmt->matchExpression.get());
+
+        // We need a type tag — for standalone use, the expression should
+        // be something like list.SHIFT which returns a raw value.
+        // We'll need to call list_shift_type() or similar.
+        // For now, store the value and emit a warning.
+        builder_.emitComment("MATCH TYPE: standalone expression — type tag from runtime");
+
+        // Allocate a temp slot for the raw value
+        std::string slotAddr = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l alloc8 8\n");
+        builder_.emitStore("l", rawVal, slotAddr);
+        rawValueAddr = slotAddr;
+
+        // Use 0 as default tag (will match nothing unless CASE ELSE)
+        typeTagVal = builder_.newTemp();
+        builder_.emitRaw("    " + typeTagVal + " =w copy 0\n");
+    }
+
+    // --- Generate unique labels for the MATCH TYPE block ---
+    int matchId = builder_.getNextLabelId();
+    std::string endLabel = "@match_end_" + std::to_string(matchId);
+    std::string elseLabel = "@match_else_" + std::to_string(matchId);
+
+    // Build arm labels
+    std::vector<std::string> armLabels;
+    std::vector<std::string> checkLabels;
+    for (size_t i = 0; i < stmt->caseArms.size(); ++i) {
+        armLabels.push_back("@match_arm_" + std::to_string(matchId) + "_" + std::to_string(i));
+        if (i + 1 < stmt->caseArms.size()) {
+            checkLabels.push_back("@match_check_" + std::to_string(matchId) + "_" + std::to_string(i + 1));
+        } else {
+            // Last arm — fall through to CASE ELSE or end
+            if (!stmt->caseElseBody.empty()) {
+                checkLabels.push_back(elseLabel);
+            } else {
+                checkLabels.push_back(endLabel);
+            }
+        }
+    }
+
+    // If no arms at all, just jump to end
+    if (stmt->caseArms.empty()) {
+        if (!stmt->caseElseBody.empty()) {
+            builder_.emitLabel("match_else_" + std::to_string(matchId));
+            for (const auto& s : stmt->caseElseBody) {
+                emitStatement(s.get());
+            }
+        }
+        builder_.emitLabel("match_end_" + std::to_string(matchId));
+        return;
+    }
+
+    // --- Resolve class IDs for class-specific arms (from symbol table) ---
+    // Also detect UDT names and mark them accordingly.  This uses the
+    // static type information the compiler already knows from CLASS and
+    // TYPE declarations.
+    struct ResolvedArmInfo {
+        bool isClassSpecific = false;
+        int  classId = -1;
+        bool isUDTSpecific = false;
+        std::string className;
+        std::string udtName;
+    };
+    std::vector<ResolvedArmInfo> resolvedArms(stmt->caseArms.size());
+
+    {
+        const auto& symbolTable = getSymbolTable();
+        for (size_t i = 0; i < stmt->caseArms.size(); ++i) {
+            const auto& arm = stmt->caseArms[i];
+            if (arm.isClassMatch && !arm.matchClassName.empty()) {
+                // Try to resolve as a CLASS first
+                const FasterBASIC::ClassSymbol* cls = symbolTable.lookupClass(arm.matchClassName);
+                if (cls) {
+                    resolvedArms[i].isClassSpecific = true;
+                    resolvedArms[i].classId = cls->classId;
+                    resolvedArms[i].className = cls->name;
+                    builder_.emitComment("CASE " + arm.matchClassName +
+                                         " resolved to class_id=" + std::to_string(cls->classId));
+                } else {
+                    // Not a class — try UDT (TYPE)
+                    auto typeIt = symbolTable.types.find(arm.matchClassName);
+                    if (typeIt != symbolTable.types.end()) {
+                        resolvedArms[i].isUDTSpecific = true;
+                        resolvedArms[i].udtName = arm.matchClassName;
+                        builder_.emitComment("CASE " + arm.matchClassName +
+                                             " resolved to UDT type");
+                    } else {
+                        builder_.emitComment("WARNING: CASE " + arm.matchClassName +
+                                             " — name not found as CLASS or TYPE; treating as generic OBJECT");
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Emit type-tag comparison chain ---
+    for (size_t i = 0; i < stmt->caseArms.size(); ++i) {
+        const auto& arm = stmt->caseArms[i];
+
+        if (i > 0) {
+            // Emit label for this check
+            builder_.emitLabel("match_check_" + std::to_string(matchId) + "_" + std::to_string(i));
+        }
+
+        if (resolvedArms[i].isClassSpecific) {
+            // --- Class-specific match: CASE ClassName ---
+            // Two checks: (1) atom tag == ATOM_OBJECT (5), then
+            //              (2) class_is_instance(obj_ptr, target_class_id)
+            // This supports inheritance: CASE Dog matches Dog and all subclasses.
+            std::string isObj = builder_.newTemp();
+            builder_.emitRaw("    " + isObj + " =w ceqw " + typeTagVal + ", 5\n");
+
+            // If not an object at all, skip to next check
+            std::string classCheckLabel = "match_classcheck_" + std::to_string(matchId) + "_" + std::to_string(i);
+            builder_.emitBranch(isObj, classCheckLabel, checkLabels[i].substr(1));
+
+            // Emit the class_is_instance check
+            builder_.emitLabel(classCheckLabel);
+            std::string objPtr = builder_.newTemp();
+            builder_.emitRaw("    " + objPtr + " =l loadl " + rawValueAddr + "\n");
+            std::string isInstance = builder_.newTemp();
+            builder_.emitRaw("    " + isInstance + " =w call $class_is_instance(l " + objPtr +
+                             ", l " + std::to_string(resolvedArms[i].classId) + ")\n");
+
+            builder_.emitBranch(isInstance,
+                               "match_arm_" + std::to_string(matchId) + "_" + std::to_string(i),
+                               checkLabels[i].substr(1));
+
+        } else if (resolvedArms[i].isUDTSpecific) {
+            // --- UDT-specific match: CASE UDTName ---
+            // UDTs are value types — they cannot currently be stored in
+            // LIST OF ANY atoms, so this arm can only match when used
+            // with a statically-typed expression.  For LIST OF ANY
+            // iteration, this arm will never fire (the tag will never
+            // match).  Emit a comment and fall through to next check.
+            //
+            // Future: When variant/tagged-union support is added, UDT
+            // matching will use a type ID comparison here.
+            builder_.emitComment("CASE " + resolvedArms[i].udtName +
+                                 " — UDT static type match (skipped for LIST OF ANY)");
+
+            // For now, UDT match in a FOR EACH context never fires.
+            // Jump directly to the next check label.
+            builder_.emitJump(checkLabels[i].substr(1));
+
+        } else {
+            // --- Basic type or generic OBJECT match ---
+            // Compare type tag with arm's atom type tag
+            std::string isMatch = builder_.newTemp();
+            builder_.emitRaw("    " + isMatch + " =w ceqw " + typeTagVal + ", " +
+                             std::to_string(arm.atomTypeTag) + "\n");
+
+            builder_.emitBranch(isMatch, 
+                               "match_arm_" + std::to_string(matchId) + "_" + std::to_string(i),
+                               checkLabels[i].substr(1)); // strip leading @
+        }
+    }
+
+    // --- Emit each arm body ---
+    for (size_t i = 0; i < stmt->caseArms.size(); ++i) {
+        const auto& arm = stmt->caseArms[i];
+
+        builder_.emitLabel("match_arm_" + std::to_string(matchId) + "_" + std::to_string(i));
+        builder_.emitComment("CASE " + arm.typeKeyword + " " + arm.bindingVariable);
+
+        // --- Fused typed load into binding variable ---
+        // Allocate a stack slot for the binding variable
+        std::string bindAddr = builder_.newTemp();
+
+        if (arm.typeKeyword == "INTEGER") {
+            // Load as 32-bit integer (but atom stores 64-bit, so load l then truncate)
+            builder_.emitRaw("    " + bindAddr + " =l alloc4 4\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            std::string truncated = builder_.newTemp();
+            builder_.emitRaw("    " + truncated + " =w copy " + rawVal + "\n");
+            builder_.emitStore("w", truncated, bindAddr);
+
+            // Register the binding variable for this arm's scope
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::INTEGER;
+
+        } else if (arm.typeKeyword == "LONG") {
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::LONG;
+
+        } else if (arm.typeKeyword == "DOUBLE") {
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            // Bitcast raw 64-bit to double
+            std::string dblVal = builder_.newTemp();
+            builder_.emitRaw("    " + dblVal + " =d cast " + rawVal + "\n");
+            builder_.emitRaw("    stored " + dblVal + ", " + bindAddr + "\n");
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::DOUBLE;
+
+        } else if (arm.typeKeyword == "SINGLE") {
+            builder_.emitRaw("    " + bindAddr + " =l alloc4 4\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            std::string dblVal = builder_.newTemp();
+            builder_.emitRaw("    " + dblVal + " =d cast " + rawVal + "\n");
+            std::string sngVal = builder_.newTemp();
+            builder_.emitRaw("    " + sngVal + " =s truncd " + dblVal + "\n");
+            builder_.emitRaw("    stores " + sngVal + ", " + bindAddr + "\n");
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::SINGLE;
+
+        } else if (arm.typeKeyword == "STRING") {
+            // Load as pointer (StringDescriptor*)
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::STRING;
+
+        } else if (arm.typeKeyword == "LIST") {
+            // Load as pointer (ListHeader*)
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::OBJECT;
+
+        } else if (resolvedArms[i].isClassSpecific) {
+            // Specific CLASS instance — load as pointer (same as generic OBJECT
+            // but we register the class name so downstream method calls can
+            // resolve the correct ClassSymbol for virtual dispatch)
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::CLASS_INSTANCE;
+            // Store the class name so emitMethodCall / emitMemberAccess can
+            // resolve the correct ClassSymbol for virtual dispatch.
+            methodParamClassNames_[arm.bindingVariable] = resolvedArms[i].className;
+
+        } else if (resolvedArms[i].isUDTSpecific) {
+            // UDT match — allocate space for the full UDT value
+            // (Future: copy UDT data from variant storage)
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::USER_DEFINED;
+
+        } else {
+            // Generic OBJECT — load as pointer
+            builder_.emitRaw("    " + bindAddr + " =l alloc8 8\n");
+            std::string rawVal = builder_.newTemp();
+            builder_.emitRaw("    " + rawVal + " =l loadl " + rawValueAddr + "\n");
+            builder_.emitStore("l", rawVal, bindAddr);
+
+            globalVarAddresses_[arm.bindingVariable] = bindAddr;
+            forEachVarTypes_[arm.bindingVariable] = FasterBASIC::BaseType::OBJECT;
+        }
+
+        // Emit arm body statements (in direct-emit context so IF/FOR/etc.
+        // use inline labels instead of relying on CFG edges)
+        bool savedDirectEmit = inDirectEmitContext_;
+        inDirectEmitContext_ = true;
+        for (const auto& bodyStmt : arm.body) {
+            emitStatement(bodyStmt.get());
+        }
+        inDirectEmitContext_ = savedDirectEmit;
+
+        // Clean up binding variable from scope
+        globalVarAddresses_.erase(arm.bindingVariable);
+        forEachVarTypes_.erase(arm.bindingVariable);
+        // Clean up class name mapping if we registered one for this arm
+        if (resolvedArms[i].isClassSpecific) {
+            methodParamClassNames_.erase(arm.bindingVariable);
+        }
+
+        // Jump to end of MATCH TYPE
+        builder_.emitJump("match_end_" + std::to_string(matchId));
+    }
+
+    // --- Emit CASE ELSE body ---
+    if (!stmt->caseElseBody.empty()) {
+        builder_.emitLabel("match_else_" + std::to_string(matchId));
+        builder_.emitComment("CASE ELSE");
+        bool savedDirectEmit2 = inDirectEmitContext_;
+        inDirectEmitContext_ = true;
+        for (const auto& s : stmt->caseElseBody) {
+            emitStatement(s.get());
+        }
+        inDirectEmitContext_ = savedDirectEmit2;
+        builder_.emitJump("match_end_" + std::to_string(matchId));
+    }
+
+    // --- End label ---
+    builder_.emitLabel("match_end_" + std::to_string(matchId));
+    builder_.emitComment("=== END MATCH ===");
 }
 
 void ASTEmitter::emitCallStatement(const CallStatement* stmt) {
@@ -4282,6 +5106,27 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
                         if (objDesc) {
                             const FasterBASIC::MethodSignature* method = objDesc->findMethod(methodExpr->methodName);
                             if (method) {
+                                // For LIST methods, override the registry default return type
+                                // based on the list's element type (same logic as emitMethodCall)
+                                if (objectTypeDesc.isList()) {
+                                    std::string upperMeth = methodExpr->methodName;
+                                    std::transform(upperMeth.begin(), upperMeth.end(), upperMeth.begin(), ::toupper);
+                                    FasterBASIC::BaseType listElem = objectTypeDesc.listElementType();
+                                    if (upperMeth == "HEAD" || upperMeth == "GET" || upperMeth == "SHIFT" || upperMeth == "POP") {
+                                        if (listElem == FasterBASIC::BaseType::DOUBLE || listElem == FasterBASIC::BaseType::SINGLE) {
+                                            return FasterBASIC::BaseType::DOUBLE;
+                                        } else if (listElem == FasterBASIC::BaseType::STRING || listElem == FasterBASIC::BaseType::UNICODE) {
+                                            return FasterBASIC::BaseType::STRING;
+                                        } else if (listElem == FasterBASIC::BaseType::OBJECT) {
+                                            return FasterBASIC::BaseType::LONG;
+                                        }
+                                        // else: default INTEGER/LONG from registry
+                                    } else if (upperMeth == "JOIN") {
+                                        return FasterBASIC::BaseType::STRING;
+                                    } else if (upperMeth == "REST" || upperMeth == "COPY" || upperMeth == "REVERSE") {
+                                        return FasterBASIC::BaseType::LONG; // ListHeader pointer
+                                    }
+                                }
                                 return method->returnType;
                             }
                         }
@@ -4320,6 +5165,37 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
                     }
                 }
             }
+            // --- MATCH TYPE binding variable fallback ---
+            // Binding variables created by MATCH TYPE CASE arms (e.g.
+            // CASE Dog d) are registered in forEachVarTypes_ with
+            // CLASS_INSTANCE type and in methodParamClassNames_ with the
+            // class name.  Resolve the return type from the ClassSymbol.
+            if (methodExpr->object->getType() == ASTNodeType::EXPR_VARIABLE) {
+                const auto* varExpr2 = static_cast<const VariableExpression*>(methodExpr->object.get());
+                auto feTypeIt = forEachVarTypes_.find(varExpr2->name);
+                if (feTypeIt != forEachVarTypes_.end() &&
+                    feTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                    const FasterBASIC::ClassSymbol* cls = nullptr;
+                    auto cnIt = methodParamClassNames_.find(varExpr2->name);
+                    if (cnIt != methodParamClassNames_.end()) {
+                        cls = semantic_.getSymbolTable().lookupClass(cnIt->second);
+                    }
+                    if (!cls) {
+                        for (const auto& pair : semantic_.getSymbolTable().classes) {
+                            if (pair.second.findMethod(methodExpr->methodName)) {
+                                cls = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                    if (cls) {
+                        const auto* mi = cls->findMethod(methodExpr->methodName);
+                        if (mi) {
+                            return mi->returnType.baseType;
+                        }
+                    }
+                }
+            }
             
             return BaseType::UNKNOWN;
         }
@@ -4354,6 +5230,29 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
                     }
                     if (varSymbol && varSymbol->typeDesc.isClassType) {
                         classSym = semantic_.getSymbolTable().lookupClass(varSymbol->typeDesc.className);
+                    }
+                    // --- MATCH TYPE binding variable fallback ---
+                    // Binding variables created by MATCH TYPE CASE arms (e.g.
+                    // CASE Dog d) are registered in forEachVarTypes_ with
+                    // CLASS_INSTANCE type and in methodParamClassNames_ with
+                    // the class name.  Resolve the field type from ClassSymbol.
+                    if (!classSym) {
+                        auto feTypeIt = forEachVarTypes_.find(varExpr->name);
+                        if (feTypeIt != forEachVarTypes_.end() &&
+                            feTypeIt->second == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                            auto cnIt = methodParamClassNames_.find(varExpr->name);
+                            if (cnIt != methodParamClassNames_.end()) {
+                                classSym = semantic_.getSymbolTable().lookupClass(cnIt->second);
+                            }
+                            if (!classSym) {
+                                for (const auto& pair : semantic_.getSymbolTable().classes) {
+                                    if (pair.second.findField(memberExpr->memberName)) {
+                                        classSym = &pair.second;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 
@@ -4787,21 +5686,116 @@ void ASTEmitter::preAllocateForEachSlots(const ForInStatement* stmt) {
 
     const auto& symbolTable = semantic_.getSymbolTable();
 
-    // --- Detect HASHMAP vs ARRAY ---
+    // --- Detect HASHMAP vs LIST vs ARRAY ---
     bool isHashmap = false;
+    bool isList = false;
+    FasterBASIC::BaseType listElemType = FasterBASIC::BaseType::UNKNOWN;
     {
         std::string currentFunc = symbolMapper_.getCurrentFunction();
         const auto* varSym = semantic_.lookupVariableScoped(collectionName, currentFunc);
-        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT &&
-            varSym->typeDesc.objectTypeName == "HASHMAP") {
-            isHashmap = true;
+        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT) {
+            if (varSym->typeDesc.objectTypeName == "HASHMAP") {
+                isHashmap = true;
+            } else if (varSym->typeDesc.objectTypeName == "LIST") {
+                isList = true;
+                listElemType = varSym->typeDesc.listElementType();
+            }
         }
     }
 
     builder_.emitComment("Pre-alloc FOR EACH slots for: " + stmt->variable +
-                         (isHashmap ? " (hashmap)" : " (array)"));
+                         (isHashmap ? " (hashmap)" : (isList ? " (list)" : " (array)")));
 
-    if (isHashmap) {
+    if (isList) {
+        // =================================================================
+        // LIST iteration — cursor-based (linked list traversal)
+        // =================================================================
+        forEachIsList_.insert(stmt->variable);
+
+        // Determine element type for typed lists
+        FasterBASIC::BaseType elemType = listElemType;
+        bool isListOfAny = (elemType == FasterBASIC::BaseType::UNKNOWN);
+
+        // cursor pointer (l) — pointer to current ListAtom
+        std::string cursorVar = "__foreach_cursor_" + stmt->variable;
+        std::string cursorAddr = builder_.newTemp();
+        builder_.emitRaw("    " + cursorAddr + " =l alloc8 8\n");
+        builder_.emitStore("l", "0", cursorAddr);
+        forLoopTempAddresses_[cursorVar] = cursorAddr;
+
+        // idx (w) — 1-based index counter (always needed for condition)
+        std::string idxAddr = builder_.newTemp();
+        builder_.emitRaw("    " + idxAddr + " =l alloc4 4\n");
+        builder_.emitStore("w", "0", idxAddr);
+        forLoopTempAddresses_[idxVarKey] = idxAddr;
+
+        // element value slot (l = 8 bytes, covers int64/double/pointer)
+        std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+        std::string slotAddr = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l alloc8 8\n");
+        builder_.emitStore("l", "0", slotAddr);
+        forLoopTempAddresses_[varSlotKey] = slotAddr;
+
+        // For LIST OF ANY with two-variable form: T = type tag, E = element value
+        // For typed lists with two-variable form: A = element, B = index
+        if (isListOfAny) {
+            // Single variable gets raw 64-bit value
+            globalVarAddresses_[stmt->variable] = slotAddr;
+            if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::DOUBLE;
+            } else if (elemType == FasterBASIC::BaseType::STRING) {
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::STRING;
+            } else {
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::LONG;
+            }
+
+            if (!stmt->indexVariable.empty()) {
+                // Two-variable LIST OF ANY: T (type tag), E (element)
+                // First variable = type tag (w, integer)
+                std::string typeSlotKey = "__foreach_type_" + stmt->variable;
+                std::string typeSlotAddr = builder_.newTemp();
+                builder_.emitRaw("    " + typeSlotAddr + " =l alloc4 4\n");
+                builder_.emitStore("w", "0", typeSlotAddr);
+                forLoopTempAddresses_[typeSlotKey] = typeSlotAddr;
+                globalVarAddresses_[stmt->variable] = typeSlotAddr;
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::INTEGER;
+
+                // Second variable = element value (l, raw 64-bit)
+                std::string elemSlotKey = "__foreach_slot_" + stmt->indexVariable;
+                std::string elemSlotAddr = builder_.newTemp();
+                builder_.emitRaw("    " + elemSlotAddr + " =l alloc8 8\n");
+                builder_.emitStore("l", "0", elemSlotAddr);
+                forLoopTempAddresses_[elemSlotKey] = elemSlotAddr;
+                globalVarAddresses_[stmt->indexVariable] = elemSlotAddr;
+                forEachVarTypes_[stmt->indexVariable] = FasterBASIC::BaseType::LONG;
+            }
+        } else {
+            // Typed list — element variable gets the correct type
+            globalVarAddresses_[stmt->variable] = slotAddr;
+            if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::DOUBLE;
+            } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE) {
+                forEachVarTypes_[stmt->variable] = FasterBASIC::BaseType::STRING;
+            } else {
+                forEachVarTypes_[stmt->variable] = elemType;
+            }
+
+            // Two-variable typed list: A = element, B = index
+            if (!stmt->indexVariable.empty()) {
+                std::string idxSlotKey = "__foreach_slot_" + stmt->indexVariable;
+                std::string idxSlot = builder_.newTemp();
+                builder_.emitRaw("    " + idxSlot + " =l alloc4 4\n");
+                builder_.emitStore("w", "0", idxSlot);
+                forLoopTempAddresses_[idxSlotKey] = idxSlot;
+                globalVarAddresses_[stmt->indexVariable] = idxSlot;
+                forEachVarTypes_[stmt->indexVariable] = FasterBASIC::BaseType::INTEGER;
+            }
+        }
+
+        // Store the list element type for later use in body preamble
+        forEachListElemType_[stmt->variable] = elemType;
+
+    } else if (isHashmap) {
         // idx (0-based index, w)
         std::string idxAddr = builder_.newTemp();
         builder_.emitRaw("    " + idxAddr + " =l alloc4 4");
@@ -4924,16 +5918,18 @@ void ASTEmitter::emitForEachInit(const ForInStatement* stmt) {
 
     const auto& symbolTable = semantic_.getSymbolTable();
 
-    // --- Detect HASHMAP vs ARRAY ---
-    // Check if the collection is a HASHMAP (OBJECT type) by looking in the
-    // variable symbol table rather than the arrays table.
+    // --- Detect HASHMAP vs LIST vs ARRAY ---
     bool isHashmap = false;
+    bool isList = false;
     {
         std::string currentFunc = symbolMapper_.getCurrentFunction();
         const auto* varSym = semantic_.lookupVariableScoped(collectionName, currentFunc);
-        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT &&
-            varSym->typeDesc.objectTypeName == "HASHMAP") {
-            isHashmap = true;
+        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT) {
+            if (varSym->typeDesc.objectTypeName == "HASHMAP") {
+                isHashmap = true;
+            } else if (varSym->typeDesc.objectTypeName == "LIST") {
+                isList = true;
+            }
         }
     }
 
@@ -4943,7 +5939,54 @@ void ASTEmitter::emitForEachInit(const ForInStatement* stmt) {
     bool slotsPreAllocated = forLoopTempAddresses_.find(
         "__foreach_idx_" + stmt->variable) != forLoopTempAddresses_.end();
 
-    if (isHashmap) {
+    if (isList) {
+        // =================================================================
+        // LIST iteration — cursor-based (linked list traversal)
+        // =================================================================
+        forEachIsList_.insert(stmt->variable);
+
+        builder_.emitComment("FOR EACH over LIST: " + collectionName);
+
+        // Load the list header pointer
+        std::string listPtr = loadVariable(collectionName);
+
+        // Call list_iter_begin(header) to get the first atom (cursor)
+        std::string cursor = builder_.newTemp();
+        builder_.emitCall(cursor, "l", "list_iter_begin", "l " + listPtr);
+
+        if (slotsPreAllocated) {
+            // Store initial cursor
+            std::string cursorAddr = forLoopTempAddresses_["__foreach_cursor_" + stmt->variable];
+            builder_.emitStore("l", cursor, cursorAddr);
+
+            // Initialize index to 1 (1-based)
+            std::string idxAddr = forLoopTempAddresses_["__foreach_idx_" + stmt->variable];
+            builder_.emitStore("w", "1", idxAddr);
+        } else {
+            // Fallback: inline allocs
+            std::string cursorVar = "__foreach_cursor_" + stmt->variable;
+            std::string cursorAddr = builder_.newTemp();
+            builder_.emitRaw("    " + cursorAddr + " =l alloc8 8\n");
+            builder_.emitStore("l", cursor, cursorAddr);
+            forLoopTempAddresses_[cursorVar] = cursorAddr;
+
+            std::string idxAddr = builder_.newTemp();
+            builder_.emitRaw("    " + idxAddr + " =l alloc4 4\n");
+            builder_.emitStore("w", "1", idxAddr);
+            forLoopTempAddresses_["__foreach_idx_" + stmt->variable] = idxAddr;
+
+            // Element slot
+            std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+            if (forLoopTempAddresses_.find(varSlotKey) == forLoopTempAddresses_.end()) {
+                std::string slotAddr = builder_.newTemp();
+                builder_.emitRaw("    " + slotAddr + " =l alloc8 8\n");
+                builder_.emitStore("l", "0", slotAddr);
+                forLoopTempAddresses_[varSlotKey] = slotAddr;
+                globalVarAddresses_[stmt->variable] = slotAddr;
+            }
+        }
+
+    } else if (isHashmap) {
         // =================================================================
         // HASHMAP iteration
         // =================================================================
@@ -5126,6 +6169,20 @@ void ASTEmitter::emitForEachInit(const ForInStatement* stmt) {
 }
 
 std::string ASTEmitter::emitForEachCondition(const ForInStatement* stmt) {
+    // --- LIST iteration: cursor != NULL ---
+    if (forEachIsList_.count(stmt->variable)) {
+        std::string cursorVar = "__foreach_cursor_" + stmt->variable;
+        std::string cursorAddr = forLoopTempAddresses_[cursorVar];
+        
+        std::string cursor = builder_.newTemp();
+        builder_.emitRaw("    " + cursor + " =l loadl " + cursorAddr + "\n");
+        
+        // Condition: cursor != 0 (NULL)
+        std::string cond = builder_.newTemp();
+        builder_.emitRaw("    " + cond + " =w cnel " + cursor + ", 0\n");
+        return cond;
+    }
+
     std::string idxVar  = "__foreach_idx_" + stmt->variable;
     std::string ubVar   = "__foreach_ub_"  + stmt->variable;
 
@@ -5155,6 +6212,33 @@ std::string ASTEmitter::emitForEachCondition(const ForInStatement* stmt) {
 
 void ASTEmitter::emitForEachIncrement(const ForInStatement* stmt) {
     clearArrayElementCache();
+
+    // --- LIST iteration: advance cursor to next atom ---
+    if (forEachIsList_.count(stmt->variable)) {
+        std::string cursorVar = "__foreach_cursor_" + stmt->variable;
+        std::string cursorAddr = forLoopTempAddresses_[cursorVar];
+        
+        // Load current cursor
+        std::string cursor = builder_.newTemp();
+        builder_.emitRaw("    " + cursor + " =l loadl " + cursorAddr + "\n");
+        
+        // Advance: next = list_iter_next(cursor)
+        std::string nextCursor = builder_.newTemp();
+        builder_.emitCall(nextCursor, "l", "list_iter_next", "l " + cursor);
+        builder_.emitStore("l", nextCursor, cursorAddr);
+        
+        // Increment index counter
+        std::string idxVar  = "__foreach_idx_" + stmt->variable;
+        std::string idxAddr = forLoopTempAddresses_[idxVar];
+        std::string idx = builder_.newTemp();
+        builder_.emitRaw("    " + idx + " =w loadw " + idxAddr + "\n");
+        std::string nextIdx = builder_.newTemp();
+        builder_.emitRaw("    " + nextIdx + " =w add " + idx + ", 1\n");
+        builder_.emitStore("w", nextIdx, idxAddr);
+        
+        return;
+    }
+
     std::string idxVar  = "__foreach_idx_" + stmt->variable;
     std::string idxAddr = forLoopTempAddresses_[idxVar];
 
@@ -5169,6 +6253,95 @@ void ASTEmitter::emitForEachIncrement(const ForInStatement* stmt) {
 
 void ASTEmitter::emitForEachBodyPreamble(const ForInStatement* stmt) {
     clearArrayElementCache();
+
+    // --- LIST iteration: load element from current cursor ---
+    if (forEachIsList_.count(stmt->variable)) {
+        std::string cursorVar = "__foreach_cursor_" + stmt->variable;
+        std::string cursorAddr = forLoopTempAddresses_[cursorVar];
+        
+        // Load current cursor (ListAtom pointer)
+        std::string cursor = builder_.newTemp();
+        builder_.emitRaw("    " + cursor + " =l loadl " + cursorAddr + "\n");
+        
+        // Determine list element type
+        FasterBASIC::BaseType elemType = FasterBASIC::BaseType::UNKNOWN;
+        auto eit = forEachListElemType_.find(stmt->variable);
+        if (eit != forEachListElemType_.end()) {
+            elemType = eit->second;
+        }
+        
+        bool isListOfAny = (elemType == FasterBASIC::BaseType::UNKNOWN);
+        
+        if (isListOfAny && !stmt->indexVariable.empty()) {
+            // Two-variable LIST OF ANY: T = type tag, E = element value
+            builder_.emitComment("LIST OF ANY: load type tag + element value");
+            
+            // Load type tag: list_iter_type(cursor)
+            std::string typeTag = builder_.newTemp();
+            builder_.emitCall(typeTag, "w", "list_iter_type", "l " + cursor);
+            
+            // Store type tag in first variable slot (T)
+            std::string typeSlotKey = "__foreach_type_" + stmt->variable;
+            auto typeIt = forLoopTempAddresses_.find(typeSlotKey);
+            if (typeIt != forLoopTempAddresses_.end()) {
+                builder_.emitStore("w", typeTag, typeIt->second);
+            }
+            
+            // Load raw 64-bit value: list_iter_value_int(cursor)
+            std::string rawVal = builder_.newTemp();
+            builder_.emitCall(rawVal, "l", "list_iter_value_int", "l " + cursor);
+            
+            // Store element value in second variable slot (E)
+            std::string elemSlotKey = "__foreach_slot_" + stmt->indexVariable;
+            auto elemIt = forLoopTempAddresses_.find(elemSlotKey);
+            if (elemIt != forLoopTempAddresses_.end()) {
+                builder_.emitStore("l", rawVal, elemIt->second);
+            }
+        } else {
+            // Single variable or typed list: load element value directly
+            std::string elemVal;
+            
+            if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                elemVal = builder_.newTemp();
+                builder_.emitCall(elemVal, "d", "list_iter_value_float", "l " + cursor);
+            } else if (elemType == FasterBASIC::BaseType::STRING || elemType == FasterBASIC::BaseType::UNICODE ||
+                       elemType == FasterBASIC::BaseType::OBJECT) {
+                elemVal = builder_.newTemp();
+                builder_.emitCall(elemVal, "l", "list_iter_value_ptr", "l " + cursor);
+            } else {
+                // Integer types or LIST OF ANY single-variable
+                elemVal = builder_.newTemp();
+                builder_.emitCall(elemVal, "l", "list_iter_value_int", "l " + cursor);
+            }
+            
+            // Store element value in the loop variable slot
+            std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+            auto slotIt = forLoopTempAddresses_.find(varSlotKey);
+            if (slotIt != forLoopTempAddresses_.end()) {
+                if (elemType == FasterBASIC::BaseType::DOUBLE || elemType == FasterBASIC::BaseType::SINGLE) {
+                    builder_.emitRaw("    stored " + elemVal + ", " + slotIt->second + "\n");
+                } else {
+                    builder_.emitStore("l", elemVal, slotIt->second);
+                }
+            }
+            
+            // If two-variable typed list: store index in second variable
+            if (!stmt->indexVariable.empty() && !isListOfAny) {
+                std::string idxVar  = "__foreach_idx_" + stmt->variable;
+                std::string idxAddr = forLoopTempAddresses_[idxVar];
+                std::string idxVal = builder_.newTemp();
+                builder_.emitRaw("    " + idxVal + " =w loadw " + idxAddr + "\n");
+                
+                std::string idxSlotKey = "__foreach_slot_" + stmt->indexVariable;
+                auto idxSlotIt = forLoopTempAddresses_.find(idxSlotKey);
+                if (idxSlotIt != forLoopTempAddresses_.end()) {
+                    builder_.emitStore("w", idxVal, idxSlotIt->second);
+                }
+            }
+        }
+        
+        return;
+    }
 
     // --- Load current index ---
     std::string idxVar  = "__foreach_idx_" + stmt->variable;
@@ -5298,6 +6471,12 @@ void ASTEmitter::emitForEachBodyPreamble(const ForInStatement* stmt) {
 }
 
 void ASTEmitter::emitForEachCleanup(const ForInStatement* stmt) {
+    // LIST iteration needs no cleanup (SAMM handles list lifetime)
+    if (forEachIsList_.count(stmt->variable)) {
+        builder_.emitComment("FOR EACH LIST cleanup (SAMM-managed, no-op)");
+        return;
+    }
+    
     // Only hashmap iteration needs cleanup (free the keys array)
     if (!forEachIsHashmap_.count(stmt->variable)) {
         return;

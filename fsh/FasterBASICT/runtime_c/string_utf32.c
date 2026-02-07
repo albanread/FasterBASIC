@@ -490,6 +490,12 @@ void string_release(StringDescriptor* str) {
     str->refcount--;
     
     if (str->refcount <= 0) {
+        // Untrack from SAMM before freeing so that SAMM's scope-exit
+        // cleanup won't try to string_release() an already-freed
+        // descriptor.  When called *from* SAMM cleanup the pointer has
+        // already been moved out of the scope, so samm_untrack is a
+        // harmless no-op.
+        samm_untrack(str);
         if (str->data) {
             free(str->data);
         }
@@ -1620,7 +1626,9 @@ StringDescriptor* string_mid_assign(StringDescriptor* str, int64_t pos, int64_t 
     
     new_str->length = new_length;
     
-    // Free old string
+    // Free old string — untrack from SAMM first so it won't try to
+    // string_release() an already-freed descriptor at scope exit.
+    samm_untrack(str);
     if (str->data) {
         free(str->data);
     }

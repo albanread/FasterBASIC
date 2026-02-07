@@ -142,6 +142,7 @@ FBCQBE compiles FasterBASIC programs to native machine code through the QBE (Qui
 - **DEF FN**: Complete implementation with proper typing
 - **Arrays**: Full runtime integration for multi-dimensional arrays and numeric types
 - **String operations**: Advanced string functions (LEN, MID, INSTR, etc.)
+- **LIST type**: Linked-list collection with typed and heterogeneous variants
 
 ### 📋 Planned
 
@@ -474,6 +475,89 @@ PRINT numbers%(1)  ' Still 100
 PRINT numbers%(2)  ' Still 200
 END
 ```
+
+### Linked Lists (LIST)
+
+```basic
+OPTION SAMM ON
+
+' Typed lists — element type is known at compile time
+DIM nums AS LIST OF INTEGER = LIST(10, 20, 30)
+DIM words AS LIST OF STRING = LIST("hello", "world")
+
+' Basic operations
+nums.APPEND(40)
+nums.PREPEND(5)
+PRINT "Length: "; nums.LENGTH()
+PRINT "Head: "; nums.HEAD()
+PRINT "Get(2): "; nums.GET(2)
+
+' Subscript sugar — myList(n) is shorthand for myList.GET(n)
+PRINT "nums(3): "; nums(3)
+
+' Removal
+DIM first% = nums.SHIFT()    ' Remove and return first element
+DIM last%  = nums.POP()      ' Remove and return last element
+nums.REMOVE(2)                ' Remove element at position 2
+
+' Search
+PRINT "Contains 20: "; nums.CONTAINS(20)
+PRINT "IndexOf 20: "; nums.INDEXOF(20)
+
+' String list operations
+DIM joined$ = words.JOIN(", ")
+PRINT "Joined: "; joined$
+
+' Iteration with FOR EACH
+FOR EACH elem IN nums
+    PRINT elem; " ";
+NEXT elem
+
+' Iteration with index
+FOR EACH val, idx IN nums
+    PRINT "Index "; idx; ": "; val
+NEXT val
+
+' Copy and reverse (return new lists)
+DIM rev AS LIST OF INTEGER = nums.REVERSE()
+DIM dup AS LIST OF INTEGER = nums.COPY()
+
+' ERASE frees a list and sets the variable to null
+ERASE nums
+END
+```
+
+### MATCH TYPE (Safe Type Dispatch)
+
+```basic
+OPTION SAMM ON
+
+' LIST OF ANY holds elements of mixed types
+DIM mixed AS LIST OF ANY = LIST(42, "hello", 3.14)
+
+' MATCH TYPE safely dispatches on element type
+' The compiler fuses the type check and typed load — no way to mismatch
+FOR EACH T, E IN mixed
+    MATCH TYPE E
+        CASE INTEGER n%
+            PRINT "Int: "; n%
+        CASE STRING s$
+            PRINT "Str: "; s$
+        CASE DOUBLE f#
+            PRINT "Flt: "; f#
+        CASE ELSE
+            PRINT "Other type"
+    END MATCH
+NEXT T
+END
+```
+
+**MATCH TYPE guarantees:**
+- Binding variable type always matches the CASE arm (compiler-enforced)
+- No `AS` casts needed — the typed load is fused into each arm
+- Duplicate type arms are a compile-time error
+- Binding variables are scoped to their arm (no leaking)
+- Zero runtime overhead vs. manual `SELECT CASE` + `AS`
 
 ## Control Flow Graph (CFG)
 

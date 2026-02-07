@@ -130,6 +130,16 @@ FOR EACH item IN array()
   PRINT item
 NEXT
 
+' FOR EACH on HashMap (Keys)
+FOR EACH key IN map
+  PRINT key; " -> "; map(key)
+NEXT
+
+' FOR EACH on HashMap (Key, Value)
+FOR k, v IN map
+  PRINT k; " = "; v
+NEXT
+
 ' WHILE loop
 WHILE condition
   ' statements
@@ -291,6 +301,43 @@ ERR()  ' Error code
 ERL()  ' Error line
 ```
 
+## Lists & Pattern Matching
+
+```basic
+' List Declaration
+DIM nums AS LIST OF INTEGER
+DIM mixed AS LIST OF ANY
+
+' Initialization
+DIM primes AS LIST OF INTEGER = LIST(2, 3, 5, 7)
+
+' List Operations
+nums.APPEND(10)
+nums.PREPEND(5)
+x = nums.POP()      ' Remove last
+y = nums.SHIFT()    ' Remove first
+len = nums.LENGTH()
+val = nums.GET(1)   ' 1-based index (method)
+val = nums(1)       ' 1-based index (shorthand)
+isEmpty = nums.EMPTY()
+head = nums.HEAD()  ' First element
+idx = nums.INDEXOF(10)
+hasVal = nums.CONTAINS(10)
+ERASE nums          ' Clear/Delete list
+
+' Pattern Matching (Type Switching)
+FOR EACH item IN mixed
+  MATCH TYPE item
+    CASE INTEGER n%
+      PRINT "Int: "; n%
+    CASE STRING s$
+      PRINT "String: "; s$
+    CASE ELSE
+      PRINT "Other type"
+  END MATCH
+NEXT
+```
+
 ## User-Defined Types
 
 ```basic
@@ -303,6 +350,50 @@ DIM p AS Point
 p.X = 10
 p.Y = 20
 PRINT p.X, p.Y
+```
+
+## Object-Oriented Programming
+
+```basic
+CLASS Animal
+  Name AS STRING
+  CONSTRUCTOR(n$)
+    ME.Name = n$
+  END CONSTRUCTOR
+  METHOD Speak()
+    PRINT ME.Name; " makes a sound."
+  END METHOD
+END CLASS
+
+CLASS Dog INHERITS Animal
+  METHOD Speak()
+    PRINT ME.Name; " says Woof!"
+  END METHOD
+END CLASS
+
+DIM d AS Dog = NEW Dog("Rex")
+d.Speak()
+```
+
+## HashMaps
+
+```basic
+DIM map AS HASHMAP
+map("key") = "value"
+map("user") = "Alice"
+
+PRINT map("key")
+map("key") = "new value"
+```
+
+## Plugins
+
+```basic
+' Plugins in 'plugins/enabled/' are auto-loaded.
+' You can call their commands directly.
+
+' Example (assuming math plugin is loaded):
+' DIM result = MY_PLUGIN_FUNC(10)
 ```
 
 ## Data Statements

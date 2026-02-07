@@ -145,6 +145,16 @@ struct TypeDescriptor {
         return desc;
     }
     
+    // Factory: create a LIST type descriptor with optional element type
+    // LIST OF INTEGER  → makeList(BaseType::INTEGER)
+    // LIST OF STRING   → makeList(BaseType::STRING)
+    // LIST OF ANY      → makeList()  or  makeList(BaseType::UNKNOWN)
+    static TypeDescriptor makeList(BaseType elemType = BaseType::UNKNOWN) {
+        TypeDescriptor desc = makeObject("LIST");
+        desc.elementType = elemType;
+        return desc;
+    }
+    
     // Factory: create a CLASS instance type descriptor
     static TypeDescriptor makeClassInstance(const std::string& clsName) {
         TypeDescriptor desc(BaseType::CLASS_INSTANCE);
@@ -165,6 +175,20 @@ struct TypeDescriptor {
     bool isUserDefined() const { return baseType == BaseType::USER_DEFINED; }
     bool isObject() const { return baseType == BaseType::OBJECT; }
     bool isClassInstance() const { return baseType == BaseType::CLASS_INSTANCE || isClassType; }
+    
+    // LIST type predicates
+    bool isList() const {
+        return baseType == BaseType::OBJECT && objectTypeName == "LIST";
+    }
+    bool isTypedList() const {
+        return isList() && elementType != BaseType::UNKNOWN;
+    }
+    bool isHeterogeneousList() const {
+        return isList() && elementType == BaseType::UNKNOWN;
+    }
+    BaseType listElementType() const {
+        return isList() ? elementType : BaseType::UNKNOWN;
+    }
     
     bool isInteger() const {
         return baseType == BaseType::BYTE || baseType == BaseType::UBYTE ||
@@ -450,6 +474,8 @@ inline TypeDescriptor keywordToDescriptor(TokenType keyword) {
             return TypeDescriptor(BaseType::ULONG);
         case TokenType::KEYWORD_HASHMAP:
             return TypeDescriptor::makeObject("HASHMAP");
+        case TokenType::KEYWORD_LIST:
+            return TypeDescriptor::makeList();  // LIST OF ANY by default
         default:
             return TypeDescriptor(BaseType::UNKNOWN);
     }

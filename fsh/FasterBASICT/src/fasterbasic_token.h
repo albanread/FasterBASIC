@@ -63,9 +63,11 @@ enum class TokenType {
     SELECT,          // SELECT
     OF,              // OF
     WHEN,            // WHEN
-    IS,              // IS (for CASE IS expressions)
+    IS,              // IS
     OTHERWISE,       // OTHERWISE
     ENDCASE,         // ENDCASE
+    MATCH,           // MATCH (for MATCH TYPE statement)
+    ENDMATCH,        // END MATCH
     
     // Keywords - Exception Handling
     TRY,             // TRY (begin exception handling block)
@@ -127,6 +129,7 @@ enum class TokenType {
     KEYWORD_UINTEGER,   // UINTEGER (for AS declarations)
     KEYWORD_ULONG,      // ULONG (for AS declarations)
     KEYWORD_HASHMAP,    // HASHMAP (for AS declarations - dictionary/map type)
+    KEYWORD_LIST,       // LIST (for AS declarations - linked list type)
     
     // Keywords - Data
     DIM,             // DIM
@@ -275,11 +278,31 @@ enum class TokenType {
     AT_SUFFIX,       // @ (byte suffix)
 
     // Hashmap methods
-    HASKEY,          // HASKEY (hashmap.HASKEY method)
-    KEYS,            // KEYS (hashmap.KEYS method)
-    SIZE,            // SIZE (hashmap.SIZE method)
-    CLEAR,           // CLEAR (hashmap.CLEAR method)
-    REMOVE,          // REMOVE (hashmap.REMOVE method)
+    HASKEY,          // HASKEY (hashmap method)
+    KEYS,            // KEYS (hashmap/object method)
+    SIZE,            // SIZE (hashmap/object method)
+    CLEAR,           // CLEAR (hashmap/object method)
+    REMOVE,          // REMOVE (hashmap/object method)
+    
+    // List method keywords
+    APPEND,          // APPEND (list method)
+    PREPEND,         // PREPEND (list method)
+    HEAD,            // HEAD (list method)
+    TAIL,            // TAIL (list method — alias for REST)
+    REST,            // REST (list method)
+    LENGTH,          // LENGTH (list method)
+    EMPTY,           // EMPTY (list method)
+    CONTAINS,        // CONTAINS (list method)
+    INDEXOF,         // INDEXOF (list method)
+    JOIN,            // JOIN (list method)
+    COPY,            // COPY (list method)
+    REVERSE,         // REVERSE (list method)
+    SHIFT,           // SHIFT (list method)
+    POP,             // POP (list method)
+    EXTEND,          // EXTEND (list method)
+    INSERT,          // INSERT (list method)
+    GET,             // GET (list method)
+    TYPEOF_KW,       // TYPEOF (type query for LIST OF ANY)
 
     // Special
     USING,           // USING (for PRINT USING)
@@ -407,6 +430,8 @@ inline const char* tokenTypeToString(TokenType type) {
         case TokenType::IS: return "IS";
         case TokenType::OTHERWISE: return "OTHERWISE";
         case TokenType::ENDCASE: return "ENDCASE";
+        case TokenType::MATCH: return "MATCH";
+        case TokenType::ENDMATCH: return "END MATCH";
         case TokenType::TRY: return "TRY";
         case TokenType::CATCH: return "CATCH";
         case TokenType::FINALLY: return "FINALLY";
@@ -452,11 +477,30 @@ inline const char* tokenTypeToString(TokenType type) {
         case TokenType::KEYWORD_UINTEGER: return "UINTEGER";
         case TokenType::KEYWORD_ULONG: return "ULONG";
         case TokenType::KEYWORD_HASHMAP: return "HASHMAP";
+        case TokenType::KEYWORD_LIST: return "LIST";
         case TokenType::HASKEY: return "HASKEY";
         case TokenType::KEYS: return "KEYS";
         case TokenType::SIZE: return "SIZE";
         case TokenType::CLEAR: return "CLEAR";
         case TokenType::REMOVE: return "REMOVE";
+        case TokenType::APPEND: return "APPEND";
+        case TokenType::PREPEND: return "PREPEND";
+        case TokenType::HEAD: return "HEAD";
+        case TokenType::TAIL: return "TAIL";
+        case TokenType::REST: return "REST";
+        case TokenType::LENGTH: return "LENGTH";
+        case TokenType::EMPTY: return "EMPTY";
+        case TokenType::CONTAINS: return "CONTAINS";
+        case TokenType::INDEXOF: return "INDEXOF";
+        case TokenType::JOIN: return "JOIN";
+        case TokenType::COPY: return "COPY";
+        case TokenType::REVERSE: return "REVERSE";
+        case TokenType::SHIFT: return "SHIFT";
+        case TokenType::POP: return "POP";
+        case TokenType::EXTEND: return "EXTEND";
+        case TokenType::INSERT: return "INSERT";
+        case TokenType::GET: return "GET";
+        case TokenType::TYPEOF_KW: return "TYPEOF";
         case TokenType::DIM: return "DIM";
         case TokenType::REDIM: return "REDIM";
         case TokenType::ERASE: return "ERASE";

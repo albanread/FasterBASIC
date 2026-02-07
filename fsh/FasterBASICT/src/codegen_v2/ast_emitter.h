@@ -100,6 +100,13 @@ public:
      * Get the current CLASS context (may be nullptr if not inside a method)
      */
     const FasterBASIC::ClassSymbol* getCurrentClassContext() const { return currentClassContext_; }
+
+    /**
+     * Set/get the current FOR EACH statement whose body is being emitted.
+     * Used by MATCH TYPE to resolve which loop's slots to consult.
+     */
+    void setCurrentForEachStmt(const FasterBASIC::ForInStatement* stmt) { currentForEachStmt_ = stmt; }
+    const FasterBASIC::ForInStatement* getCurrentForEachStmt() const { return currentForEachStmt_; }
     
     /**
      * Set the return type for the current METHOD being emitted.
@@ -357,6 +364,12 @@ public:
     void emitEraseStatement(const FasterBASIC::EraseStatement* stmt);
     
     /**
+     * Emit MATCH TYPE statement (safe type dispatch for LIST OF ANY)
+     * @param stmt MATCH TYPE statement
+     */
+    void emitMatchTypeStatement(const FasterBASIC::MatchTypeStatement* stmt);
+    
+    /**
      * Emit LOCAL statement (local variable declaration in SUB/FUNCTION)
      * @param stmt LOCAL statement
      */
@@ -468,6 +481,18 @@ private:
     // the correct lowering (keys-array iteration vs array element access).
     std::unordered_set<std::string> forEachIsHashmap_;
 
+    // FOR EACH list tracking — set of primary loop variable names
+    // whose FOR EACH loop iterates over a LIST rather than an array.
+    // Used by emitForEachCondition / BodyPreamble / Increment to choose
+    // cursor-based linked list traversal.
+    std::unordered_set<std::string> forEachIsList_;
+
+    // FOR EACH list element type — maps loop variable name to the
+    // list's element BaseType (e.g. INTEGER for LIST OF INTEGER,
+    // UNKNOWN for LIST OF ANY). Used by body preamble to select
+    // the correct list_iter_value_* function.
+    std::unordered_map<std::string, FasterBASIC::BaseType> forEachListElemType_;
+
     // Shared bounds buffer for DIM/REDIM array statements.
     // Pre-allocated in the entry block so that alloc instructions
     // are never emitted in non-start blocks (QBE requirement).
@@ -494,6 +519,17 @@ private:
     // Tracks the current CLASS being emitted (for METHOD/CONSTRUCTOR/DESTRUCTOR bodies).
     // Used to resolve ME.Field accesses and ME.Method() calls to the correct class.
     const FasterBASIC::ClassSymbol* currentClassContext_ = nullptr;
+
+    // When true, IF/FOR/WHILE statements use direct inline emission instead of
+    // being delegated to CFG edges.  Set inside MATCH TYPE arm bodies where the
+    // CFG builder does not recurse into nested control flow.
+    bool inDirectEmitContext_ = false;
+
+    // Tracks the current FOR EACH statement whose body is being emitted.
+    // Set by the CFG emitter when entering a ForIn_Body block so that
+    // MATCH TYPE can determine which loop's slots to use (avoids
+    // confusion when multiple loops share the same variable name).
+    const FasterBASIC::ForInStatement* currentForEachStmt_ = nullptr;
     
     // === METHOD return type context ===
     // When emitting a METHOD body that has a return value, this is set to the
@@ -538,6 +574,7 @@ private:
     std::string emitFunctionCall(const FasterBASIC::FunctionCallExpression* expr);
     std::string emitIIFExpression(const FasterBASIC::IIFExpression* expr);
     std::string emitMethodCall(const FasterBASIC::MethodCallExpression* expr);
+    std::string emitListConstructor(const FasterBASIC::ListConstructorExpression* expr);
     
     // === Binary Operation Helpers ===
     

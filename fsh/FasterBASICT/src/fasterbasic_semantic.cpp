@@ -197,6 +197,14 @@ void SemanticAnalyzer::ensureConstantsLoaded() {
     m_constantsManager.clear();
     m_constantsManager.addPredefinedConstants();
     
+    // Register LIST type tag constants (match ATOM_* values in list_ops.h)
+    // These are used with FOR EACH T, E IN over LIST OF ANY
+    m_constantsManager.addConstant("LIST_TYPE_INT",    (int64_t)1);
+    m_constantsManager.addConstant("LIST_TYPE_FLOAT",  (int64_t)2);
+    m_constantsManager.addConstant("LIST_TYPE_STRING", (int64_t)3);
+    m_constantsManager.addConstant("LIST_TYPE_LIST",   (int64_t)4);
+    m_constantsManager.addConstant("LIST_TYPE_OBJECT", (int64_t)5);
+    
     // Register voice waveform constants (WAVE_SINE, WAVE_SQUARE, etc.)
 #ifdef FBRUNNER3_BUILD
     FBRunner3::VoiceRegistration::registerVoiceConstants(m_constantsManager);
@@ -517,6 +525,14 @@ void SemanticAnalyzer::collectDimStatementsRecursive(const std::vector<Statement
             case ASTNodeType::STMT_DO: {
                 const auto* doStmt = static_cast<const DoStatement*>(stmt.get());
                 collectDimStatementsRecursive(doStmt->body);
+                break;
+            }
+            case ASTNodeType::STMT_MATCH_TYPE: {
+                const auto* matchStmt = static_cast<const MatchTypeStatement*>(stmt.get());
+                for (const auto& arm : matchStmt->caseArms) {
+                    collectDimStatementsRecursive(arm.body);
+                }
+                collectDimStatementsRecursive(matchStmt->caseElseBody);
                 break;
             }
             default:
@@ -1470,6 +1486,14 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
         // Check if this is a scalar user-defined type declaration
         // DIM P AS Point (no dimensions) should create a variable, not an array
         if (arrayDim.dimensions.empty() && arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
+            // Skip this UDT/CLASS path for LIST types — they are handled below
+            // as built-in OBJECT types (like HASHMAP), not as user-defined types.
+            if (arrayDim.asTypeKeyword == TokenType::KEYWORD_LIST) {
+                // Fall through to the scalar variable declaration path below
+                // which handles KEYWORD_LIST via the makeList() factory.
+                goto handle_scalar_builtin;
+            }
+            
             // This is a scalar UDT or CLASS variable declaration (inside function or global)
             if (m_symbolTable.variables.find(arrayDim.name) != m_symbolTable.variables.end()) {
                 error(SemanticErrorType::ARRAY_REDECLARED,
@@ -1509,6 +1533,7 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
         
         // Check if this is a scalar variable of a built-in type
         // DIM x AS INTEGER or DIM x% (no dimensions) should create a variable, not an array
+        handle_scalar_builtin:
         if (arrayDim.dimensions.empty()) {
             // This is a scalar variable declaration
             if (m_symbolTable.variables.find(arrayDim.name) != m_symbolTable.variables.end()) {
@@ -1522,8 +1547,39 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
             TypeDescriptor typeDesc;
             
             // Infer type from suffix or explicit AS type
-            // Check asTypeKeyword first (for built-in types like HASHMAP, INTEGER, etc.)
-            if (arrayDim.hasAsType && arrayDim.asTypeKeyword != TokenType::UNKNOWN) {
+            // Check asTypeKeyword first (for built-in types like HASHMAP, LIST, INTEGER, etc.)
+            if (arrayDim.hasAsType && arrayDim.asTypeKeyword == TokenType::KEYWORD_LIST) {
+                // LIST type — parse asTypeName to determine element type
+                // asTypeName is "LIST" (bare) or "LIST OF <ELEMTYPE>"
+                std::string listSpec = arrayDim.asTypeName;
+                std::string upperSpec = listSpec;
+                std::transform(upperSpec.begin(), upperSpec.end(), upperSpec.begin(), ::toupper);
+                
+                if (upperSpec == "LIST" || upperSpec == "LIST OF ANY") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::UNKNOWN);
+                } else if (upperSpec == "LIST OF INTEGER" || upperSpec == "LIST OF INT") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::INTEGER);
+                } else if (upperSpec == "LIST OF LONG") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::LONG);
+                } else if (upperSpec == "LIST OF DOUBLE") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::DOUBLE);
+                } else if (upperSpec == "LIST OF SINGLE" || upperSpec == "LIST OF FLOAT") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::SINGLE);
+                } else if (upperSpec == "LIST OF STRING") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::STRING);
+                } else if (upperSpec == "LIST OF LIST") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::OBJECT);
+                } else if (upperSpec == "LIST OF HASHMAP") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::OBJECT);
+                } else if (upperSpec == "LIST OF BYTE") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::BYTE);
+                } else if (upperSpec == "LIST OF SHORT") {
+                    typeDesc = TypeDescriptor::makeList(BaseType::SHORT);
+                } else {
+                    // Default: LIST OF ANY
+                    typeDesc = TypeDescriptor::makeList(BaseType::UNKNOWN);
+                }
+            } else if (arrayDim.hasAsType && arrayDim.asTypeKeyword != TokenType::UNKNOWN) {
                 // Use keywordToDescriptor to get correct type from keyword token
                 typeDesc = keywordToDescriptor(arrayDim.asTypeKeyword);
             } else if (arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
@@ -2233,6 +2289,28 @@ void SemanticAnalyzer::validateStatement(const Statement& stmt) {
         case ASTNodeType::STMT_RETURN:
             validateReturnStatement(static_cast<const ReturnStatement&>(stmt));
             break;
+        case ASTNodeType::STMT_MATCH_TYPE: {
+            const MatchTypeStatement& matchStmt = static_cast<const MatchTypeStatement&>(stmt);
+            // Validate the match expression
+            if (matchStmt.matchExpression) {
+                validateExpression(*matchStmt.matchExpression);
+            }
+            // Validate statements inside each CASE arm
+            for (const auto& arm : matchStmt.caseArms) {
+                for (const auto& armStmt : arm.body) {
+                    if (armStmt) {
+                        validateStatement(*armStmt);
+                    }
+                }
+            }
+            // Validate statements inside CASE ELSE
+            for (const auto& elseStmt : matchStmt.caseElseBody) {
+                if (elseStmt) {
+                    validateStatement(*elseStmt);
+                }
+            }
+            break;
+        }
         default:
             // Other statements don't need special validation
             break;

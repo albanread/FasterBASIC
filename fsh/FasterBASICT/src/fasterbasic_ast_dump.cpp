@@ -40,6 +40,7 @@ std::string getNodeTypeName(ASTNodeType type) {
         case ASTNodeType::STMT_EXIT: return "STMT_EXIT";
         case ASTNodeType::STMT_IF: return "STMT_IF";
         case ASTNodeType::STMT_CASE: return "STMT_CASE";
+        case ASTNodeType::STMT_MATCH_TYPE: return "STMT_MATCH_TYPE";
         case ASTNodeType::STMT_WHEN: return "STMT_WHEN";
         case ASTNodeType::STMT_FOR: return "STMT_FOR";
         case ASTNodeType::STMT_FOR_IN: return "STMT_FOR_IN";
@@ -186,6 +187,34 @@ void dumpStatement(const Statement& stmt, int indentLevel, std::ostream& os) {
         case ASTNodeType::STMT_REM: {
             const auto& remStmt = static_cast<const RemStatement&>(stmt);
             os << " (comment=\"" << remStmt.comment << "\")\n";
+            return;
+        }
+        
+        case ASTNodeType::STMT_MATCH_TYPE: {
+            const auto& matchStmt = static_cast<const MatchTypeStatement&>(stmt);
+            os << " (arms=" << matchStmt.caseArms.size()
+               << ", hasCaseElse=" << (!matchStmt.caseElseBody.empty()) << ")\n";
+            for (size_t i = 0; i < matchStmt.caseArms.size(); ++i) {
+                const auto& arm = matchStmt.caseArms[i];
+                os << indent(indentLevel + 1) << "CASE " << arm.typeKeyword
+                   << " " << arm.bindingVariable << " (tag=" << arm.atomTypeTag;
+                if (arm.isClassMatch) {
+                    os << ", class=" << arm.matchClassName;
+                }
+                if (arm.isUDTMatch) {
+                    os << ", udt=" << arm.udtTypeName;
+                }
+                os << "):\n";
+                for (const auto& armStmt : arm.body) {
+                    dumpStatement(*armStmt, indentLevel + 2, os);
+                }
+            }
+            if (!matchStmt.caseElseBody.empty()) {
+                os << indent(indentLevel + 1) << "CASE ELSE:\n";
+                for (const auto& elseStmt : matchStmt.caseElseBody) {
+                    dumpStatement(*elseStmt, indentLevel + 2, os);
+                }
+            }
             return;
         }
         

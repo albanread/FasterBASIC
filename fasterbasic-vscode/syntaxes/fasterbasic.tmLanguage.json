@@ -1,0 +1,117 @@
+{
+	"$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+	"name": "FasterBASIC",
+	"patterns": [
+		{
+			"include": "#comments"
+		},
+		{
+			"include": "#strings"
+		},
+		{
+			"include": "#numbers"
+		},
+		{
+			"include": "#keywords"
+		},
+		{
+			"include": "#types"
+		},
+		{
+			"include": "#functions"
+		},
+		{
+			"include": "#operators"
+		}
+	],
+	"repository": {
+		"comments": {
+			"patterns": [
+				{
+					"name": "comment.line.rem.fasterbasic",
+					"match": "(?i)(REM|').*$"
+				}
+			]
+		},
+		"strings": {
+			"name": "string.quoted.double.fasterbasic",
+			"begin": "\"",
+			"end": "\"",
+			"patterns": [
+				{
+					"name": "constant.character.escape.fasterbasic",
+					"match": "\\\\."
+				}
+			]
+		},
+		"numbers": {
+			"patterns": [
+				{
+					"name": "constant.numeric.hex.fasterbasic",
+					"match": "\\&[Hh][0-9a-fA-F]+"
+				},
+				{
+					"name": "constant.numeric.float.fasterbasic",
+					"match": "\\b\\d+\\.\\d+([eE][+-]?\\d+)?([#|!])?\\b"
+				},
+				{
+					"name": "constant.numeric.integer.fasterbasic",
+					"match": "\\b\\d+([%|&])?\\b"
+				}
+			]
+		},
+		"keywords": {
+			"patterns": [
+				{
+					"name": "keyword.control.fasterbasic",
+					"match": "(?i)\\b(IF|THEN|ELSE|ELSEIF|ENDIF|END\\s+IF|FOR|NEXT|STEP|TO|WHILE|WEND|DO|LOOP|REPEAT|UNTIL|SELECT|CASE|OTHERWISE|ENDCASE|END\\s+CASE|GOTO|GOSUB|RETURN|EXIT|CONTINUE|TRY|CATCH|FINALLY|THROW|MATCH|WITH|ENDMATCH|END\\s+MATCH)\\b"
+				},
+				{
+					"name": "keyword.other.fasterbasic",
+					"match": "(?i)\\b(DIM|REDIM|ERASE|LET|CONST|CONSTANT|AS|SHARED|GLOBAL|LOCAL|STATIC|OPTION|EXPLICIT|BASE|CLASS|EXTENDS|CONSTRUCTOR|DESTRUCTOR|METHOD|PROPERTY|END\\s+CLASS|END\\s+SUB|END\\s+FUNCTION|END\\s+TYPE|TYPE|END\\s+CONSTRUCTOR|END\\s+DESTRUCTOR|END\\s+METHOD|NEW|DELETE|RUN|STOP|END|DATA|READ|RESTORE|OPEN|CLOSE|INPUT|PRINT|LINE\\s+INPUT|OUTPUT|APPEND|BINARY|TEXTPUT|TEXT_PUT|SPRLOAD|SPRSHOW|SPRHIDE|SPRMOVE|SPRPOS|TIMER|AFTER|EVERY|FRAMES|MS|SECS|VSYNC|WAIT|WAIT_MS)\\b"
+				},
+				{
+					"name": "storage.type.fasterbasic",
+					"match": "(?i)\\b(INTEGER|LONG|SINGLE|DOUBLE|STRING|BYTE|SHORT|UBYTE|USHORT|UINTEGER|ULONG|FLOAT|ANY|LIST|HASHMAP|OF)\\b"
+				},
+				{
+					"name": "constant.language.fasterbasic",
+					"match": "(?i)\\b(TRUE|FALSE|PI|NOTHING|ME)\\b"
+				}
+			]
+		},
+		"types": {
+			"patterns": [
+				{
+					"name": "entity.name.type.fasterbasic",
+					"match": "\\b[A-Za-z_][A-Za-z0-9_]*[%&!#$]?\\b(?=\\s+AS)"
+				}
+			]
+		},
+		"functions": {
+			"patterns": [
+				{
+					"name": "support.function.builtin.fasterbasic",
+					"match": "(?i)\\b(ABS|ASC|ATN|CDBL|CHR\\$|CINT|CLNG|COS|CSNG|CSTR|EXP|FIX|HEX\\$|INSTR|INT|LCASE\\$|LEFT\\$|LEN|LOG|LTRIM\\$|MID\\$|OCT\\$|RIGHT\\$|RND|RTRIM\\$|SGN|SIN|SPACE\\$|SQR|STR\\$|STRING\\$|TAN|TRIM\\$|UBOUND|LBOUND|UCASE\\$|VAL|VARPTR|PEEK|POKE|TIMER|ERR|ERL|EOF|LOF|POS|TAB|APPEND|PREPEND|POP|SHIFT|GET|LENGTH|HEAD|CONTAINS|INDEXOF|EMPTY)\\b"
+				},
+				{
+					"name": "entity.name.function.definition.fasterbasic",
+					"match": "(?i)(?<=SUB|FUNCTION|METHOD|CONSTRUCTOR|DESTRUCTOR)\\s+[A-Za-z_][A-Za-z0-9_]*"
+				},
+				{
+					"name": "entity.name.function.call.fasterbasic",
+					"match": "\\b[A-Za-z_][A-Za-z0-9_]*\\s*(?=\\()"
+				}
+			]
+		},
+		"operators": {
+			"patterns": [
+				{
+					"name": "keyword.operator.fasterbasic",
+					"match": "(\\+|-|\\*|/|\\\\|\\^|=|<>|<|>|<=|>=|\\b(AND|OR|NOT|XOR|MOD|EQV|IMP|IS)\\b)"
+				}
+			]
+		}
+	},
+	"scopeName": "source.fasterbasic"
+}

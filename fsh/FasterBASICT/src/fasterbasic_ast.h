@@ -158,6 +158,7 @@ enum class ASTNodeType {
     STMT_CONSTRUCTOR,       // CONSTRUCTOR ... END CONSTRUCTOR
     STMT_DESTRUCTOR,        // DESTRUCTOR ... END DESTRUCTOR
     STMT_DELETE,            // DELETE obj
+    STMT_MATCH_TYPE,        // MATCH TYPE ... END MATCH (safe type dispatch)
 
     // Expressions
     EXPR_BINARY,
@@ -178,6 +179,9 @@ enum class ASTNodeType {
     EXPR_SUPER_CALL,        // SUPER.Method() or SUPER() in constructor
     EXPR_IS_TYPE,           // obj IS ClassName / obj IS NOTHING
     EXPR_NOTHING,           // NOTHING (null object reference)
+    
+    // LIST expressions
+    EXPR_LIST_CONSTRUCTOR,  // LIST(expr, expr, ...) literal constructor
 };
 
 // =============================================================================
@@ -506,6 +510,34 @@ public:
         oss << makeIndent(indent + 1) << "falseValue:\n";
         oss << falseValue->toString(indent + 2);
         oss << makeIndent(indent) << ")\n";
+        return oss.str();
+    }
+};
+
+// =============================================================================
+// LIST Constructor Expression: LIST(expr1, expr2, ...)
+// =============================================================================
+
+class ListConstructorExpression : public Expression {
+public:
+    std::vector<ExpressionPtr> elements;   // Elements in the LIST(...) literal
+    
+    ListConstructorExpression() {}
+    
+    void addElement(ExpressionPtr elem) {
+        elements.push_back(std::move(elem));
+    }
+    
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_LIST_CONSTRUCTOR; }
+    
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "LIST(";
+        for (size_t i = 0; i < elements.size(); ++i) {
+            if (i > 0) oss << ", ";
+            oss << elements[i]->toString(0);
+        }
+        oss << ")";
         return oss.str();
     }
 };
@@ -1630,6 +1662,87 @@ public:
             }
         }
 
+        return oss.str();
+    }
+};
+
+// MATCH TYPE statement (safe type dispatch for LIST OF ANY)
+class MatchTypeStatement : public Statement {
+public:
+    // A single CASE arm: CASE INTEGER n%, CASE STRING s$, etc.
+    struct CaseArm {
+        std::string typeKeyword;           // "INTEGER", "DOUBLE", "STRING", "LIST", "OBJECT", "LONG", "SINGLE", or a class/UDT name
+        int atomTypeTag;                   // ATOM_INT=1, ATOM_FLOAT=2, ATOM_STRING=3, ATOM_LIST=4, ATOM_OBJECT=5
+        std::string bindingVariable;       // e.g. "n%", "s$", "f#", "sub"
+        TokenType bindingSuffix;           // Suffix token type for the binding variable
+        std::vector<StatementPtr> body;    // Statements in this arm
+
+        // --- Extended type matching (class / UDT / basic type) ---
+        // When isClassMatch is true, matchClassName holds the specific CLASS name
+        // and codegen will emit a class_is_instance() runtime check in addition
+        // to the ATOM_OBJECT tag check.  This supports inheritance: CASE Dog
+        // will match any Dog or subclass-of-Dog object.
+        bool isClassMatch = false;         // true if CASE <ClassName> (not generic OBJECT)
+        std::string matchClassName;        // Specific class name (e.g. "DOG", "CAT"); empty for generic OBJECT
+
+        // When isUDTMatch is true, udtTypeName holds the TYPE name.
+        // UDTs are value types so this is resolved via static type info the
+        // compiler already knows.  Useful for future variant / tagged-union
+        // support or for statically-typed MATCH TYPE on non-list expressions.
+        bool isUDTMatch = false;           // true if CASE <UDTName>
+        std::string udtTypeName;           // UDT type name (e.g. "VEC3"); empty if not a UDT match
+
+        CaseArm() : atomTypeTag(0), bindingSuffix(TokenType::UNKNOWN) {}
+    };
+
+    ExpressionPtr matchExpression;         // The expression after MATCH TYPE
+    std::vector<CaseArm> caseArms;         // Typed case arms
+    std::vector<StatementPtr> caseElseBody; // Optional CASE ELSE body
+
+    MatchTypeStatement() = default;
+
+    void addCaseArm(CaseArm arm) {
+        caseArms.push_back(std::move(arm));
+    }
+
+    void addCaseElseStatement(StatementPtr stmt) {
+        caseElseBody.push_back(std::move(stmt));
+    }
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_MATCH_TYPE; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "MATCH TYPE\n";
+
+        if (matchExpression) {
+            oss << makeIndent(indent + 1) << "Expression:\n";
+            oss << matchExpression->toString(indent + 2);
+        }
+
+        for (const auto& arm : caseArms) {
+            oss << makeIndent(indent + 1) << "CASE " << arm.typeKeyword
+                << " " << arm.bindingVariable;
+            if (arm.isClassMatch) {
+                oss << " [class=" << arm.matchClassName << "]";
+            }
+            if (arm.isUDTMatch) {
+                oss << " [udt=" << arm.udtTypeName << "]";
+            }
+            oss << "\n";
+            for (const auto& stmt : arm.body) {
+                oss << stmt->toString(indent + 2);
+            }
+        }
+
+        if (!caseElseBody.empty()) {
+            oss << makeIndent(indent + 1) << "CASE ELSE\n";
+            for (const auto& stmt : caseElseBody) {
+                oss << stmt->toString(indent + 2);
+            }
+        }
+
+        oss << makeIndent(indent) << "END MATCH\n";
         return oss.str();
     }
 };

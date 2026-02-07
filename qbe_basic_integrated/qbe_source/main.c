@@ -626,6 +626,7 @@ main(int ac, char *av[])
 			"plugin_context_runtime.c",
 			"class_runtime.c",
 			"samm_core.c",
+			"list_ops.c",
 			NULL
 		};
 		

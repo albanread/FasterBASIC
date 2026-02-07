@@ -117,6 +117,8 @@ This document provides a comprehensive Backus-Naur Form (BNF) description of the
               | <throw-statement>
               | <sub-statement>
               | <function-statement>
+              | <class-declaration>
+              | <match-type-statement>
               | <call-statement>
               | <def-statement>
               | <swap-statement>
@@ -139,6 +141,47 @@ This document provides a comprehensive Backus-Naur Form (BNF) description of the
               | <end-statement>
 ```
 
+### Class and Object System
+
+```bnf
+<class-declaration> ::= 'CLASS' <identifier> [ 'EXTENDS' <identifier> ] <EOL>
+                        { <class-member> }
+                        'END' 'CLASS' <EOL>
+
+<class-member> ::= <field-declaration>
+                 | <method-declaration>
+                 | <constructor-declaration>
+                 | <destructor-declaration>
+                 | <rem-statement>
+                 | <statement-list>
+
+<field-declaration> ::= <identifier> 'AS' <type-name> <EOL>
+
+<constructor-declaration> ::= 'CONSTRUCTOR' [ '(' <parameter-list> ')' ] <EOL>
+                              { <statement> }
+                              'END' 'CONSTRUCTOR' <EOL>
+
+<destructor-declaration> ::= 'DESTRUCTOR' <EOL>
+                             { <statement> }
+                             'END' 'DESTRUCTOR' <EOL>
+
+<method-declaration> ::= 'METHOD' <identifier> [ '(' <parameter-list> ')' ] [ 'AS' <type-name> ] <EOL>
+                         { <statement> }
+                         'END' 'METHOD' <EOL>
+```
+
+### Pattern Matching
+
+```bnf
+<match-type-statement> ::= 'MATCH' 'TYPE' <expression> <EOL>
+                           { <case-type-block> }
+                           [ 'CASE' 'ELSE' <EOL> { <statement> } ]
+                           ( 'END' 'MATCH' | 'ENDMATCH' )
+
+<case-type-block> ::= 'CASE' <type-name> <identifier> <EOL>
+                      { <statement> }
+```
+
 ### Print and Console Statements
 
 ```bnf
@@ -153,8 +196,13 @@ This document provides a comprehensive Backus-Naur Form (BNF) description of the
 <print-item> ::= <expression>
 
 <print-separator> ::= ';' | ','
+             | <identifier> [ <type-keyword> ] '=' <expression>
 
-<print-at-statement> ::= 'PRINT_AT' <expression> ',' <expression> [ ',' <expression> ',' <expression> ] ',' <print-list>
+<dimension-list> ::= <expression> { ',' <expression> }
+
+<type-keyword> ::= 'AS' <type-name>
+                 | 'AS' 'LIST' [ 'OF' <type-name> ]
+                 | 'AS' 'HASHMAP'expression> [ ',' <expression> ',' <expression> ] ',' <print-list>
 ```
 
 ### Input Statements

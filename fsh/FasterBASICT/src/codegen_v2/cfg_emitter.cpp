@@ -455,6 +455,7 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                                     if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
                                         const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
                                         astEmitter_.emitForEachBodyPreamble(forInStmt);
+                                        astEmitter_.setCurrentForEachStmt(forInStmt);
                                         goto forin_preamble_done;
                                     }
                                 }
@@ -483,6 +484,7 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
                                 for (const Statement* stmt : initBlock->statements) {
                                     if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
                                         const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
+                                        astEmitter_.setCurrentForEachStmt(nullptr);
                                         astEmitter_.emitForEachCleanup(forInStmt);
                                         goto forin_cleanup_done;
                                     }

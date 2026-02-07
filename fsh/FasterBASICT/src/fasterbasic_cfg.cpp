@@ -171,6 +171,16 @@ void collectJumpTargetsFromStatements(const std::vector<std::unique_ptr<Statemen
                 break;
             }
             
+            case ASTNodeType::STMT_MATCH_TYPE: {
+                const auto& matchStmt = static_cast<const MatchTypeStatement&>(*stmt);
+                // Recursively scan each CASE arm body and CASE ELSE body
+                for (const auto& arm : matchStmt.caseArms) {
+                    collectJumpTargetsFromStatements(arm.body, targets);
+                }
+                collectJumpTargetsFromStatements(matchStmt.caseElseBody, targets);
+                break;
+            }
+            
             default:
                 break;
         }
@@ -329,6 +339,10 @@ void CFGBuilder::processStatement(const Statement& stmt, BasicBlock* currentBloc
             
         case ASTNodeType::STMT_CASE:
             processCaseStatement(static_cast<const CaseStatement&>(stmt), currentBlock);
+            break;
+            
+        case ASTNodeType::STMT_MATCH_TYPE:
+            processMatchTypeStatement(static_cast<const MatchTypeStatement&>(stmt), currentBlock);
             break;
         
         case ASTNodeType::STMT_THROW:
@@ -660,6 +674,7 @@ void CFGBuilder::processNestedStatements(const std::vector<StatementPtr>& statem
                              type == ASTNodeType::STMT_DO ||
                              type == ASTNodeType::STMT_REPEAT ||
                              type == ASTNodeType::STMT_CASE ||
+                             type == ASTNodeType::STMT_MATCH_TYPE ||
                              type == ASTNodeType::STMT_TRY_CATCH ||
                              type == ASTNodeType::STMT_WEND ||
                              type == ASTNodeType::STMT_NEXT ||
@@ -872,6 +887,58 @@ void CFGBuilder::processCaseStatement(const CaseStatement& stmt, BasicBlock* cur
     ctx.exitBlock = exitBlock->id;
     ctx.caseStatement = &stmt;
     m_selectCaseStack.push_back(ctx);
+    
+    // Continue with exit block
+    m_currentBlock = exitBlock;
+}
+
+void CFGBuilder::processMatchTypeStatement(const MatchTypeStatement& stmt, BasicBlock* currentBlock) {
+    // MATCH TYPE creates a structure similar to SELECT CASE:
+    //   - Current block: evaluates the match expression (type tag)
+    //   - One body block per CASE arm
+    //   - Optional CASE ELSE block
+    //   - Exit block: continue after END MATCH
+    
+    // Create exit block
+    BasicBlock* exitBlock = createNewBlock("After MATCH TYPE");
+    
+    // For each CASE arm, create a body block
+    for (size_t i = 0; i < stmt.caseArms.size(); i++) {
+        BasicBlock* armBlock = createNewBlock("MATCH CASE " + stmt.caseArms[i].typeKeyword);
+        
+        // Process statements in the arm block
+        m_currentBlock = armBlock;
+        for (const auto& armStmt : stmt.caseArms[i].body) {
+            if (armStmt) {
+                processStatement(*armStmt, m_currentBlock, 0);
+            }
+        }
+        
+        // Add fallthrough edge from arm to exit (no fall-through between arms)
+        if (!m_currentBlock->isTerminator) {
+            m_cfg->edges.push_back({m_currentBlock->id, exitBlock->id, EdgeType::FALLTHROUGH, "match_arm_to_exit"});
+        }
+    }
+    
+    // Create CASE ELSE block if present
+    if (!stmt.caseElseBody.empty()) {
+        BasicBlock* elseBlock = createNewBlock("MATCH CASE ELSE");
+        
+        m_currentBlock = elseBlock;
+        for (const auto& elseStmt : stmt.caseElseBody) {
+            if (elseStmt) {
+                processStatement(*elseStmt, m_currentBlock, 0);
+            }
+        }
+        
+        if (!m_currentBlock->isTerminator) {
+            m_cfg->edges.push_back({m_currentBlock->id, exitBlock->id, EdgeType::FALLTHROUGH, "match_else_to_exit"});
+        }
+    }
+    
+    // The current block (where MATCH TYPE was) falls through to the exit
+    // (the actual branching is handled by the AST emitter's switch-on-tag codegen)
+    m_cfg->edges.push_back({currentBlock->id, exitBlock->id, EdgeType::FALLTHROUGH, "match_type_to_exit"});
     
     // Continue with exit block
     m_currentBlock = exitBlock;

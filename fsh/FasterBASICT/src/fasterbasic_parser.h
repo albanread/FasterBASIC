@@ -231,6 +231,7 @@ private:
     StatementPtr parseIfStatement();
     StatementPtr parseCaseStatement();
     StatementPtr parseSelectCaseStatement();
+    StatementPtr parseMatchTypeStatement();
     StatementPtr parseForStatement();
     StatementPtr parseNextStatement();
     StatementPtr parseWhileStatement();

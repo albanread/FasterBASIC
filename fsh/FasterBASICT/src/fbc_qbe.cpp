@@ -550,6 +550,7 @@ int main(int argc, char** argv) {
                     runtimeSrc + "/memory_mgmt.c " +
                     runtimeSrc + "/plugin_context_runtime.c " +
                     runtimeSrc + "/samm_core.c " +
+                    runtimeSrc + "/list_ops.c " +
                     runtimeSrc + "/string_ops.c " +
                     runtimeSrc + "/string_pool.c " +
                     runtimeSrc + "/string_utf32.c";
