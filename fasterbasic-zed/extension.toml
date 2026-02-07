@@ -1,0 +1,14 @@
+id = "fasterbasic"
+name = "FasterBASIC"
+description = "Syntax highlighting and language support for FasterBASIC"
+version = "0.1.0"
+schema_version = 1
+authors = ["FasterBASIC Team"]
+repository = "https://github.com/nicholasgasior/compact_repo"
+
+[language_servers]
+
+[grammars.fasterbasic]
+repository = "file:///Users/oberon/compact_repo"
+rev = "HEAD"
+path = "fasterbasic-zed/grammars/fasterbasic"

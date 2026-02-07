@@ -1,0 +1,38 @@
+{
+  "grammars": [
+    {
+      "name": "fasterbasic",
+      "camelCase": false,
+      "scope": "source.fasterbasic",
+      "path": ".",
+      "file-types": [
+        "bas",
+        "bi",
+        "bm"
+      ],
+      "highlights": "../../languages/fasterbasic/highlights.scm",
+      "injection-regex": "^fasterbasic$"
+    }
+  ],
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for FasterBASIC",
+    "authors": [
+      {
+        "name": "FasterBASIC Team"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/nicholasgasior/compact_repo"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "go": false,
+    "node": false,
+    "python": false,
+    "rust": false,
+    "swift": false
+  }
+}
