@@ -91,17 +91,22 @@ echo ""
 
 # Test categories
 categories=(
-    "tests/basic"
     "tests/arithmetic"
-    "tests/loops"
-    "tests/strings"
-    "tests/functions"
+    "tests/array_expr"
     "tests/arrays"
-    "tests/hashmap"
-    "tests/types"
-    "tests/control"
+    "tests/comparisons"
+    "tests/conditionals"
+    "tests/data"
     "tests/exceptions"
+    "tests/functions"
+    "tests/hashmap"
+    "tests/io"
+    "tests/loops"
+    "tests/neon"
+    "tests/qbe_madd"
     "tests/rosetta"
+    "tests/strings"
+    "tests/types"
 )
 
 for category in "${categories[@]}"; do

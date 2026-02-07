@@ -672,6 +672,129 @@ private:
     // names (e.g. "m_INT") with method-param registration keys (e.g. "m").
     static std::string stripTextTypeSuffix(const std::string& name);
 
+    // === Whole-Array Expression Helpers (Phase 4) ===
+
+    /**
+     * Check whether an expression is a whole-array reference: an
+     * ArrayAccessExpression with no index expressions whose name resolves
+     * to a declared array in the symbol table.
+     */
+    bool isWholeArrayRef(const FasterBASIC::Expression* expr);
+
+    /**
+     * Top-level dispatcher for whole-array expressions.
+     * Called from emitLetStatement when the LHS has empty indices and
+     * the variable name matches a declared array.
+     * Inspects the RHS to classify the operation (copy, fill, negate,
+     * array-array binop, array-scalar binop) and emits the appropriate
+     * NEON-vectorized (or scalar-fallback) loop.
+     *
+     * @return true if the expression was handled, false to fall through
+     */
+    bool tryEmitWholeArrayExpression(const FasterBASIC::LetStatement* stmt,
+                                      const FasterBASIC::ArraySymbol& destArray);
+
+    /**
+     * Classify a binary expression as array-array or array-scalar and
+     * dispatch to the appropriate emitter.
+     */
+    bool emitArrayBinaryOp(const FasterBASIC::LetStatement* stmt,
+                            const FasterBASIC::ArraySymbol& destArray,
+                            const FasterBASIC::BinaryExpression* binExpr);
+
+    /**
+     * Element-wise array-array operation: C() = A() op B()
+     * Builds a SIMDLoopInfo and calls emitWholeArraySIMDLoop.
+     */
+    bool emitArrayArrayOp(const FasterBASIC::LetStatement* stmt,
+                           const FasterBASIC::ArraySymbol& destArray,
+                           const FasterBASIC::BinaryExpression* binExpr);
+
+    /**
+     * Array-scalar broadcast operation: B() = A() op scalar  or  B() = scalar op A()
+     * Pre-broadcasts the scalar into a 16-byte aligned stack slot, then
+     * runs a NEON loop with the scalar vector held in q29.
+     *
+     * @param scalarOnLeft  true when the scalar is the left operand
+     */
+    bool emitArrayScalarOp(const FasterBASIC::LetStatement* stmt,
+                            const FasterBASIC::ArraySymbol& destArray,
+                            const FasterBASIC::BinaryExpression* binExpr,
+                            bool scalarOnLeft);
+
+    /**
+     * Whole-array copy: B() = A()
+     */
+    bool emitArrayCopy(const FasterBASIC::LetStatement* stmt,
+                        const FasterBASIC::ArraySymbol& destArray,
+                        const FasterBASIC::ArrayAccessExpression* srcRef);
+
+    /**
+     * Array fill with a scalar value: A() = 0, A() = 3.14
+     */
+    bool emitArrayFill(const FasterBASIC::LetStatement* stmt,
+                        const FasterBASIC::ArraySymbol& destArray);
+
+    /**
+     * Array negate: B() = -A()
+     * Implemented as 0 - A() using NEON subtract.
+     */
+    bool emitArrayNegate(const FasterBASIC::LetStatement* stmt,
+                          const FasterBASIC::ArraySymbol& destArray,
+                          const FasterBASIC::UnaryExpression* unary);
+
+    /**
+     * Construct a SIMDInfo descriptor for a plain numeric array element type.
+     * Maps INTEGER → .4s int, SINGLE → .4s float, DOUBLE → .2d float, etc.
+     * Returns an info with type == NONE for non-SIMD-eligible types.
+     */
+    FasterBASIC::TypeDeclarationStatement::SIMDInfo
+    getSIMDInfoForArrayElement(const FasterBASIC::ArraySymbol& arr);
+
+    /**
+     * Get the per-element size in bytes for an array, accounting for UDT
+     * element types (uses TypeManager for UDT size calculation).
+     */
+    int getElementSizeBytes(const FasterBASIC::ArraySymbol& arr);
+
+    /**
+     * Emit a NEON-vectorized loop for a whole-array expression.
+     * Reads bounds from array descriptors (not FOR loop variables).
+     * Handles both UDT arrays (elemSize == 16, no remainder) and
+     * numeric arrays (elemSize < 16, with scalar remainder epilogue).
+     *
+     * @param info         SIMDLoopInfo describing the operation and operands
+     * @param elemSize     Per-element size in bytes (4 for SINGLE, 8 for DOUBLE, 16 for UDT)
+     * @param destArrayName  Name of the destination array (for descriptor lookup)
+     */
+    void emitWholeArraySIMDLoop(const SIMDLoopInfo& info,
+                                 int elemSize,
+                                 const std::string& destArrayName);
+
+    /**
+     * Emit a scalar (non-NEON) fallback loop for a whole-array expression.
+     * Used when NEON is disabled or unavailable.
+     *
+     * @param destArrayName  Destination array name
+     * @param srcArrayNames  Source array names (empty for fill)
+     * @param operation      "add", "sub", "mul", "div", "copy", "fill", "neg"
+     * @param scalarValue    QBE temporary holding the scalar (for fill/broadcast)
+     * @param elemType       Element BaseType
+     * @param scalarOnLeft   For broadcast ops, true if scalar is the left operand
+     */
+    void emitWholeArrayScalarLoop(const std::string& destArrayName,
+                                   const std::vector<std::string>& srcArrayNames,
+                                   const std::string& operation,
+                                   const std::string& scalarValue,
+                                   FasterBASIC::BaseType elemType,
+                                   bool scalarOnLeft = false);
+
+    /**
+     * Check whether the NEON array-expression path is enabled.
+     * Respects the ENABLE_NEON_LOOP environment variable kill-switch.
+     */
+    bool isNEONArrayExprEnabled();
+
 public:
     // === NEON Phase 3: Array Loop Vectorization (public for CFGEmitter) ===
 

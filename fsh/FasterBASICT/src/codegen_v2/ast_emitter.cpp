@@ -2273,6 +2273,22 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
 void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
     // Invalidate array element cache - assignment may change index variables or array contents
     clearArrayElementCache();
+
+    // ── Whole-array expression detection ──
+    // If the LHS has empty indices and no member chain, check if the variable
+    // is a declared array.  If so, try to emit a whole-array expression
+    // (e.g. C() = A() + B(), A() = 0, B() = A(), etc.)
+    if (stmt->indices.empty() && stmt->memberChain.empty()) {
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto arrIt = symbolTable.arrays.find(stmt->variable);
+        if (arrIt != symbolTable.arrays.end()) {
+            if (tryEmitWholeArrayExpression(stmt, arrIt->second)) {
+                return;  // Handled as whole-array expression
+            }
+            // Fall through to normal paths (might be a scalar with same name, etc.)
+        }
+    }
+
     // Check if this is UDT member assignment: udt.field = value or array(i).field = value
     if (!stmt->memberChain.empty()) {
         // === CLASS Instance Member Assignment (fast path) ===
@@ -8270,6 +8286,1670 @@ void ASTEmitter::emitWhileDirect(const FasterBASIC::WhileStatement* stmt) {
 
     // --- End ---
     builder_.emitLabel(endLabel);
+}
+
+// ===========================================================================
+// Whole-Array Expression Implementation (Phase 4)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// isNEONArrayExprEnabled — check the ENABLE_NEON_LOOP kill-switch
+// ---------------------------------------------------------------------------
+bool ASTEmitter::isNEONArrayExprEnabled() {
+    static int checked = 0;
+    static int enabled = 1;
+    if (!checked) {
+        const char* env = getenv("ENABLE_NEON_LOOP");
+        if (env) {
+            enabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+        }
+        checked = 1;
+    }
+    return enabled != 0;
+}
+
+// ---------------------------------------------------------------------------
+// isWholeArrayRef — check if an expression is A() with no indices
+// ---------------------------------------------------------------------------
+bool ASTEmitter::isWholeArrayRef(const FasterBASIC::Expression* expr) {
+    using namespace FasterBASIC;
+    if (!expr) return false;
+    if (expr->getType() != ASTNodeType::EXPR_ARRAY_ACCESS) return false;
+    auto* arr = static_cast<const ArrayAccessExpression*>(expr);
+    if (!arr->indices.empty()) return false;
+    // Verify it's a declared array
+    const auto& symbolTable = semantic_.getSymbolTable();
+    return symbolTable.arrays.count(arr->name) > 0;
+}
+
+// ---------------------------------------------------------------------------
+// getSIMDInfoForArrayElement — construct SIMDInfo for a numeric element type
+// ---------------------------------------------------------------------------
+FasterBASIC::TypeDeclarationStatement::SIMDInfo
+ASTEmitter::getSIMDInfoForArrayElement(const FasterBASIC::ArraySymbol& arr) {
+    using namespace FasterBASIC;
+    using SIMDType = TypeDeclarationStatement::SIMDType;
+    TypeDeclarationStatement::SIMDInfo info;
+    info.type = SIMDType::NONE;
+    info.laneCount = 0;
+    info.physicalLanes = 0;
+    info.laneBitWidth = 0;
+    info.totalBytes = 0;
+    info.isFullQ = false;
+    info.isPadded = false;
+    info.isFloatingPoint = false;
+    info.laneBaseType = 0;
+
+    BaseType elemType = arr.elementTypeDesc.baseType;
+
+    // For UDT arrays, delegate to the UDT's own SIMD info
+    if (elemType == BaseType::USER_DEFINED) {
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto udtIt = symbolTable.types.find(arr.elementTypeDesc.udtName);
+        if (udtIt != symbolTable.types.end()) {
+            return typeManager_.getSIMDInfo(udtIt->second);
+        }
+        return info;
+    }
+
+    switch (elemType) {
+        case BaseType::INTEGER:
+        case BaseType::UINTEGER:
+            info.type = SIMDType::V4S;
+            info.laneCount = 4;
+            info.physicalLanes = 4;
+            info.laneBitWidth = 32;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::INTEGER);
+            break;
+        case BaseType::SINGLE:
+            info.type = SIMDType::V4S;
+            info.laneCount = 4;
+            info.physicalLanes = 4;
+            info.laneBitWidth = 32;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = true;
+            info.laneBaseType = static_cast<int>(BaseType::SINGLE);
+            break;
+        case BaseType::DOUBLE:
+            info.type = SIMDType::V2D;
+            info.laneCount = 2;
+            info.physicalLanes = 2;
+            info.laneBitWidth = 64;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = true;
+            info.laneBaseType = static_cast<int>(BaseType::DOUBLE);
+            break;
+        case BaseType::LONG:
+        case BaseType::ULONG:
+            info.type = SIMDType::V2D;
+            info.laneCount = 2;
+            info.physicalLanes = 2;
+            info.laneBitWidth = 64;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::LONG);
+            break;
+        default:
+            break;  // Not SIMD-eligible (STRING, BYTE, SHORT, etc.)
+    }
+    return info;
+}
+
+// ---------------------------------------------------------------------------
+// getElementSizeBytes — per-element byte size for an array
+// ---------------------------------------------------------------------------
+int ASTEmitter::getElementSizeBytes(const FasterBASIC::ArraySymbol& arr) {
+    using namespace FasterBASIC;
+    BaseType elemType = arr.elementTypeDesc.baseType;
+    if (elemType == BaseType::USER_DEFINED) {
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto udtIt = symbolTable.types.find(arr.elementTypeDesc.udtName);
+        if (udtIt != symbolTable.types.end()) {
+            return typeManager_.getUDTSizeRecursive(udtIt->second, symbolTable.types);
+        }
+        return 0;
+    }
+    return typeManager_.getTypeSize(elemType);
+}
+
+// ---------------------------------------------------------------------------
+// tryEmitWholeArrayExpression — top-level dispatcher
+// ---------------------------------------------------------------------------
+bool ASTEmitter::tryEmitWholeArrayExpression(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray) {
+    using namespace FasterBASIC;
+
+    // String arrays are not supported
+    if (destArray.elementTypeDesc.baseType == BaseType::STRING ||
+        destArray.elementTypeDesc.baseType == BaseType::UNICODE) {
+        return false;
+    }
+
+    const auto& value = stmt->value;
+    if (!value) return false;
+
+    // --- Case 1: Unary negate — B() = -A() ---
+    if (value->getType() == ASTNodeType::EXPR_UNARY) {
+        auto* unary = static_cast<const UnaryExpression*>(value.get());
+        if (unary->op == TokenType::MINUS && isWholeArrayRef(unary->expr.get())) {
+            return emitArrayNegate(stmt, destArray, unary);
+        }
+    }
+
+    // --- Case 2: Binary — C() = A() op B(), or B() = A() op scalar ---
+    if (value->getType() == ASTNodeType::EXPR_BINARY) {
+        auto* binExpr = static_cast<const BinaryExpression*>(value.get());
+        return emitArrayBinaryOp(stmt, destArray, binExpr);
+    }
+
+    // --- Case 3: Copy — B() = A() ---
+    if (value->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+        auto* srcRef = static_cast<const ArrayAccessExpression*>(value.get());
+        if (srcRef->indices.empty()) {
+            const auto& symbolTable = semantic_.getSymbolTable();
+            if (symbolTable.arrays.count(srcRef->name) > 0) {
+                return emitArrayCopy(stmt, destArray, srcRef);
+            }
+        }
+    }
+
+    // --- Case 4: Fill — A() = <scalar> ---
+    // If the RHS is not an array reference at all, treat it as a fill
+    if (!isWholeArrayRef(value.get())) {
+        return emitArrayFill(stmt, destArray);
+    }
+
+    return false;  // Not a recognized array expression
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayBinaryOp — classify as array-array or array-scalar
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayBinaryOp(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::BinaryExpression* binExpr) {
+    using namespace FasterBASIC;
+
+    // Only support arithmetic operators
+    switch (binExpr->op) {
+        case TokenType::PLUS:
+        case TokenType::MINUS:
+        case TokenType::MULTIPLY:
+        case TokenType::DIVIDE:
+            break;
+        default:
+            return false;
+    }
+
+    bool leftIsArray  = isWholeArrayRef(binExpr->left.get());
+    bool rightIsArray = isWholeArrayRef(binExpr->right.get());
+
+    if (leftIsArray && rightIsArray) {
+        // C() = A() + B() → element-wise
+        return emitArrayArrayOp(stmt, destArray, binExpr);
+    }
+    if (leftIsArray && !rightIsArray) {
+        // B() = A() + 5 → broadcast scalar right
+        return emitArrayScalarOp(stmt, destArray, binExpr, /*scalarOnLeft=*/false);
+    }
+    if (!leftIsArray && rightIsArray) {
+        // B() = 5 - A() → broadcast scalar left
+        return emitArrayScalarOp(stmt, destArray, binExpr, /*scalarOnLeft=*/true);
+    }
+
+    return false;  // Both scalars — not an array expression
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayArrayOp — element-wise: C() = A() op B()
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayArrayOp(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::BinaryExpression* binExpr) {
+    using namespace FasterBASIC;
+
+    auto* leftArr  = static_cast<const ArrayAccessExpression*>(binExpr->left.get());
+    auto* rightArr = static_cast<const ArrayAccessExpression*>(binExpr->right.get());
+
+    // Look up source arrays
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcAIt = symbolTable.arrays.find(leftArr->name);
+    auto srcBIt = symbolTable.arrays.find(rightArr->name);
+    if (srcAIt == symbolTable.arrays.end() || srcBIt == symbolTable.arrays.end())
+        return false;
+
+    // Verify element types match
+    if (destArray.elementTypeDesc.baseType != srcAIt->second.elementTypeDesc.baseType)
+        return false;
+    if (destArray.elementTypeDesc.baseType != srcBIt->second.elementTypeDesc.baseType)
+        return false;
+
+    // For UDT arrays, verify same UDT type
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        std::string udtName = destArray.elementTypeDesc.udtName;
+        if (srcAIt->second.elementTypeDesc.udtName != udtName ||
+            srcBIt->second.elementTypeDesc.udtName != udtName)
+            return false;
+    }
+
+    // Determine element size and SIMD info
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    // Map operator to operation name
+    std::string opName;
+    switch (binExpr->op) {
+        case TokenType::PLUS:     opName = "add"; break;
+        case TokenType::MINUS:    opName = "sub"; break;
+        case TokenType::MULTIPLY: opName = "mul"; break;
+        case TokenType::DIVIDE:   opName = "div"; break;
+        default: return false;
+    }
+
+    // Integer division not supported via NEON hardware
+    if (opName == "div" && !simdInfo.isFloatingPoint &&
+        simdInfo.isValid() && isNEONArrayExprEnabled()) {
+        // Fall through to scalar path for integer division
+    }
+
+    builder_.emitComment("Array expression: " + stmt->variable
+        + "() = " + leftArr->name + "() " + opName + " " + rightArr->name + "()");
+
+    // Try NEON path
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled()) {
+        // Check for UDT string fields
+        bool hasStrings = false;
+        if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+            auto udtIt = symbolTable.types.find(destArray.elementTypeDesc.udtName);
+            if (udtIt != symbolTable.types.end()) {
+                hasStrings = typeManager_.hasStringFields(udtIt->second, symbolTable.types);
+            }
+        }
+
+        // Integer division must use scalar path
+        if (opName == "div" && !simdInfo.isFloatingPoint) {
+            hasStrings = true; // Force scalar fallback
+        }
+
+        if (!hasStrings) {
+            // Build SIMDLoopInfo
+            SIMDLoopInfo info;
+            info.isVectorizable = true;
+            info.operation = opName;
+            info.elemSizeBytes = simdInfo.totalBytes; // 16 = NEON register width
+            info.arrangementCode = simdArrangementCode(simdInfo);
+
+            SIMDLoopInfo::ArrayOperand srcAOp;
+            srcAOp.arrayName = leftArr->name;
+            srcAOp.simdInfo = simdInfo;
+            srcAOp.isReadOnly = true;
+
+            SIMDLoopInfo::ArrayOperand srcBOp;
+            srcBOp.arrayName = rightArr->name;
+            srcBOp.simdInfo = simdInfo;
+            srcBOp.isReadOnly = true;
+
+            SIMDLoopInfo::ArrayOperand destOp;
+            destOp.arrayName = stmt->variable;
+            destOp.simdInfo = simdInfo;
+            destOp.isReadOnly = false;
+
+            info.operands = { srcAOp, srcBOp, destOp };
+            info.srcAArrayIndex = 0;
+            info.srcBArrayIndex = 1;
+            info.destArrayIndex = 2;
+            info.startIsConstant = false;
+            info.endIsConstant = false;
+
+            emitWholeArraySIMDLoop(info, elemSize, stmt->variable);
+            return true;
+        }
+    }
+
+    // Scalar fallback
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        // UDT array-array arithmetic scalar fallback: field-by-field per element
+        builder_.emitComment("UDT array-array arithmetic: scalar field-by-field fallback");
+
+        auto udtIt = symbolTable.types.find(destArray.elementTypeDesc.udtName);
+        if (udtIt == symbolTable.types.end()) return false;
+        const auto& udtDef = udtIt->second;
+
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string srcADescName = getArrayDescriptorPtr(leftArr->name);
+        std::string srcAArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcAArrPtr, "l", srcADescName);
+        std::string srcADataPtr = builder_.newTemp();
+        builder_.emitCall(srcADataPtr, "l", "array_get_data_ptr", "l " + srcAArrPtr);
+
+        std::string srcBDescName = getArrayDescriptorPtr(rightArr->name);
+        std::string srcBArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcBArrPtr, "l", srcBDescName);
+        std::string srcBDataPtr = builder_.newTemp();
+        builder_.emitCall(srcBDataPtr, "l", "array_get_data_ptr", "l " + srcBArrPtr);
+
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcAArrPtr + ", w " + lbW + ", w " + ubW);
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcBArrPtr + ", w " + lbW + ", w " + ubW);
+
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        // Per-element loop with field-by-field arithmetic
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "udtarith_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "udtarith_body_" + std::to_string(loopId);
+        std::string doneLabel = "udtarith_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + totalBytes);
+        builder_.emitBranch(done, doneLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        // Base addresses for this element
+        std::string elemSrcA = builder_.newTemp();
+        builder_.emitBinary(elemSrcA, "l", "add", srcADataPtr, off);
+        std::string elemSrcB = builder_.newTemp();
+        builder_.emitBinary(elemSrcB, "l", "add", srcBDataPtr, off);
+        std::string elemDst = builder_.newTemp();
+        builder_.emitBinary(elemDst, "l", "add", destDataPtr, off);
+
+        // Field-by-field arithmetic
+        int64_t fieldOff = 0;
+        for (size_t fi = 0; fi < udtDef.fields.size(); ++fi) {
+            const auto& field = udtDef.fields[fi];
+            BaseType fType = field.typeDesc.baseType;
+            if (fType == BaseType::STRING || fType == BaseType::USER_DEFINED) {
+                fieldOff += typeManager_.getTypeSize(fType);
+                continue;
+            }
+            std::string fQbeType = typeManager_.getQBEType(fType);
+            std::string fLoadOp = "load" + fQbeType;
+            std::string fStoreOp = "store" + fQbeType;
+
+            std::string fSrcA = builder_.newTemp();
+            std::string fSrcB = builder_.newTemp();
+            std::string fDst = builder_.newTemp();
+            if (fieldOff > 0) {
+                builder_.emitBinary(fSrcA, "l", "add", elemSrcA, std::to_string(fieldOff));
+                builder_.emitBinary(fSrcB, "l", "add", elemSrcB, std::to_string(fieldOff));
+                builder_.emitBinary(fDst, "l", "add", elemDst, std::to_string(fieldOff));
+            } else {
+                builder_.emitRaw("    " + fSrcA + " =l copy " + elemSrcA);
+                builder_.emitRaw("    " + fSrcB + " =l copy " + elemSrcB);
+                builder_.emitRaw("    " + fDst + " =l copy " + elemDst);
+            }
+
+            std::string aVal = builder_.newTemp();
+            builder_.emitRaw("    " + aVal + " =" + fQbeType + " " + fLoadOp + " " + fSrcA);
+            std::string bVal = builder_.newTemp();
+            builder_.emitRaw("    " + bVal + " =" + fQbeType + " " + fLoadOp + " " + fSrcB);
+            std::string res = builder_.newTemp();
+            builder_.emitBinary(res, fQbeType, opName, aVal, bVal);
+            builder_.emitRaw("    " + fStoreOp + " " + res + ", " + fDst);
+
+            fieldOff += typeManager_.getTypeSize(fType);
+        }
+
+        // Advance by element size
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End UDT array arithmetic scalar loop ===");
+        return true;
+    }
+
+    // Primitive scalar fallback: emit scalar loop
+    std::vector<std::string> srcNames = { leftArr->name, rightArr->name };
+    emitWholeArrayScalarLoop(stmt->variable, srcNames, opName, "",
+                              destArray.elementTypeDesc.baseType, false);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayScalarOp — broadcast: B() = A() * 2.0 or B() = 2.0 * A()
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayScalarOp(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::BinaryExpression* binExpr,
+        bool scalarOnLeft) {
+    using namespace FasterBASIC;
+
+    // Identify the array operand and the scalar operand
+    const Expression* arrayExpr  = scalarOnLeft ? binExpr->right.get() : binExpr->left.get();
+    const Expression* scalarExpr = scalarOnLeft ? binExpr->left.get()  : binExpr->right.get();
+
+    auto* arrAccess = static_cast<const ArrayAccessExpression*>(arrayExpr);
+
+    // Verify source array exists and has matching element type
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcIt = symbolTable.arrays.find(arrAccess->name);
+    if (srcIt == symbolTable.arrays.end()) return false;
+    if (destArray.elementTypeDesc.baseType != srcIt->second.elementTypeDesc.baseType)
+        return false;
+
+    // For UDT arrays, broadcast doesn't make sense — UDTs aren't scalar-compatible
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED)
+        return false;
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    std::string opName;
+    switch (binExpr->op) {
+        case TokenType::PLUS:     opName = "add"; break;
+        case TokenType::MINUS:    opName = "sub"; break;
+        case TokenType::MULTIPLY: opName = "mul"; break;
+        case TokenType::DIVIDE:   opName = "div"; break;
+        default: return false;
+    }
+
+    builder_.emitComment("Array expression (broadcast): " + stmt->variable
+        + "() = " + (scalarOnLeft ? "<scalar>" : arrAccess->name + "()")
+        + " " + opName + " "
+        + (scalarOnLeft ? arrAccess->name + "()" : "<scalar>"));
+
+    // Evaluate the scalar expression to the array's element type
+    BaseType elemType = destArray.elementTypeDesc.baseType;
+    std::string scalarVal = emitExpressionAs(scalarExpr, elemType);
+
+    // Integer division must use scalar path
+    bool forceScalar = (opName == "div" && !simdInfo.isFloatingPoint);
+
+    // Try NEON path with pre-broadcast
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled() && !forceScalar) {
+        builder_.emitComment("=== Array broadcast: NEON vectorized loop ===");
+
+        // Pre-broadcast: fill a 16-byte aligned stack slot with the scalar value
+        std::string bcastSlot = builder_.newTemp();
+        builder_.emitRaw("    " + bcastSlot + " =l alloc16 16");
+
+        std::string qbeType = typeManager_.getQBEType(elemType);
+        int lanesPerReg = 16 / elemSize;
+        for (int lane = 0; lane < lanesPerReg; ++lane) {
+            if (lane == 0) {
+                builder_.emitRaw("    store" + qbeType + " " + scalarVal + ", " + bcastSlot);
+            } else {
+                std::string off = builder_.newTemp();
+                builder_.emitBinary(off, "l", "add", bcastSlot,
+                                    std::to_string(lane * elemSize));
+                builder_.emitRaw("    store" + qbeType + " " + scalarVal + ", " + off);
+            }
+        }
+
+        // Get dest array pointer, bounds, and data pointer
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        // Get source array pointer and data pointer
+        std::string srcDescName = getArrayDescriptorPtr(arrAccess->name);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+        // Get element count from destination array
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+        // Bounds-check source array
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+        // Compute total byte count
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        // Main NEON loop (16 bytes per iteration)
+        std::string neonEndOff = builder_.newTemp();
+        // neonEndOff = totalBytes rounded down to multiple of 16
+        std::string neonMask = builder_.newTemp();
+        builder_.emitRaw("    " + neonMask + " =l copy -16");  // ~15 = -16 in two's complement
+        builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        // Pre-load broadcast value into q29
+        builder_.emitRaw("    neonldr2 " + bcastSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "arrexpr_bcast_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "arrexpr_bcast_body_" + std::to_string(loopId);
+        std::string remLabel = "arrexpr_bcast_rem_" + std::to_string(loopId);
+        std::string remBodyLabel = "arrexpr_bcast_rembody_" + std::to_string(loopId);
+        std::string doneLabel = "arrexpr_bcast_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+        builder_.emitBranch(done, remLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", srcDataPtr, off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+        if (scalarOnLeft) {
+            // scalar op A(): load array into q28, scalar is in q29
+            // But neon ops do q28 = q28 op q29, so we need:
+            // q28 = scalar, q29 = array → result = scalar op array
+            // Re-load broadcast into q28, array into q29
+            builder_.emitRaw("    neonldr " + bcastSlot);
+            builder_.emitRaw("    neonldr2 " + srcAddr);
+        } else {
+            // A() op scalar: load array into q28, scalar already in q29
+            builder_.emitRaw("    neonldr " + srcAddr);
+            // q29 already has broadcast value — but we need to reload it since
+            // neonldr2 might have been overwritten in scalarOnLeft path above.
+            // For the !scalarOnLeft case, q29 was loaded above the loop. Good.
+        }
+
+        std::string neonOp = "neon" + opName;
+        builder_.emitRaw("    " + neonOp + " " + std::to_string(simdArrangementCode(simdInfo)));
+        builder_.emitRaw("    neonstr " + dstAddr);
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "16");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        // --- Remainder loop (scalar, for tail elements) ---
+        builder_.emitLabel(remLabel);
+        if (elemSize < 16) {
+            std::string remOff = builder_.newTemp();
+            builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+            std::string remDone = builder_.newTemp();
+            builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+            builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+            builder_.emitLabel(remBodyLabel);
+            std::string rOff = builder_.newTemp();
+            builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+            std::string rSrcAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcAddr, "l", "add", srcDataPtr, rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, rOff);
+
+            std::string loadOp = "load" + qbeType;
+            std::string storeOp = "store" + qbeType;
+            std::string rSrcVal = builder_.newTemp();
+            builder_.emitRaw("    " + rSrcVal + " =" + qbeType + " " + loadOp + " " + rSrcAddr);
+
+            std::string rResult = builder_.newTemp();
+            if (scalarOnLeft) {
+                builder_.emitBinary(rResult, qbeType, opName, scalarVal, rSrcVal);
+            } else {
+                builder_.emitBinary(rResult, qbeType, opName, rSrcVal, scalarVal);
+            }
+            builder_.emitRaw("    " + storeOp + " " + rResult + ", " + rDstAddr);
+
+            std::string rNext = builder_.newTemp();
+            builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+            builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+            builder_.emitJump(remLabel);
+        }
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End array broadcast expression ===");
+        return true;
+    }
+
+    // Scalar fallback
+    std::vector<std::string> srcNames = { arrAccess->name };
+    emitWholeArrayScalarLoop(stmt->variable, srcNames, opName, scalarVal,
+                              destArray.elementTypeDesc.baseType, scalarOnLeft);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayCopy — whole-array copy: B() = A()
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayCopy(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::ArrayAccessExpression* srcRef) {
+    using namespace FasterBASIC;
+
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcIt = symbolTable.arrays.find(srcRef->name);
+    if (srcIt == symbolTable.arrays.end()) return false;
+
+    // Verify element types match
+    if (destArray.elementTypeDesc.baseType != srcIt->second.elementTypeDesc.baseType)
+        return false;
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        if (destArray.elementTypeDesc.udtName != srcIt->second.elementTypeDesc.udtName)
+            return false;
+    }
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    builder_.emitComment("Array expression: " + stmt->variable
+        + "() = " + srcRef->name + "() (copy)");
+
+    // Check for string fields in UDT
+    bool hasStrings = false;
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        auto udtIt = symbolTable.types.find(destArray.elementTypeDesc.udtName);
+        if (udtIt != symbolTable.types.end()) {
+            hasStrings = typeManager_.hasStringFields(udtIt->second, symbolTable.types);
+        }
+    }
+
+    // Try NEON path
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled() && !hasStrings) {
+        SIMDLoopInfo info;
+        info.isVectorizable = true;
+        info.operation = "copy";
+        info.elemSizeBytes = simdInfo.totalBytes;
+        info.arrangementCode = simdArrangementCode(simdInfo);
+
+        SIMDLoopInfo::ArrayOperand srcOp;
+        srcOp.arrayName = srcRef->name;
+        srcOp.simdInfo = simdInfo;
+        srcOp.isReadOnly = true;
+
+        SIMDLoopInfo::ArrayOperand dstOp;
+        dstOp.arrayName = stmt->variable;
+        dstOp.simdInfo = simdInfo;
+        dstOp.isReadOnly = false;
+
+        info.operands = { srcOp, dstOp };
+        info.srcAArrayIndex = 0;
+        info.srcBArrayIndex = -1;
+        info.destArrayIndex = 1;
+        info.startIsConstant = false;
+        info.endIsConstant = false;
+
+        emitWholeArraySIMDLoop(info, elemSize, stmt->variable);
+        return true;
+    }
+
+    // Scalar fallback
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        // UDT copy scalar fallback: byte-level copy using 8-byte chunks
+        builder_.emitComment("UDT array copy: scalar byte-level fallback");
+
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string srcDescName = getArrayDescriptorPtr(srcRef->name);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        // Byte-level copy loop using 8-byte (long) chunks
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "udtcopy_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "udtcopy_body_" + std::to_string(loopId);
+        std::string doneLabel = "udtcopy_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + totalBytes);
+        builder_.emitBranch(done, doneLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+        std::string sAddr = builder_.newTemp();
+        builder_.emitBinary(sAddr, "l", "add", srcDataPtr, off);
+        std::string dAddr = builder_.newTemp();
+        builder_.emitBinary(dAddr, "l", "add", destDataPtr, off);
+        std::string val = builder_.newTemp();
+        builder_.emitRaw("    " + val + " =l loadl " + sAddr);
+        builder_.emitRaw("    storel " + val + ", " + dAddr);
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "8");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End UDT array copy scalar loop ===");
+        return true;
+    }
+
+    // Primitive scalar fallback
+    std::vector<std::string> srcNames = { srcRef->name };
+    emitWholeArrayScalarLoop(stmt->variable, srcNames, "copy", "",
+                              destArray.elementTypeDesc.baseType, false);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayFill — fill: A() = scalar
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayFill(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray) {
+    using namespace FasterBASIC;
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    BaseType elemType = destArray.elementTypeDesc.baseType;
+
+    // For UDT arrays, fill doesn't make sense (can't assign a scalar to a UDT)
+    if (elemType == BaseType::USER_DEFINED)
+        return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    builder_.emitComment("Array expression: " + stmt->variable + "() = <fill value>");
+
+    // Evaluate the fill value
+    std::string fillVal = emitExpressionAs(stmt->value.get(), elemType);
+
+    // Try NEON path
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled()) {
+        builder_.emitComment("=== Array fill: NEON vectorized loop ===");
+
+        std::string qbeType = typeManager_.getQBEType(elemType);
+        int arrCode = simdArrangementCode(simdInfo);
+
+        // For SINGLE and INTEGER: use neondup to broadcast scalar → v28.
+        // neondup expects a GPR operand, so for SINGLE we bit-cast first.
+        // For DOUBLE: QBE's constant folding of 'cast d_const' is unreliable,
+        // so we fall back to the proven stack-slot broadcast approach.
+        bool useNeonDup = (elemType != BaseType::DOUBLE);
+        std::string bcastSlot; // only used for DOUBLE fallback
+
+        if (useNeonDup) {
+            std::string dupSrc;
+            if (elemType == BaseType::SINGLE) {
+                // Bit-cast single → 32-bit GPR via QBE 'cast'
+                dupSrc = builder_.newTemp();
+                builder_.emitRaw("    " + dupSrc + " =w cast " + fillVal);
+            } else {
+                dupSrc = fillVal;
+            }
+            builder_.emitRaw("    neondup " + std::to_string(arrCode) + ", " + dupSrc);
+        } else {
+            // DOUBLE: pre-broadcast fill value into a 16-byte aligned stack slot
+            bcastSlot = builder_.newTemp();
+            builder_.emitRaw("    " + bcastSlot + " =l alloc16 16");
+            int lanesPerReg = 16 / elemSize;
+            for (int lane = 0; lane < lanesPerReg; ++lane) {
+                if (lane == 0) {
+                    builder_.emitRaw("    store" + qbeType + " " + fillVal + ", " + bcastSlot);
+                } else {
+                    std::string off = builder_.newTemp();
+                    builder_.emitBinary(off, "l", "add", bcastSlot,
+                                        std::to_string(lane * elemSize));
+                    builder_.emitRaw("    store" + qbeType + " " + fillVal + ", " + off);
+                }
+            }
+            builder_.emitRaw("    neonldr " + bcastSlot);
+        }
+
+        // Get dest array pointer and data
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        // Get element count
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+        // Compute total bytes
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        // NEON end offset (rounded down to multiple of 16)
+        std::string neonEndOff = builder_.newTemp();
+        std::string neonMask = builder_.newTemp();
+        builder_.emitRaw("    " + neonMask + " =l copy -16");
+        builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "arrexpr_fill_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "arrexpr_fill_body_" + std::to_string(loopId);
+        std::string remLabel = "arrexpr_fill_rem_" + std::to_string(loopId);
+        std::string remBodyLabel = "arrexpr_fill_rembody_" + std::to_string(loopId);
+        std::string doneLabel = "arrexpr_fill_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+        builder_.emitBranch(done, remLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+        // Re-broadcast fill value into v28 (invariant across iterations;
+        // we re-emit each iteration because QBE may not keep NEON state alive)
+        if (useNeonDup) {
+            std::string dupSrc2;
+            if (elemType == BaseType::SINGLE) {
+                dupSrc2 = builder_.newTemp();
+                builder_.emitRaw("    " + dupSrc2 + " =w cast " + fillVal);
+            } else {
+                dupSrc2 = fillVal;
+            }
+            builder_.emitRaw("    neondup " + std::to_string(arrCode) + ", " + dupSrc2);
+        } else {
+            builder_.emitRaw("    neonldr " + bcastSlot);
+        }
+        builder_.emitRaw("    neonstr " + dstAddr);
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "16");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        // --- Remainder loop ---
+        builder_.emitLabel(remLabel);
+        if (elemSize < 16) {
+            std::string remOff = builder_.newTemp();
+            builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+            std::string remDone = builder_.newTemp();
+            builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+            builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+            builder_.emitLabel(remBodyLabel);
+            std::string rOff = builder_.newTemp();
+            builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, rOff);
+            builder_.emitRaw("    store" + qbeType + " " + fillVal + ", " + rDstAddr);
+
+            std::string rNext = builder_.newTemp();
+            builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+            builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+            builder_.emitJump(remLabel);
+        }
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End array fill expression ===");
+        return true;
+    }
+
+    // Scalar fallback
+    std::vector<std::string> srcNames;  // no sources for fill
+    emitWholeArrayScalarLoop(stmt->variable, srcNames, "fill", fillVal,
+                              elemType, false);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emitArrayNegate — negate: B() = -A()
+// ---------------------------------------------------------------------------
+bool ASTEmitter::emitArrayNegate(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::UnaryExpression* unary) {
+    using namespace FasterBASIC;
+
+    // The inner expression must be a whole-array ref
+    auto* srcArrExpr = static_cast<const ArrayAccessExpression*>(unary->expr.get());
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcIt = symbolTable.arrays.find(srcArrExpr->name);
+    if (srcIt == symbolTable.arrays.end()) return false;
+
+    if (destArray.elementTypeDesc.baseType != srcIt->second.elementTypeDesc.baseType)
+        return false;
+
+    // UDT negate doesn't make sense
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED)
+        return false;
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    BaseType elemType = destArray.elementTypeDesc.baseType;
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    builder_.emitComment("Array expression: " + stmt->variable
+        + "() = -" + srcArrExpr->name + "() (negate)");
+
+    // Try NEON path: use neonneg opcode for direct vector negation
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled()) {
+        builder_.emitComment("=== Array negate: NEON vectorized loop (neonneg) ===");
+
+        std::string qbeType = typeManager_.getQBEType(elemType);
+
+        // Get array data pointers
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string srcDescName = getArrayDescriptorPtr(srcArrExpr->name);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+        // Get bounds and check source
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+        // Compute total bytes
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        // NEON-aligned end
+        std::string neonEndOff = builder_.newTemp();
+        std::string neonMask = builder_.newTemp();
+        builder_.emitRaw("    " + neonMask + " =l copy -16");
+        builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "arrexpr_neg_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "arrexpr_neg_body_" + std::to_string(loopId);
+        std::string remLabel = "arrexpr_neg_rem_" + std::to_string(loopId);
+        std::string remBodyLabel = "arrexpr_neg_rembody_" + std::to_string(loopId);
+        std::string doneLabel = "arrexpr_neg_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+        builder_.emitBranch(done, remLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", srcDataPtr, off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+        // Negate: load source → v28, then neonneg v28 = -v28
+        builder_.emitRaw("    neonldr " + srcAddr);
+        builder_.emitRaw("    neonneg " + std::to_string(simdArrangementCode(simdInfo)));
+        builder_.emitRaw("    neonstr " + dstAddr);
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "16");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        // --- Remainder loop ---
+        builder_.emitLabel(remLabel);
+        if (elemSize < 16) {
+            std::string remOff = builder_.newTemp();
+            builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+            std::string remDone = builder_.newTemp();
+            builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+            builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+            builder_.emitLabel(remBodyLabel);
+            std::string rOff = builder_.newTemp();
+            builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+            std::string rSrcAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcAddr, "l", "add", srcDataPtr, rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, rOff);
+
+            std::string loadOp = "load" + qbeType;
+            std::string rSrcVal = builder_.newTemp();
+            builder_.emitRaw("    " + rSrcVal + " =" + qbeType + " " + loadOp + " " + rSrcAddr);
+
+            // Scalar negate: 0 - value
+            std::string rZero = builder_.newTemp();
+            if (typeManager_.isFloatingPoint(elemType)) {
+                if (elemType == BaseType::SINGLE) {
+                    builder_.emitRaw("    " + rZero + " =s copy s_0.0");
+                } else {
+                    builder_.emitRaw("    " + rZero + " =d copy d_0.0");
+                }
+            } else {
+                builder_.emitRaw("    " + rZero + " =w copy 0");
+            }
+            std::string rResult = builder_.newTemp();
+            builder_.emitBinary(rResult, qbeType, "sub", rZero, rSrcVal);
+            builder_.emitRaw("    store" + qbeType + " " + rResult + ", " + rDstAddr);
+
+            std::string rNext = builder_.newTemp();
+            builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+            builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+            builder_.emitJump(remLabel);
+        }
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End array negate expression ===");
+        return true;
+    }
+
+    // Scalar fallback
+    if (destArray.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+        // UDT array negate scalar fallback: field-by-field per element
+        builder_.emitComment("UDT array negate: scalar field-by-field fallback");
+
+        auto udtIt = symbolTable.types.find(destArray.elementTypeDesc.udtName);
+        if (udtIt == symbolTable.types.end()) return false;
+        const auto& udtDef = udtIt->second;
+
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string srcDescName = getArrayDescriptorPtr(srcArrExpr->name);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string elemSizeL = builder_.newTemp();
+        builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "udtneg_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "udtneg_body_" + std::to_string(loopId);
+        std::string doneLabel = "udtneg_done_" + std::to_string(loopId);
+
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + totalBytes);
+        builder_.emitBranch(done, doneLabel, bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        std::string elemSrc = builder_.newTemp();
+        builder_.emitBinary(elemSrc, "l", "add", srcDataPtr, off);
+        std::string elemDst = builder_.newTemp();
+        builder_.emitBinary(elemDst, "l", "add", destDataPtr, off);
+
+        int64_t fieldOff = 0;
+        for (size_t fi = 0; fi < udtDef.fields.size(); ++fi) {
+            const auto& field = udtDef.fields[fi];
+            BaseType fType = field.typeDesc.baseType;
+            if (fType == BaseType::STRING || fType == BaseType::USER_DEFINED) {
+                fieldOff += typeManager_.getTypeSize(fType);
+                continue;
+            }
+            std::string fQbeType = typeManager_.getQBEType(fType);
+            std::string fLoadOp = "load" + fQbeType;
+            std::string fStoreOp = "store" + fQbeType;
+
+            std::string fSrc = builder_.newTemp();
+            std::string fDst = builder_.newTemp();
+            if (fieldOff > 0) {
+                builder_.emitBinary(fSrc, "l", "add", elemSrc, std::to_string(fieldOff));
+                builder_.emitBinary(fDst, "l", "add", elemDst, std::to_string(fieldOff));
+            } else {
+                builder_.emitRaw("    " + fSrc + " =l copy " + elemSrc);
+                builder_.emitRaw("    " + fDst + " =l copy " + elemDst);
+            }
+
+            std::string srcVal = builder_.newTemp();
+            builder_.emitRaw("    " + srcVal + " =" + fQbeType + " " + fLoadOp + " " + fSrc);
+
+            std::string zeroVal;
+            if (typeManager_.isFloatingPoint(fType)) {
+                zeroVal = builder_.newTemp();
+                if (fType == BaseType::SINGLE) {
+                    builder_.emitRaw("    " + zeroVal + " =s copy s_0.0");
+                } else {
+                    builder_.emitRaw("    " + zeroVal + " =d copy d_0.0");
+                }
+            } else {
+                zeroVal = "0";
+            }
+            std::string res = builder_.newTemp();
+            builder_.emitBinary(res, fQbeType, "sub", zeroVal, srcVal);
+            builder_.emitRaw("    " + fStoreOp + " " + res + ", " + fDst);
+
+            fieldOff += typeManager_.getTypeSize(fType);
+        }
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End UDT array negate scalar loop ===");
+        return true;
+    }
+
+    // Primitive scalar fallback
+    std::vector<std::string> srcNames = { srcArrExpr->name };
+    emitWholeArrayScalarLoop(stmt->variable, srcNames, "neg", "",
+                              elemType, false);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// emitWholeArraySIMDLoop — NEON vectorized loop for array expressions
+// ---------------------------------------------------------------------------
+void ASTEmitter::emitWholeArraySIMDLoop(
+        const SIMDLoopInfo& info,
+        int elemSize,
+        const std::string& destArrayName) {
+    using namespace FasterBASIC;
+
+    builder_.emitComment("=== Array expression: NEON vectorized loop ===");
+    builder_.emitComment("Pattern: " + info.operation
+        + " | arrays: " + std::to_string(info.operands.size())
+        + " | elemSize: " + std::to_string(elemSize) + "B"
+        + " | registerWidth: " + std::to_string(info.elemSizeBytes) + "B");
+
+    // 1. Get destination array pointer and bounds
+    std::string destDescName = getArrayDescriptorPtr(destArrayName);
+    std::string destArrPtr = builder_.newTemp();
+    builder_.emitLoad(destArrPtr, "l", destDescName);
+
+    std::string lbW = builder_.newTemp();
+    builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+    std::string ubW = builder_.newTemp();
+    builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+    // 2. Bounds-check source arrays
+    for (size_t i = 0; i < info.operands.size(); ++i) {
+        if ((int)i == info.destArrayIndex) continue;
+        std::string srcDescName = getArrayDescriptorPtr(info.operands[i].arrayName);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        builder_.emitComment("Bounds-check source array: " + info.operands[i].arrayName);
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+    }
+
+    // 3. Get data pointers for all arrays
+    std::vector<std::string> basePtrs;
+    for (const auto& op : info.operands) {
+        std::string descName = getArrayDescriptorPtr(op.arrayName);
+        std::string arrPtr = builder_.newTemp();
+        builder_.emitLoad(arrPtr, "l", descName);
+        std::string dataPtr = builder_.newTemp();
+        builder_.emitCall(dataPtr, "l", "array_get_data_ptr", "l " + arrPtr);
+        basePtrs.push_back(dataPtr);
+    }
+
+    // 4. Compute total byte count: count = (ub - lb + 1) * elemSize
+    std::string lbL = builder_.newTemp();
+    builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+    std::string ubL = builder_.newTemp();
+    builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+    std::string countL = builder_.newTemp();
+    builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+    std::string count1L = builder_.newTemp();
+    builder_.emitBinary(count1L, "l", "add", countL, "1");
+    std::string elemSizeL = builder_.newTemp();
+    builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+    // 5. NEON loop: iterate in steps of 16 bytes (NEON register width)
+    //    For UDT arrays (elemSize == 16), no remainder needed.
+    //    For numeric arrays (elemSize < 16), handle remainder after main loop.
+    int neonStride = info.elemSizeBytes;  // 16
+
+    // Compute NEON-aligned end offset (round down totalBytes to multiple of 16)
+    std::string neonEndOff = builder_.newTemp();
+    if (elemSize < 16) {
+        std::string neonMask = builder_.newTemp();
+        builder_.emitRaw("    " + neonMask + " =l copy -16");
+        builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+    } else {
+        builder_.emitRaw("    " + neonEndOff + " =l copy " + totalBytes);
+    }
+
+    // Cursor offset slot
+    std::string curOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel 0, " + curOffSlot);
+
+    int loopId = builder_.getNextLabelId();
+    std::string hdrLabel = "arrexpr_hdr_" + std::to_string(loopId);
+    std::string bodyLabel = "arrexpr_body_" + std::to_string(loopId);
+    std::string remLabel = "arrexpr_rem_" + std::to_string(loopId);
+    std::string remBodyLabel = "arrexpr_rembody_" + std::to_string(loopId);
+    std::string doneLabel = "arrexpr_done_" + std::to_string(loopId);
+
+    builder_.emitJump(hdrLabel);
+    builder_.emitLabel(hdrLabel);
+
+    // Check: curOff >= neonEndOff → go to remainder/done
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+    std::string done = builder_.newTemp();
+    builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+    builder_.emitBranch(done, (elemSize < 16 ? remLabel : doneLabel), bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+    if (info.operation == "copy") {
+        // Copy: neonldr from source, neonstr to dest
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", basePtrs[info.srcAArrayIndex], off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", basePtrs[info.destArrayIndex], off);
+        builder_.emitRaw("    neonldr " + srcAddr);
+        builder_.emitRaw("    neonstr " + dstAddr);
+    } else {
+        // Arithmetic: neonldr srcA → q28, neonldr2 srcB → q29, op, neonstr dest
+        std::string srcAAddr = builder_.newTemp();
+        builder_.emitBinary(srcAAddr, "l", "add", basePtrs[info.srcAArrayIndex], off);
+        std::string srcBAddr = builder_.newTemp();
+        builder_.emitBinary(srcBAddr, "l", "add", basePtrs[info.srcBArrayIndex], off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", basePtrs[info.destArrayIndex], off);
+
+        builder_.emitRaw("    neonldr " + srcAAddr);
+        builder_.emitRaw("    neonldr2 " + srcBAddr);
+        std::string neonOp = "neon" + info.operation;
+        builder_.emitRaw("    " + neonOp + " " + std::to_string(info.arrangementCode));
+        builder_.emitRaw("    neonstr " + dstAddr);
+    }
+
+    // Advance offset by NEON stride (16 bytes)
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(neonStride));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+    builder_.emitJump(hdrLabel);
+
+    // 6. Remainder loop for numeric arrays (elemSize < 16)
+    if (elemSize < 16) {
+        builder_.emitLabel(remLabel);
+        builder_.emitComment("Scalar remainder loop for tail elements");
+
+        std::string remOff = builder_.newTemp();
+        builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+        std::string remDone = builder_.newTemp();
+        builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+        builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+        builder_.emitLabel(remBodyLabel);
+        std::string rOff = builder_.newTemp();
+        builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+
+        // Determine QBE scalar type from the dest array
+        BaseType elemType = BaseType::UNKNOWN;
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto arrIt = symbolTable.arrays.find(destArrayName);
+        if (arrIt != symbolTable.arrays.end()) {
+            elemType = arrIt->second.elementTypeDesc.baseType;
+        }
+        std::string qbeType = typeManager_.getQBEType(elemType);
+        std::string loadOp = "load" + qbeType;
+        std::string storeOp = "store" + qbeType;
+
+        if (info.operation == "copy") {
+            std::string rSrcAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcAddr, "l", "add", basePtrs[info.srcAArrayIndex], rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", basePtrs[info.destArrayIndex], rOff);
+            std::string rVal = builder_.newTemp();
+            builder_.emitRaw("    " + rVal + " =" + qbeType + " " + loadOp + " " + rSrcAddr);
+            builder_.emitRaw("    " + storeOp + " " + rVal + ", " + rDstAddr);
+        } else {
+            std::string rSrcAAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcAAddr, "l", "add", basePtrs[info.srcAArrayIndex], rOff);
+            std::string rSrcBAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcBAddr, "l", "add", basePtrs[info.srcBArrayIndex], rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", basePtrs[info.destArrayIndex], rOff);
+
+            std::string rA = builder_.newTemp();
+            builder_.emitRaw("    " + rA + " =" + qbeType + " " + loadOp + " " + rSrcAAddr);
+            std::string rB = builder_.newTemp();
+            builder_.emitRaw("    " + rB + " =" + qbeType + " " + loadOp + " " + rSrcBAddr);
+            std::string rResult = builder_.newTemp();
+            builder_.emitBinary(rResult, qbeType, info.operation, rA, rB);
+            builder_.emitRaw("    " + storeOp + " " + rResult + ", " + rDstAddr);
+        }
+
+        // Advance by element size
+        std::string rNext = builder_.newTemp();
+        builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+        builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+        builder_.emitJump(remLabel);
+    }
+
+    builder_.emitLabel(doneLabel);
+    builder_.emitComment("=== End array expression loop ===");
+}
+
+// ---------------------------------------------------------------------------
+// emitWholeArrayScalarLoop — scalar fallback for all array operations
+// ---------------------------------------------------------------------------
+void ASTEmitter::emitWholeArrayScalarLoop(
+        const std::string& destArrayName,
+        const std::vector<std::string>& srcArrayNames,
+        const std::string& operation,
+        const std::string& scalarValue,
+        FasterBASIC::BaseType elemType,
+        bool scalarOnLeft) {
+    using namespace FasterBASIC;
+
+    builder_.emitComment("=== Array expression: scalar fallback loop ===");
+    builder_.emitComment("Operation: " + operation);
+
+    std::string qbeType = typeManager_.getQBEType(elemType);
+    int elemSize = typeManager_.getTypeSize(elemType);
+    if (elemSize <= 0) {
+        builder_.emitComment("ERROR: unsupported element type for scalar loop");
+        return;
+    }
+
+    // Get destination array pointer and data
+    std::string destDescName = getArrayDescriptorPtr(destArrayName);
+    std::string destArrPtr = builder_.newTemp();
+    builder_.emitLoad(destArrPtr, "l", destDescName);
+    std::string destDataPtr = builder_.newTemp();
+    builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+    // Get bounds
+    std::string lbW = builder_.newTemp();
+    builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+    std::string ubW = builder_.newTemp();
+    builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+    // Get source array data pointers and bounds-check
+    std::vector<std::string> srcDataPtrs;
+    for (const auto& srcName : srcArrayNames) {
+        std::string srcDescName = getArrayDescriptorPtr(srcName);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+        srcDataPtrs.push_back(srcDataPtr);
+    }
+
+    // Compute total bytes
+    std::string lbL = builder_.newTemp();
+    builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+    std::string ubL = builder_.newTemp();
+    builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+    std::string countL = builder_.newTemp();
+    builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+    std::string count1L = builder_.newTemp();
+    builder_.emitBinary(count1L, "l", "add", countL, "1");
+    std::string elemSizeL = builder_.newTemp();
+    builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(elemSize));
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1L, elemSizeL);
+
+    // Loop: iterate in steps of elemSize
+    std::string curOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel 0, " + curOffSlot);
+
+    int loopId = builder_.getNextLabelId();
+    std::string hdrLabel = "arrexpr_scalar_hdr_" + std::to_string(loopId);
+    std::string bodyLabel = "arrexpr_scalar_body_" + std::to_string(loopId);
+    std::string doneLabel = "arrexpr_scalar_done_" + std::to_string(loopId);
+
+    builder_.emitJump(hdrLabel);
+    builder_.emitLabel(hdrLabel);
+
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+    std::string done = builder_.newTemp();
+    builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + totalBytes);
+    builder_.emitBranch(done, doneLabel, bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+    std::string loadOp = "load" + qbeType;
+    std::string storeOp = "store" + qbeType;
+
+    std::string dstAddr = builder_.newTemp();
+    builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+    if (operation == "copy") {
+        // Copy: load from source, store to dest
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", srcDataPtrs[0], off);
+        std::string val = builder_.newTemp();
+        builder_.emitRaw("    " + val + " =" + qbeType + " " + loadOp + " " + srcAddr);
+        builder_.emitRaw("    " + storeOp + " " + val + ", " + dstAddr);
+    } else if (operation == "fill") {
+        // Fill: store scalar value to dest
+        builder_.emitRaw("    " + storeOp + " " + scalarValue + ", " + dstAddr);
+    } else if (operation == "neg") {
+        // Negate: load from source, negate, store to dest
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", srcDataPtrs[0], off);
+        std::string srcVal = builder_.newTemp();
+        builder_.emitRaw("    " + srcVal + " =" + qbeType + " " + loadOp + " " + srcAddr);
+
+        std::string zeroVal;
+        if (typeManager_.isFloatingPoint(elemType)) {
+            zeroVal = builder_.newTemp();
+            if (elemType == BaseType::SINGLE) {
+                builder_.emitRaw("    " + zeroVal + " =s copy s_0.0");
+            } else {
+                builder_.emitRaw("    " + zeroVal + " =d copy d_0.0");
+            }
+        } else {
+            zeroVal = "0";
+        }
+        std::string result = builder_.newTemp();
+        builder_.emitBinary(result, qbeType, "sub", zeroVal, srcVal);
+        builder_.emitRaw("    " + storeOp + " " + result + ", " + dstAddr);
+    } else {
+        // Binary op (add, sub, mul, div)
+        if (srcDataPtrs.size() >= 2) {
+            // Array-array: load both sources
+            std::string srcAAddr = builder_.newTemp();
+            builder_.emitBinary(srcAAddr, "l", "add", srcDataPtrs[0], off);
+            std::string srcBAddr = builder_.newTemp();
+            builder_.emitBinary(srcBAddr, "l", "add", srcDataPtrs[1], off);
+            std::string aVal = builder_.newTemp();
+            builder_.emitRaw("    " + aVal + " =" + qbeType + " " + loadOp + " " + srcAAddr);
+            std::string bVal = builder_.newTemp();
+            builder_.emitRaw("    " + bVal + " =" + qbeType + " " + loadOp + " " + srcBAddr);
+            std::string result = builder_.newTemp();
+            builder_.emitBinary(result, qbeType, operation, aVal, bVal);
+            builder_.emitRaw("    " + storeOp + " " + result + ", " + dstAddr);
+        } else if (srcDataPtrs.size() == 1) {
+            // Array-scalar broadcast
+            std::string srcAddr = builder_.newTemp();
+            builder_.emitBinary(srcAddr, "l", "add", srcDataPtrs[0], off);
+            std::string arrVal = builder_.newTemp();
+            builder_.emitRaw("    " + arrVal + " =" + qbeType + " " + loadOp + " " + srcAddr);
+            std::string result = builder_.newTemp();
+            if (scalarOnLeft) {
+                builder_.emitBinary(result, qbeType, operation, scalarValue, arrVal);
+            } else {
+                builder_.emitBinary(result, qbeType, operation, arrVal, scalarValue);
+            }
+            builder_.emitRaw("    " + storeOp + " " + result + ", " + dstAddr);
+        }
+    }
+
+    // Advance offset
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+    builder_.emitJump(hdrLabel);
+
+    builder_.emitLabel(doneLabel);
+    builder_.emitComment("=== End array expression scalar loop ===");
 }
 
 } // namespace fbc

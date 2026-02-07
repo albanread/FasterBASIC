@@ -1670,9 +1670,9 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
                         size = 10;  // Default fallback
                     }
                     
-                    if (size <= 0) {
+                    if (size < 0) {
                         error(SemanticErrorType::INVALID_ARRAY_INDEX,
-                              "Constant array dimension must be positive (got " + std::to_string(size) + ")",
+                              "Constant array dimension must be non-negative (got " + std::to_string(size) + ")",
                               stmt.location);
                         size = 1;
                     }
@@ -4433,7 +4433,8 @@ void SemanticAnalyzer::useArray(const std::string& name, size_t dimensionCount,
     }
     
     // Check dimension count
-    if (dimensionCount != sym->dimensions.size()) {
+    // Allow dimensionCount == 0 for whole-array references like A() in array expressions
+    if (dimensionCount != 0 && dimensionCount != sym->dimensions.size()) {
         error(SemanticErrorType::WRONG_DIMENSION_COUNT,
               "Array '" + name + "' expects " + std::to_string(sym->dimensions.size()) +
               " dimensions, got " + std::to_string(dimensionCount),

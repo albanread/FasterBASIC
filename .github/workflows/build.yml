@@ -93,9 +93,193 @@ jobs:
           path: release/fasterbasic-macos-arm64.tar.gz
           retention-days: 90
 
+  test-neon:
+    name: NEON Tests (array_expr + neon)
+    runs-on: macos-latest
+    needs: [build-macos]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build FasterBASIC
+        run: |
+          cd qbe_basic_integrated
+          ./build_qbe_basic.sh
+
+      - name: Run all NEON-path tests
+        env:
+          ENABLE_NEON_LOOP: "1"
+        run: |
+          cd qbe_basic_integrated
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+          FAILED_TESTS=""
+
+          run_suite() {
+            local suite_name="$1"
+            local suite_dir="$2"
+
+            echo ""
+            echo "============================================"
+            echo "  $suite_name — NEON Enabled"
+            echo "============================================"
+            echo ""
+
+            for bas_file in "$suite_dir"/*.bas; do
+              [ -f "$bas_file" ] || continue
+              test_name="$(basename "$bas_file" .bas)"
+              echo "--- Compiling: $test_name ---"
+              TOTAL=$((TOTAL + 1))
+
+              if ! ./fbc_qbe "$bas_file" -o "../test_output_${test_name}" 2>&1; then
+                echo "COMPILE ERROR: $test_name"
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  COMPILE: $test_name\n"
+                continue
+              fi
+
+              echo "--- Running: $test_name ---"
+              output=$("../test_output_${test_name}" 2>&1) || true
+              echo "$output"
+              echo ""
+
+              fail_count=$(echo "$output" | grep -ci "FAIL" || true)
+              if [ "$fail_count" -gt 0 ]; then
+                echo "*** TEST FAILED: $test_name ($fail_count failure(s)) ***"
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  RUNTIME: $test_name ($fail_count failures)\n"
+              else
+                pass_count=$(echo "$output" | grep -ci "PASS" || true)
+                if [ "$pass_count" -eq 0 ]; then
+                  echo "*** TEST SUSPECT: $test_name (no PASS lines found) ***"
+                  FAILED=$((FAILED + 1))
+                  FAILED_TESTS="$FAILED_TESTS  NO_PASS: $test_name\n"
+                else
+                  PASSED=$((PASSED + 1))
+                fi
+              fi
+
+              rm -f "../test_output_${test_name}"
+            done
+          }
+
+          run_suite "Array Expression Tests" "../tests/array_expr"
+          run_suite "NEON SIMD Tests"        "../tests/neon"
+
+          echo ""
+          echo "============================================"
+          echo "  NEON Results: $PASSED/$TOTAL passed"
+          echo "============================================"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            echo -e "$FAILED_TESTS"
+            exit 1
+          fi
+
+  test-scalar:
+    name: Scalar Fallback Tests (array_expr + neon)
+    runs-on: macos-latest
+    needs: [build-macos]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Build FasterBASIC
+        run: |
+          cd qbe_basic_integrated
+          ./build_qbe_basic.sh
+
+      - name: Run all scalar-fallback tests
+        env:
+          ENABLE_NEON_LOOP: "0"
+        run: |
+          cd qbe_basic_integrated
+          TOTAL=0
+          PASSED=0
+          FAILED=0
+          FAILED_TESTS=""
+
+          run_suite() {
+            local suite_name="$1"
+            local suite_dir="$2"
+
+            echo ""
+            echo "============================================"
+            echo "  $suite_name — Scalar Fallback"
+            echo "============================================"
+            echo ""
+
+            for bas_file in "$suite_dir"/*.bas; do
+              [ -f "$bas_file" ] || continue
+              test_name="$(basename "$bas_file" .bas)"
+              echo "--- Compiling: $test_name ---"
+              TOTAL=$((TOTAL + 1))
+
+              if ! ./fbc_qbe "$bas_file" -o "../test_output_${test_name}_scalar" 2>&1; then
+                echo "COMPILE ERROR: $test_name"
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  COMPILE: $test_name\n"
+                continue
+              fi
+
+              echo "--- Running: $test_name (scalar) ---"
+              output=$(ENABLE_NEON_LOOP=0 "../test_output_${test_name}_scalar" 2>&1) || true
+              echo "$output"
+              echo ""
+
+              fail_count=$(echo "$output" | grep -ci "FAIL" || true)
+              if [ "$fail_count" -gt 0 ]; then
+                echo "*** TEST FAILED: $test_name ($fail_count failure(s)) ***"
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  RUNTIME: $test_name ($fail_count failures)\n"
+              else
+                pass_count=$(echo "$output" | grep -ci "PASS" || true)
+                if [ "$pass_count" -eq 0 ]; then
+                  echo "*** TEST SUSPECT: $test_name (no PASS lines found) ***"
+                  FAILED=$((FAILED + 1))
+                  FAILED_TESTS="$FAILED_TESTS  NO_PASS: $test_name\n"
+                else
+                  PASSED=$((PASSED + 1))
+                fi
+              fi
+
+              rm -f "../test_output_${test_name}_scalar"
+            done
+          }
+
+          run_suite "Array Expression Tests" "../tests/array_expr"
+          run_suite "NEON SIMD Tests"        "../tests/neon"
+
+          echo ""
+          echo "============================================"
+          echo "  Scalar Fallback Results: $PASSED/$TOTAL passed"
+          echo "============================================"
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo ""
+            echo "Failed tests:"
+            echo -e "$FAILED_TESTS"
+            exit 1
+          fi
+
   create-release:
     name: Create GitHub Release
-    needs: [build-macos]
+    needs: [build-macos, test-neon, test-scalar]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
@@ -164,6 +348,7 @@ jobs:
           - Pattern matching with MATCH TYPE
           - Exception handling (TRY/CATCH/FINALLY)
           - NEON SIMD acceleration on ARM64
+          - Whole-array expressions with automatic NEON vectorization
           - User-defined types with SIMD optimization
           - Plugin system for extensibility
 
