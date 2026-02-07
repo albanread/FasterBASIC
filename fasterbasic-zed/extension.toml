@@ -4,11 +4,11 @@ description = "Syntax highlighting and language support for FasterBASIC"
 version = "0.1.0"
 schema_version = 1
 authors = ["FasterBASIC Team"]
-repository = "https://github.com/nicholasgasior/compact_repo"
+repository = "https://github.com/albanread/FasterBASIC"
 
 [language_servers]
 
 [grammars.fasterbasic]
-repository = "file:///Users/oberon/compact_repo"
-rev = "HEAD"
+repository = "https://github.com/albanread/FasterBASIC"
+rev = "a7b8bed3944fb2578f74ff21fdee0f0665fe80a5"
 path = "fasterbasic-zed/grammars/fasterbasic"
