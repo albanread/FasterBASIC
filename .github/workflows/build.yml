@@ -2,11 +2,11 @@ name: Build and Release
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     tags:
-      - 'v*'
+      - "v*"
   pull_request:
-    branches: [ main ]
+    branches: [main]
   workflow_dispatch:
 
 jobs:
@@ -15,335 +15,168 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup Xcode
-      uses: maxim-lobanov/setup-xcode@v1
-      with:
-        xcode-version: latest-stable
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
-    - name: Build FasterBASIC
-      run: |
-        cd qbe_basic_integrated
-        ./build_qbe_basic.sh
+      - name: Build FasterBASIC
+        run: |
+          cd qbe_basic_integrated
+          ./build_qbe_basic.sh
 
-    - name: Verify build
-      run: |
-        cd qbe_basic_integrated
-        ./fbc_qbe --version || echo "Version flag not implemented"
-        file fbc_qbe
+      - name: Verify build
+        run: |
+          cd qbe_basic_integrated
+          ./fbc_qbe --version || echo "Version flag not implemented"
+          file fbc_qbe
 
-    - name: Create test program
-      run: |
-        cat > test_hello.bas << 'EOF'
-        PRINT "Hello from FasterBASIC!"
-        PRINT "Platform: macOS ARM64"
-        END
-        EOF
+      - name: Create test program
+        run: |
+          cat > test_hello.bas << 'EOF'
+          PRINT "Hello from FasterBASIC!"
+          PRINT "Platform: macOS ARM64"
+          END
+          EOF
 
-    - name: Test compilation
-      run: |
-        cd qbe_basic_integrated
-        ./fbc_qbe ../test_hello.bas -o ../test_hello
-        ../test_hello
+      - name: Test compilation
+        run: |
+          cd qbe_basic_integrated
+          ./fbc_qbe ../test_hello.bas -o ../test_hello
+          ../test_hello
 
-    - name: Package release
-      run: |
-        mkdir -p release/fasterbasic-macos-arm64
-        cp qbe_basic_integrated/fbc_qbe release/fasterbasic-macos-arm64/
-        cp qbe_basic_integrated/qbe_basic release/fasterbasic-macos-arm64/
-        cp -r qbe_basic_integrated/runtime release/fasterbasic-macos-arm64/
-        cp README.md release/fasterbasic-macos-arm64/
-        cp LICENSE release/fasterbasic-macos-arm64/ || echo "No LICENSE file"
+      - name: Package release
+        run: |
+          mkdir -p release/fasterbasic-macos-arm64
+          cp qbe_basic_integrated/fbc_qbe release/fasterbasic-macos-arm64/
+          cp qbe_basic_integrated/qbe_basic release/fasterbasic-macos-arm64/
+          cp -r qbe_basic_integrated/runtime release/fasterbasic-macos-arm64/
+          cp README.md release/fasterbasic-macos-arm64/
+          cp LICENSE release/fasterbasic-macos-arm64/ || echo "No LICENSE file"
 
-        cat > release/fasterbasic-macos-arm64/README.txt << 'EOF'
-        FasterBASIC Compiler - macOS ARM64 (Apple Silicon)
-        ==================================================
+          cat > release/fasterbasic-macos-arm64/README.txt << 'EOF'
+          FasterBASIC Compiler - macOS ARM64 (Apple Silicon)
+          ==================================================
 
-        Usage:
-          ./fbc_qbe program.bas              # Compile to executable
-          ./fbc_qbe program.bas -o name      # Compile with custom name
-          ./fbc_qbe program.bas -i -o out.qbe # Generate QBE IL
-          ./fbc_qbe program.bas -c -o out.s  # Generate assembly
+          Usage:
+            ./fbc_qbe program.bas              # Compile to executable
+            ./fbc_qbe program.bas -o name      # Compile with custom name
+            ./fbc_qbe program.bas -i -o out.qbe # Generate QBE IL
+            ./fbc_qbe program.bas -c -o out.s  # Generate assembly
 
-        Documentation:
-          https://github.com/albanread/FasterBASIC/wiki
+          Documentation:
+            https://github.com/albanread/FasterBASIC/wiki
 
-        Examples:
-          echo 'PRINT "Hello, World!"' > hello.bas
-          echo 'END' >> hello.bas
-          ./fbc_qbe hello.bas -o hello
-          ./hello
+          Examples:
+            echo 'PRINT "Hello, World!"' > hello.bas
+            echo 'END' >> hello.bas
+            ./fbc_qbe hello.bas -o hello
+            ./hello
 
-        The fbc_qbe executable is the main compiler.
-        The qbe_basic symlink is provided for backward compatibility.
+          The fbc_qbe executable is the main compiler.
+          The qbe_basic symlink is provided for backward compatibility.
 
-        Runtime library files are in the runtime/ directory and will be
-        automatically compiled and cached on first use.
-        EOF
+          Runtime library files are in the runtime/ directory and will be
+          automatically compiled and cached on first use.
+          EOF
 
-        cd release
-        tar -czf fasterbasic-macos-arm64.tar.gz fasterbasic-macos-arm64
+          cd release
+          tar -czf fasterbasic-macos-arm64.tar.gz fasterbasic-macos-arm64
 
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: fasterbasic-macos-arm64
-        path: release/fasterbasic-macos-arm64.tar.gz
-        retention-days: 90
-
-  build-macos-x64:
-    name: Build macOS x86_64
-    runs-on: macos-13  # macOS 13 still has Intel runners
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Build FasterBASIC
-      run: |
-        cd qbe_basic_integrated
-        ./build_qbe_basic.sh
-
-    - name: Verify build
-      run: |
-        cd qbe_basic_integrated
-        file fbc_qbe
-
-    - name: Create test program
-      run: |
-        cat > test_hello.bas << 'EOF'
-        PRINT "Hello from FasterBASIC!"
-        PRINT "Platform: macOS x86_64"
-        END
-        EOF
-
-    - name: Test compilation
-      run: |
-        cd qbe_basic_integrated
-        ./fbc_qbe ../test_hello.bas -o ../test_hello
-        ../test_hello
-
-    - name: Package release
-      run: |
-        mkdir -p release/fasterbasic-macos-x86_64
-        cp qbe_basic_integrated/fbc_qbe release/fasterbasic-macos-x86_64/
-        cp qbe_basic_integrated/qbe_basic release/fasterbasic-macos-x86_64/
-        cp -r qbe_basic_integrated/runtime release/fasterbasic-macos-x86_64/
-        cp README.md release/fasterbasic-macos-x86_64/
-        cp LICENSE release/fasterbasic-macos-x86_64/ || echo "No LICENSE file"
-
-        cat > release/fasterbasic-macos-x86_64/README.txt << 'EOF'
-        FasterBASIC Compiler - macOS x86_64 (Intel)
-        ============================================
-
-        Usage:
-          ./fbc_qbe program.bas              # Compile to executable
-          ./fbc_qbe program.bas -o name      # Compile with custom name
-          ./fbc_qbe program.bas -i -o out.qbe # Generate QBE IL
-          ./fbc_qbe program.bas -c -o out.s  # Generate assembly
-
-        Documentation:
-          https://github.com/albanread/FasterBASIC/wiki
-
-        Examples:
-          echo 'PRINT "Hello, World!"' > hello.bas
-          echo 'END' >> hello.bas
-          ./fbc_qbe hello.bas -o hello
-          ./hello
-
-        The fbc_qbe executable is the main compiler.
-        The qbe_basic symlink is provided for backward compatibility.
-
-        Runtime library files are in the runtime/ directory and will be
-        automatically compiled and cached on first use.
-        EOF
-
-        cd release
-        tar -czf fasterbasic-macos-x86_64.tar.gz fasterbasic-macos-x86_64
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: fasterbasic-macos-x86_64
-        path: release/fasterbasic-macos-x86_64.tar.gz
-        retention-days: 90
-
-  build-linux:
-    name: Build Linux x86_64
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y build-essential clang
-
-    - name: Build FasterBASIC
-      run: |
-        cd qbe_basic_integrated
-        ./build_qbe_basic.sh
-
-    - name: Verify build
-      run: |
-        cd qbe_basic_integrated
-        file fbc_qbe
-        ldd fbc_qbe || true
-
-    - name: Create test program
-      run: |
-        cat > test_hello.bas << 'EOF'
-        PRINT "Hello from FasterBASIC!"
-        PRINT "Platform: Linux x86_64"
-        END
-        EOF
-
-    - name: Test compilation
-      run: |
-        cd qbe_basic_integrated
-        ./fbc_qbe ../test_hello.bas -o ../test_hello
-        ../test_hello
-
-    - name: Package release
-      run: |
-        mkdir -p release/fasterbasic-linux-x86_64
-        cp qbe_basic_integrated/fbc_qbe release/fasterbasic-linux-x86_64/
-        cp qbe_basic_integrated/qbe_basic release/fasterbasic-linux-x86_64/
-        cp -r qbe_basic_integrated/runtime release/fasterbasic-linux-x86_64/
-        cp README.md release/fasterbasic-linux-x86_64/
-        cp LICENSE release/fasterbasic-linux-x86_64/ || echo "No LICENSE file"
-
-        cat > release/fasterbasic-linux-x86_64/README.txt << 'EOF'
-        FasterBASIC Compiler - Linux x86_64
-        ====================================
-
-        Usage:
-          ./fbc_qbe program.bas              # Compile to executable
-          ./fbc_qbe program.bas -o name      # Compile with custom name
-          ./fbc_qbe program.bas -i -o out.qbe # Generate QBE IL
-          ./fbc_qbe program.bas -c -o out.s  # Generate assembly
-
-        Documentation:
-          https://github.com/albanread/FasterBASIC/wiki
-
-        Examples:
-          echo 'PRINT "Hello, World!"' > hello.bas
-          echo 'END' >> hello.bas
-          ./fbc_qbe hello.bas -o hello
-          ./hello
-
-        The fbc_qbe executable is the main compiler.
-        The qbe_basic symlink is provided for backward compatibility.
-
-        Runtime library files are in the runtime/ directory and will be
-        automatically compiled and cached on first use.
-        EOF
-
-        cd release
-        tar -czf fasterbasic-linux-x86_64.tar.gz fasterbasic-linux-x86_64
-
-    - name: Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: fasterbasic-linux-x86_64
-        path: release/fasterbasic-linux-x86_64.tar.gz
-        retention-days: 90
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fasterbasic-macos-arm64
+          path: release/fasterbasic-macos-arm64.tar.gz
+          retention-days: 90
 
   create-release:
     name: Create GitHub Release
-    needs: [build-macos, build-macos-x64, build-linux]
+    needs: [build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Download all artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: artifacts
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
-    - name: Create release notes
-      run: |
-        cat > RELEASE_NOTES.md << 'EOF'
-        # FasterBASIC Release
+      - name: Create release notes
+        run: |
+          cat > RELEASE_NOTES.md << 'EOF'
+          # FasterBASIC Release
 
-        ## Downloads
+          ## Downloads
 
-        Choose the appropriate build for your platform:
+          - **macOS ARM64** (Apple Silicon M1/M2/M3): `fasterbasic-macos-arm64.tar.gz`
 
-        - **macOS ARM64** (Apple Silicon M1/M2/M3): `fasterbasic-macos-arm64.tar.gz`
-        - **macOS x86_64** (Intel): `fasterbasic-macos-x86_64.tar.gz`
-        - **Linux x86_64**: `fasterbasic-linux-x86_64.tar.gz`
+          ## Installation
 
-        ## Installation
+          1. Download the archive
+          2. Extract: `tar -xzf fasterbasic-macos-arm64.tar.gz`
+          3. Run: `cd fasterbasic-macos-arm64/ && ./fbc_qbe yourprogram.bas`
 
-        1. Download the appropriate archive for your platform
-        2. Extract: `tar -xzf fasterbasic-*.tar.gz`
-        3. Run: `cd fasterbasic-*/ && ./fbc_qbe yourprogram.bas`
+          ## Documentation
 
-        ## Documentation
+          Visit the [FasterBASIC Wiki](https://github.com/albanread/FasterBASIC/wiki) for:
+          - [Quick Reference](https://github.com/albanread/FasterBASIC/wiki/Quick-Reference)
+          - [Language Summary](https://github.com/albanread/FasterBASIC/wiki/Language-Summary)
+          - [Classes and Objects](https://github.com/albanread/FasterBASIC/wiki/Classes-and-Objects)
+          - [Lists and Pattern Matching](https://github.com/albanread/FasterBASIC/wiki/Lists-and-Pattern-Matching)
+          - [NEON SIMD Support](https://github.com/albanread/FasterBASIC/wiki/NEON-SIMD-Support)
 
-        Visit the [FasterBASIC Wiki](https://github.com/albanread/FasterBASIC/wiki) for:
-        - [Quick Reference](https://github.com/albanread/FasterBASIC/wiki/Quick-Reference)
-        - [Language Summary](https://github.com/albanread/FasterBASIC/wiki/Language-Summary)
-        - [Classes and Objects](https://github.com/albanread/FasterBASIC/wiki/Classes-and-Objects)
-        - [Lists and Pattern Matching](https://github.com/albanread/FasterBASIC/wiki/Lists-and-Pattern-Matching)
-        - [NEON SIMD Support](https://github.com/albanread/FasterBASIC/wiki/NEON-SIMD-Support)
+          ## Quick Start
 
-        ## Quick Start
+          ```bash
+          # Create a simple program
+          echo 'PRINT "Hello, FasterBASIC!"' > hello.bas
+          echo 'END' >> hello.bas
 
-        ```bash
-        # Create a simple program
-        echo 'PRINT "Hello, FasterBASIC!"' > hello.bas
-        echo 'END' >> hello.bas
+          # Compile and run
+          ./fbc_qbe hello.bas -o hello
+          ./hello
+          ```
 
-        # Compile and run
-        ./fbc_qbe hello.bas -o hello
-        ./hello
-        ```
+          ## What's Included
 
-        ## What's Included
+          - `fbc_qbe` - The FasterBASIC compiler
+          - `qbe_basic` - Symlink for backward compatibility
+          - `runtime/` - Runtime library sources (auto-compiled on first use)
+          - `README.md` - Project documentation
+          - `README.txt` - Quick start guide
 
-        - `fbc_qbe` - The FasterBASIC compiler
-        - `qbe_basic` - Symlink for backward compatibility
-        - `runtime/` - Runtime library sources (auto-compiled on first use)
-        - `README.md` - Project documentation
-        - `README.txt` - Quick start guide
+          ## System Requirements
 
-        ## System Requirements
+          - **macOS**: macOS 10.15 or later (Apple Silicon)
 
-        - **macOS**: macOS 10.15 or later
-        - **Linux**: glibc 2.27 or later, gcc/clang for runtime compilation
+          ## Features
 
-        ## Features
+          - Native code compilation via QBE backend
+          - Object-oriented programming (classes, inheritance, polymorphism)
+          - Modern collections (Lists, HashMaps)
+          - Pattern matching with MATCH TYPE
+          - Exception handling (TRY/CATCH/FINALLY)
+          - NEON SIMD acceleration on ARM64
+          - User-defined types with SIMD optimization
+          - Plugin system for extensibility
 
-        - Native code compilation via QBE backend
-        - Object-oriented programming (classes, inheritance, polymorphism)
-        - Modern collections (Lists, HashMaps)
-        - Pattern matching with MATCH TYPE
-        - Exception handling (TRY/CATCH/FINALLY)
-        - NEON SIMD acceleration on ARM64
-        - User-defined types with SIMD optimization
-        - Plugin system for extensibility
+          For more information, visit: https://github.com/albanread/FasterBASIC
+          EOF
 
-        For more information, visit: https://github.com/albanread/FasterBASIC
-        EOF
-
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        files: |
-          artifacts/fasterbasic-macos-arm64/fasterbasic-macos-arm64.tar.gz
-          artifacts/fasterbasic-macos-x86_64/fasterbasic-macos-x86_64.tar.gz
-          artifacts/fasterbasic-linux-x86_64/fasterbasic-linux-x86_64.tar.gz
-        body_path: RELEASE_NOTES.md
-        draft: false
-        prerelease: false
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/fasterbasic-macos-arm64/fasterbasic-macos-arm64.tar.gz
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -2,7 +2,7 @@
 
 [![Build Status](https://github.com/albanread/FasterBASIC/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FasterBASIC/actions)
 
-A modern, compiled BASIC dialect that generates native machine code for AMD64, ARM64, and RISC-V architectures.
+A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon).
 
 ## 🎉 Latest Features (February 2025)
 
@@ -96,7 +96,7 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - **Exception Handling** - TRY/CATCH/FINALLY blocks
 - **SIMD Acceleration** - Automatic NEON vectorization on ARM64
 - **Plugin System** - Extensible with C/C++ plugins
-- **Cross-Platform** - AMD64, ARM64, RISC-V support
+- **Native ARM64** - Optimized for Apple Silicon
 
 > **Note on Graphics & Multimedia:** FasterBASIC will integrate with the [Superterminal](https://github.com/albanread/Superterminal) project to provide advanced graphics, sprites, and audio capabilities in the future.
 
@@ -248,7 +248,7 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 
 - **Graphics & Multimedia**: Integration with Superterminal for advanced graphics, sprites, and audio
 - **Debug info**: Enhanced debugging support with source maps
-- **Additional platforms**: Windows support
+- **Additional platforms**: Intel Mac, Linux, Windows support
 - **Standard library**: Expanded built-in functions
 
 ## Quick Start
@@ -298,7 +298,7 @@ The integrated `qbe_basic` compiler provides single-command compilation:
 
 **Features:**
 - Single command compilation from BASIC → executable
-- Automatic platform detection (macOS ARM64/x86_64, Linux)
+- Optimized for macOS ARM64 (Apple Silicon)
 - Smart runtime caching (10x faster on subsequent builds)
 - Self-contained with bundled runtime library
 
@@ -382,15 +382,11 @@ END TRY
 
 ### Auto-Detection
 
-The compiler automatically detects your platform and architecture during build:
+FasterBASIC is currently built and tested on:
 
-- **macOS ARM64** (Apple Silicon M1/M2/M3) → `arm64_apple` target
-- **macOS x86_64** (Intel) → `amd64_apple` target
-- **Linux x86_64** → `amd64_sysv` target
-- **Linux ARM64** → `arm64` target
-- **Linux RISC-V 64** → `rv64` target
+- **macOS ARM64** (Apple Silicon M1/M2/M3/M4)
 
-No manual configuration needed - just run `./build_qbe_basic.sh` and the correct target is selected automatically.
+The compiler uses the QBE backend which supports multiple architectures (AMD64, ARM64, RISC-V), making future platform support possible.
 
 ### Runtime Library
 
@@ -402,18 +398,7 @@ The runtime library is compiled on-demand with smart caching:
 
 ### Cross-Compilation
 
-To target a different architecture, use the `-t` flag:
-
-```bash
-./qbe_basic -t amd64_apple -o program input.bas  # Target Intel Mac
-./qbe_basic -t arm64_apple -o program input.bas   # Target Apple Silicon
-./qbe_basic -t amd64_sysv -o program input.bas    # Target Linux x86_64
-```
-
-List available targets:
-```bash
-./qbe_basic -t ?
-```
+The QBE backend supports cross-compilation to other architectures, though primary development and testing is on macOS ARM64.
 
 ## Architecture
 
@@ -849,7 +834,7 @@ cd fsh
 ./basic --run ../tests/exceptions/test_try_catch_basic.bas
 ```
 
-All tests pass on macOS ARM64 and x86_64. CI runs on every commit via GitHub Actions.
+All tests pass on macOS ARM64. CI runs on every commit via GitHub Actions.
 
 ## Key Implementation Insights
 
@@ -921,7 +906,7 @@ FasterBASIC explores modern compiler techniques applied to a classic language:
 **Areas for contribution:**
 - Additional language features and standard library functions
 - Plugin development (see `plugins/` directory)
-- Platform support (Windows, additional architectures)
+- Platform support (Intel Mac, Linux, Windows)
 - Optimization passes and performance improvements
 - Documentation and examples
 

@@ -11,8 +11,6 @@ FasterBASIC uses GitHub Actions to automatically build the compiler for multiple
 Every push to the `main` branch triggers builds for:
 
 - **macOS ARM64** (Apple Silicon M1/M2/M3)
-- **macOS x86_64** (Intel Macs)
-- **Linux x86_64**
 
 ### Build Process
 
@@ -80,13 +78,11 @@ git push origin v1.0.0
 
 ### Release Artifacts
 
-Each release includes three platform-specific archives:
+Each release includes:
 
 1. **fasterbasic-macos-arm64.tar.gz** - Apple Silicon
-2. **fasterbasic-macos-x86_64.tar.gz** - Intel Mac
-3. **fasterbasic-linux-x86_64.tar.gz** - Linux
 
-Each archive contains:
+The archive contains:
 - `fbc_qbe` - The compiler executable
 - `qbe_basic` - Symlink for backward compatibility
 - `runtime/` - Runtime library source files
@@ -123,15 +119,12 @@ The workflow runs on:
 ### Platform-Specific Runners
 
 - **macOS ARM64**: `macos-latest` (Apple Silicon)
-- **macOS x86_64**: `macos-13` (Intel)
-- **Linux x86_64**: `ubuntu-latest`
 
 ### Build Dependencies
 
 The workflow automatically installs:
 
 - **macOS**: Xcode command line tools (included)
-- **Linux**: `build-essential`, `clang`
 
 No additional setup is required - dependencies are installed automatically.
 
@@ -274,6 +267,7 @@ Configure notifications in GitHub settings: Settings → Notifications
 
 Potential enhancements to the CI/CD pipeline:
 
+- **macOS x86_64 builds**: Add Intel Mac support if needed
 - **ARM64 Linux builds**: Add when GitHub provides ARM runners
 - **Windows builds**: Add Windows support
 - **Automated testing**: Expand test coverage in CI

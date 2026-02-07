@@ -1,0 +1,60 @@
+name = "FasterBASIC"
+grammar = "fasterbasic"
+path_suffixes = ["bas", "bi", "bm"]
+line_comments = ["' ", "REM "]
+block_comment = []
+autoclose_before = ";:.,=}])> \n\t"
+word_characters = ["_", "$", "%", "&", "!", "#", "@", "^"]
+
+[brackets]
+"(" = ")"
+"[" = "]"
+
+[indents]
+increase = [
+  "^\\s*(IF|ELSEIF)\\b.*\\bTHEN\\s*$",
+  "^\\s*ELSE\\s*$",
+  "^\\s*FOR\\b",
+  "^\\s*WHILE\\b",
+  "^\\s*DO\\b",
+  "^\\s*REPEAT\\s*$",
+  "^\\s*SELECT\\s+CASE\\b",
+  "^\\s*CASE\\b",
+  "^\\s*OTHERWISE\\s*$",
+  "^\\s*SUB\\b",
+  "^\\s*FUNCTION\\b",
+  "^\\s*CLASS\\b",
+  "^\\s*CONSTRUCTOR\\b",
+  "^\\s*DESTRUCTOR\\b",
+  "^\\s*METHOD\\b",
+  "^\\s*TYPE\\b",
+  "^\\s*TRY\\s*$",
+  "^\\s*CATCH\\b",
+  "^\\s*FINALLY\\s*$",
+  "^\\s*MATCH\\s+TYPE\\b",
+  "^\\s*EVERY\\b.*\\bDO\\s*$",
+  "^\\s*AFTER\\b.*\\bDO\\s*$",
+]
+decrease = [
+  "^\\s*(ENDIF|END\\s+IF)\\b",
+  "^\\s*ELSE\\b",
+  "^\\s*ELSEIF\\b",
+  "^\\s*(NEXT|WEND|ENDWHILE)\\b",
+  "^\\s*LOOP\\b",
+  "^\\s*UNTIL\\b",
+  "^\\s*(ENDCASE|END\\s+CASE)\\b",
+  "^\\s*CASE\\b",
+  "^\\s*OTHERWISE\\b",
+  "^\\s*(END\\s+SUB|ENDSUB)\\b",
+  "^\\s*(END\\s+FUNCTION|ENDFUNCTION)\\b",
+  "^\\s*(END\\s+CLASS)\\b",
+  "^\\s*(END\\s+CONSTRUCTOR)\\b",
+  "^\\s*(END\\s+DESTRUCTOR)\\b",
+  "^\\s*(END\\s+METHOD)\\b",
+  "^\\s*(END\\s+TYPE|ENDTYPE)\\b",
+  "^\\s*(END\\s+TRY)\\b",
+  "^\\s*CATCH\\b",
+  "^\\s*FINALLY\\b",
+  "^\\s*(END\\s+MATCH|ENDMATCH)\\b",
+  "^\\s*DONE\\b",
+]
