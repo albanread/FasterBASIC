@@ -147,6 +147,7 @@ func(Fn *fn)
 	fillcfg(fn);
 	simpljmp(fn);
 	fillcfg(fn);
+	filllive(fn); /* re-run after regalloc so b->out has physical regs for emitter */
 	assert(fn->rpo[0] == fn->start);
 	for (n=0;; n++)
 		if (n == fn->nblk-1) {

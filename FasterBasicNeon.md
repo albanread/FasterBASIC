@@ -784,58 +784,125 @@ int elemSize = (simdInfo.isFullQ) ? 16 : 8;
 
 Remove V28, V29, V30 from `arm64_rsave[]`.
 
-### Phase 2: Element-Wise Arithmetic
+### Phase 2: Element-Wise Arithmetic ✅ IMPLEMENTED
 
-**Estimated scope:** ~600 LOC  
-**Impact:** Arithmetic on all fields of a UDT → 4 instructions  
+**Actual scope:** ~250 LOC (frontend) + ~200 LOC (backend new opcodes)  
+**Impact:** Whole-UDT arithmetic (`C = A + B`) → 4 NEON instructions  
 
-#### 6.2.1 Pattern Detection in ASTEmitter
+#### 6.2.1 Pattern Detection in ASTEmitter (Implemented)
 
-Add a new method `tryEmitSIMDElementWiseOp()` that examines consecutive
-LET statements to detect element-wise patterns.
-
-The detection works at the statement level in `emitBlock()` or
-`emitStatements()`:
+Instead of the originally-planned consecutive-LET lookahead, the actual
+implementation detects **whole-UDT binary expressions** at the LET
+statement level. This is simpler and catches the most common pattern
+directly:
 
 ```
-When processing statements[k]:
-  If stmt is LET to field F of UDT variable C:
-    Look ahead at statements[k+1 .. k+N-1] where N = field count
-    Check: do they assign to ALL other fields of C?
-    Check: all RHS have same binary operator?
-    Check: all RHS operands are corresponding fields of same UDTs A, B?
-    If YES → emit NEON element-wise operation
-              skip ahead by N statements
+In emitLetStatement(), when target is a SIMD-eligible UDT:
+  1. Call tryEmitNEONArithmetic(stmt, targetAddr, udtDef, udtMap)
+  2. Check: is value expression a BinaryExpression with +, -, *, or /?
+  3. Check: do both operands resolve to the same UDT type as target?
+  4. Check: is the UDT SIMD-eligible (full Q register, no string fields)?
+  5. Check: for division, is the arrangement floating-point?
+  6. If YES → emit NEON arithmetic sequence (4 instructions)
+  7. If NO  → fall through to UDT-to-UDT copy or scalar path
 ```
 
-This lookahead is safe because BASIC statements within a line or block
-execute sequentially with no interleaving.
+Helper methods added to `ASTEmitter`:
+- `tryEmitNEONArithmetic()` — main detection + emission entry point
+- `getUDTTypeNameForExpr()` — resolve UDT type name from variable/array/member expression
+- `getUDTAddressForExpr()` — get memory address of a UDT expression
+- `simdArrangementCode()` — map SIMDInfo to integer constant (0=.4s-int, 1=.2d-int, 2=.4s-float, 3=.2d-float)
 
-#### 6.2.2 Emit NEON Arithmetic
+#### 6.2.2 Arrangement Encoding in QBE IL (Implemented)
+
+Resultless NEON arithmetic ops always get `cls=Kw` from the parser, so the
+arrangement is encoded as an integer constant in `arg[0]`:
+
+| Code | Arrangement | Type        |
+|------|-------------|-------------|
+| 0    | .4s         | 4×32b int   |
+| 1    | .2d         | 2×64b int   |
+| 2    | .4s         | 4×32b float |
+| 3    | .2d         | 2×64b float |
+
+The emitter's `neon_arr_from_arg()` extracts this from both `RInt` and
+`RCon` refs (the parser generates `RCon` via `getcon()`).
+
+#### 6.2.3 New NEON Opcodes Added (Phase 2)
+
+In addition to the Phase 1 opcodes, Phase 2 added:
+
+| Opcode    | ARM64 Instruction          | Description                         |
+|-----------|----------------------------|-------------------------------------|
+| `neondiv` | `fdiv v28, v28, v29`       | Vector division (float only)        |
+| `neonneg` | `neg/fneg v28, v28`        | Vector negation                     |
+| `neonabs` | `abs/fabs v28, v28`        | Vector absolute value               |
+| `neonfma` | `fmla/mla v28, v29, v30`   | Fused multiply-add                  |
+| `neonmin` | `smin/fmin v28, v28, v29`  | Element-wise minimum                |
+| `neonmax` | `smax/fmax v28, v28, v29`  | Element-wise maximum                |
+| `neondup` | `dup v28.arr, wN/xN`       | Broadcast scalar to all lanes       |
+
+All arithmetic opcodes accept an arrangement constant in `arg[0]`.
+The `neondup` opcode takes arrangement in `arg[0]` and GPR in `arg[1]`.
+
+#### 6.2.4 Emit NEON Arithmetic (Implemented)
 
 ```cpp
-void ASTEmitter::emitSIMDElementWiseOp(
-    const std::string& destAddr,
-    const std::string& srcAAddr,
-    const std::string& srcBAddr,
-    const std::string& op,        // "add", "sub", "mul"
-    const SIMDInfo& simd)
-{
-    builder_.emitComment("NEON element-wise " + op);
-    builder_.emitRaw("    neonldr " + srcAAddr);
-    builder_.emitRaw("    neonldr2 " + srcBAddr);
-    
-    // Map BASIC op to NEON opcode
-    if (op == "add")
-        builder_.emitRaw("    neonadd");
-    else if (op == "sub")
-        builder_.emitRaw("    neonsub");
-    else if (op == "mul")
-        builder_.emitRaw("    neonmul");
-    
-    builder_.emitRaw("    neonstr " + destAddr);
-}
+// In tryEmitNEONArithmetic(), after all checks pass:
+int arrCode = simdArrangementCode(simdInfo);
+builder_.emitRaw("    neonldr " + leftAddr);    // q28 ← A
+builder_.emitRaw("    neonldr2 " + rightAddr);  // q29 ← B
+builder_.emitRaw("    " + neonOp + " " + std::to_string(arrCode));  // v28 = v28 op v29
+builder_.emitRaw("    neonstr " + targetAddr);  // C ← q28
 ```
+
+#### 6.2.5 Generated Assembly Examples
+
+**Vec4 (4×INTEGER) addition: `C = A + B`**
+```asm
+ldr  q28, [x0]              ; load A (128 bits)
+ldr  q29, [x1]              ; load B (128 bits)
+add  v28.4s, v28.4s, v29.4s ; element-wise add
+str  q28, [x2]              ; store C (128 bits)
+```
+
+**Vec4F (4×SINGLE) division: `C = A / B`**
+```asm
+ldr  q28, [x0]              ; load A (128 bits)
+ldr  q29, [x1]              ; load B (128 bits)
+fdiv v28.4s, v28.4s, v29.4s ; element-wise float divide
+str  q28, [x2]              ; store C (128 bits)
+```
+
+**Vec2D (2×DOUBLE) multiply: `C = A * B`**
+```asm
+ldr  q28, [x0]              ; load A (128 bits)
+ldr  q29, [x1]              ; load B (128 bits)
+fmul v28.2d, v28.2d, v29.2d ; element-wise double multiply
+str  q28, [x2]              ; store C (128 bits)
+```
+
+#### 6.2.6 Kill-Switch
+
+Controlled by `ENABLE_NEON_ARITH` environment variable (default: enabled).
+When set to `0` or `false`, `tryEmitNEONArithmetic()` returns `false` and
+the frontend falls through to scalar field-by-field codegen.
+
+#### 6.2.7 Tests
+
+New test files in `tests/neon/`:
+- `test_neon_vec4_arith.bas` — 4×INTEGER add/sub/mul (32 NEON instructions)
+- `test_neon_vec4f_arith.bas` — 4×SINGLE fadd/fsub/fmul/fdiv (40 NEON instructions)
+- `test_neon_vec2d_arith.bas` — 2×DOUBLE fadd/fsub/fmul/fdiv (48 NEON instructions)
+
+Tests cover: basic operations, negative values, zero handling, self-operation
+(`A = A + B`), source independence, subtract-to-zero, large/small values.
+
+#### 6.2.8 Parser Perfect-Hash Update
+
+Adding 7 new opcodes required recomputing the lexer perfect-hash constant:
+`K = 320942661` (was 26900255), `M = 23` (unchanged). Computed via
+`tools/lexh_neon.c`.
 
 ### Phase 3: Array Loop Vectorization
 

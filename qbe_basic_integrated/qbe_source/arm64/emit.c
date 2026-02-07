@@ -388,7 +388,8 @@ fixarg(Ref *pr, int sz, int t, E *e)
 }
 
 /* Check whether the register written by 'prev' is referenced (read) by any
- * instruction after 'i' in the same basic block, or by the block's branch.
+ * instruction after 'i' in the same basic block, by the block's branch,
+ * or by any successor block (live-out).
  *
  * When we fuse prev+i (e.g. MUL+ADD → MADD), prev is never emitted.
  * If any later instruction still reads prev->to, it would get a stale
@@ -430,6 +431,13 @@ prev_result_used_later(Ins *i, Blk *b, Ref prev_to)
 
 	/* Check the block's branch / jump argument. */
 	if (req(b->jmp.arg, prev_to))
+		return 1;
+
+	/* Check if the register is live-out from this block.
+	 * After post-regalloc filllive(), b->out contains physical
+	 * register IDs.  If prev_to is live-out, a successor block
+	 * needs the MUL result, so fusion is unsafe. */
+	if (rtype(prev_to) == RTmp && bshas(b->out, prev_to.val))
 		return 1;
 
 	return 0;
@@ -712,6 +720,51 @@ static int
 neon_is_float(int cls)
 {
 	return cls == Ks || cls == Kd;
+}
+
+/* Decode arrangement encoding from arg[0] for NEON arithmetic ops.
+ * Resultless ops always get cls=Kw from the parser, so the frontend
+ * encodes the actual arrangement as an integer constant in arg[0]:
+ *   0 = Kw (.4s integer)
+ *   1 = Kl (.2d integer)
+ *   2 = Ks (.4s float)
+ *   3 = Kd (.2d float)
+ * The parser creates RCon refs via getcon() for integer literals,
+ * so we must check both RInt (inline) and RCon (constant table).
+ * Falls back to the instruction's cls field if neither matches.
+ */
+static int
+neon_arr_from_arg(Ins *i, E *e)
+{
+	int v;
+
+	if (rtype(i->arg[0]) == RInt) {
+		v = rsval(i->arg[0]);
+		if (v >= 0 && v <= 3)
+			return v;
+	}
+	if (rtype(i->arg[0]) == RCon) {
+		Con *c = &e->fn->con[i->arg[0].val];
+		if (c->type == CBits) {
+			v = (int)c->bits.i;
+			if (v >= 0 && v <= 3)
+				return v;
+		}
+	}
+	return i->cls;
+}
+
+/* Get the scalar GPR suffix for neondup based on arrangement.
+ * .4s / .4s-float → "w" (32-bit GPR)
+ * .2d / .2d-float → "x" (64-bit GPR)
+ */
+static char *
+neon_dup_gpr_prefix(int arr)
+{
+	switch (arr) {
+	case Kl: case Kd: return "x";
+	default: return "w";
+	}
 }
 
 /* Try to fuse shift + arithmetic patterns into single instructions with shifted operands.
@@ -1352,47 +1405,59 @@ emitins(Ins *i, E *e)
 			rname(i->arg[0].val, Kl));
 		break;
 
-	case Oneonadd:
-		/* Vector add: v28.arr = v28.arr + v29.arr */
+	case Oneonadd: {
+		/* Vector add: v28.arr = v28.arr + v29.arr
+		 * Arrangement encoded in arg[0] as integer constant. */
+		int ac;
 		if (!is_neon_arith_enabled()) {
 			die("neonadd emitted but NEON arith disabled");
 		}
-		arr = neon_arrangement(i->cls);
-		if (neon_is_float(i->cls))
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
 			fprintf(e->f, "\tfadd\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		else
 			fprintf(e->f, "\tadd\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		break;
+	}
 
-	case Oneonsub:
+	case Oneonsub: {
 		/* Vector sub: v28.arr = v28.arr - v29.arr */
+		int ac;
 		if (!is_neon_arith_enabled()) {
 			die("neonsub emitted but NEON arith disabled");
 		}
-		arr = neon_arrangement(i->cls);
-		if (neon_is_float(i->cls))
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
 			fprintf(e->f, "\tfsub\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		else
 			fprintf(e->f, "\tsub\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		break;
+	}
 
-	case Oneonmul:
-		/* Vector mul: v28.arr = v28.arr * v29.arr */
+	case Oneonmul: {
+		/* Vector mul: v28.arr = v28.arr * v29.arr
+		 * Note: integer MUL is not available for .2d arrangement
+		 * on AArch64 NEON. Only .4s/.8h/.16b are supported. */
+		int ac;
 		if (!is_neon_arith_enabled()) {
 			die("neonmul emitted but NEON arith disabled");
 		}
-		arr = neon_arrangement(i->cls);
-		if (neon_is_float(i->cls))
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
 			fprintf(e->f, "\tfmul\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		else
 			fprintf(e->f, "\tmul\tv28.%s, v28.%s, v29.%s\n",
 				arr, arr, arr);
 		break;
+	}
 
 	case Oneonaddv:
 		/* Horizontal sum: reduce v28 lanes to scalar in dest GPR.
@@ -1414,6 +1479,127 @@ emitins(Ins *i, E *e)
 				rname(i->to.val, Kl));
 		}
 		break;
+
+	case Oneondiv: {
+		/* Vector division: v28.arr = v28.arr / v29.arr
+		 * NEON only supports float division (fdiv), not integer.
+		 * The frontend must only emit this for float arrangements. */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neondiv emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfdiv\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			die("neondiv: integer vector division not supported on NEON");
+		break;
+	}
+
+	case Oneonneg: {
+		/* Vector negation: v28.arr = -v28.arr */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neonneg emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfneg\tv28.%s, v28.%s\n", arr, arr);
+		else
+			fprintf(e->f, "\tneg\tv28.%s, v28.%s\n", arr, arr);
+		break;
+	}
+
+	case Oneonabs: {
+		/* Vector absolute value: v28.arr = |v28.arr| */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neonabs emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfabs\tv28.%s, v28.%s\n", arr, arr);
+		else
+			fprintf(e->f, "\tabs\tv28.%s, v28.%s\n", arr, arr);
+		break;
+	}
+
+	case Oneonfma: {
+		/* Fused multiply-add: v28.arr += v29.arr * v30.arr
+		 * Uses FMLA for float, MLA for integer.
+		 * The caller must have loaded v29 and v30 before this op. */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neonfma emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfmla\tv28.%s, v29.%s, v30.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tmla\tv28.%s, v29.%s, v30.%s\n",
+				arr, arr, arr);
+		break;
+	}
+
+	case Oneonmin: {
+		/* Element-wise minimum: v28.arr = min(v28.arr, v29.arr) */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neonmin emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfmin\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tsmin\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		break;
+	}
+
+	case Oneonmax: {
+		/* Element-wise maximum: v28.arr = max(v28.arr, v29.arr) */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neonmax emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		if (neon_is_float(ac))
+			fprintf(e->f, "\tfmax\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		else
+			fprintf(e->f, "\tsmax\tv28.%s, v28.%s, v29.%s\n",
+				arr, arr, arr);
+		break;
+	}
+
+	case Oneondup: {
+		/* Broadcast scalar GPR to all lanes of v28.
+		 * arg[0] = arrangement encoding (0=.4s, 1=.2d, 2=.4s-flt, 3=.2d-flt)
+		 * arg[1] = GPR register holding the scalar value.
+		 * For .4s: dup v28.4s, wN
+		 * For .2d: dup v28.2d, xN */
+		int ac;
+		if (!is_neon_arith_enabled()) {
+			die("neondup emitted but NEON arith disabled");
+		}
+		ac = neon_arr_from_arg(i, e);
+		arr = neon_arrangement(ac);
+		assert(isreg(i->arg[1]));
+		fprintf(e->f, "\tdup\tv28.%s, %s%d\n",
+			arr,
+			neon_dup_gpr_prefix(ac),
+			i->arg[1].val - R0);
+		break;
+	}
 	}
 }
 

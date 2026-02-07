@@ -419,6 +419,8 @@ sink(Fn *fn)
 				sinkref(fn, b, &i->arg[0]);
 			else if (isstore(i->op))
 				sinkref(fn, b, &i->arg[1]);
+			else if (isneonstore(i->op))
+				sinkref(fn, b, &i->arg[0]);
 		sinkref(fn, b, &b->jmp.arg);
 	}
 	addgcmins(fn, curi, &insb[NIns] - curi);

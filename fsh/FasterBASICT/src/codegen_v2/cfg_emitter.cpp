@@ -276,6 +276,22 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         }
     }
     
+    // Check if this block was replaced by a NEON vectorized loop — if so,
+    // emit only the label (for branch targets) but skip all content and
+    // emit a jump to the exit block instead.
+    if (simdReplacedBlocks_.count(block->id)) {
+        builder_.emitComment("NEON Phase 3: skipped (replaced by vectorized loop)");
+        // Emit a fallthrough to the next block so the label is not dangling.
+        // The block's normal terminator edges still exist; emit a jump to the
+        // first successor so QBE doesn't complain about a missing terminator.
+        if (!block->successors.empty()) {
+            builder_.emitJump(getBlockLabel(block->successors[0]));
+        }
+        builder_.emitBlankLine();
+        emittedLabels_.insert(blockId);
+        return;
+    }
+
     // Check if this is a FOR loop header - emit condition check
     if (block->isLoopHeader && block->label.find("For_Header") != std::string::npos) {
         // Find the ForStatement in the predecessor init block
@@ -340,6 +356,43 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         }
     }
     
+    // === NEON Phase 3: try to vectorize FOR loops ===
+    // When we are about to emit the statements of a FOR init block (the
+    // block whose statements contain the STMT_FOR), analyse the loop body.
+    // If it matches a vectorizable pattern, emit a NEON loop and mark the
+    // header/body/increment blocks for suppression.
+    {
+        const ForStatement* forStmtForSIMD = nullptr;
+        for (const Statement* s : block->statements) {
+            if (s && s->getType() == ASTNodeType::STMT_FOR) {
+                forStmtForSIMD = static_cast<const ForStatement*>(s);
+                break;
+            }
+        }
+        if (forStmtForSIMD) {
+            SIMDLoopInfo loopInfo = astEmitter_.analyzeSIMDLoop(forStmtForSIMD);
+            if (loopInfo.isVectorizable) {
+                int exitBlockId = findForExitBlock(block, cfg);
+                if (exitBlockId >= 0) {
+                    std::string exitLabel = getBlockLabel(exitBlockId);
+
+                    builder_.emitComment("NEON Phase 3: vectorizable FOR loop detected — emitting NEON loop");
+                    astEmitter_.emitSIMDLoop(forStmtForSIMD, loopInfo, exitLabel);
+
+                    // Collect header/body/increment blocks and mark them for suppression
+                    collectForLoopBlocks(block, exitBlockId, cfg, simdReplacedBlocks_);
+
+                    // Skip the normal statement emission for this init block
+                    // (we already emitted the NEON loop in its place).
+                    // Still need to emit the terminator-skip and mark block.
+                    builder_.emitBlankLine();
+                    emittedLabels_.insert(blockId);
+                    return;
+                }
+            }
+        }
+    }
+
     // Emit statements in this block
     emitBlockStatements(block);
     
@@ -906,6 +959,7 @@ void CFGEmitter::enterFunction(const std::string& functionName) {
     requiredLabels_.clear();
     reachabilityCache_.clear();
     outEdgeIndex_.clear();
+    simdReplacedBlocks_.clear();
 }
 
 void CFGEmitter::exitFunction() {
@@ -918,6 +972,7 @@ void CFGEmitter::reset() {
     requiredLabels_.clear();
     reachabilityCache_.clear();
     outEdgeIndex_.clear();
+    simdReplacedBlocks_.clear();
     currentCFG_ = nullptr;
 }
 
@@ -963,7 +1018,79 @@ const ForStatement* CFGEmitter::findForStatementForHeader(const BasicBlock* head
     return nullptr;
 }
 
-void CFGEmitter::computeReachability(const ControlFlowGraph* cfg) {
+// =============================================================================
+// NEON Phase 3: FOR-loop exit block finder
+// =============================================================================
+
+int CFGEmitter::findForExitBlock(const FasterBASIC::BasicBlock* initBlock,
+                                  const FasterBASIC::ControlFlowGraph* cfg) {
+    if (!initBlock || !cfg) return -1;
+
+    // Step 1: follow FALLTHROUGH from init block to the header block
+    int headerBlockId = -1;
+    const auto& initEdges = getOutEdgesIndexed(initBlock->id);
+    for (const auto& e : initEdges) {
+        if (e.type == FasterBASIC::EdgeType::FALLTHROUGH ||
+            e.type == FasterBASIC::EdgeType::JUMP) {
+            headerBlockId = e.targetBlock;
+            break;
+        }
+    }
+    if (headerBlockId < 0) return -1;
+
+    // Step 2: from the header, find the CONDITIONAL_FALSE edge → exit block
+    const auto& headerEdges = getOutEdgesIndexed(headerBlockId);
+    for (const auto& e : headerEdges) {
+        if (e.type == FasterBASIC::EdgeType::CONDITIONAL_FALSE) {
+            return e.targetBlock;
+        }
+    }
+    return -1;
+}
+
+// =============================================================================
+// NEON Phase 3: collect all blocks belonging to a FOR loop
+// =============================================================================
+
+void CFGEmitter::collectForLoopBlocks(const FasterBASIC::BasicBlock* initBlock,
+                                       int exitBlockId,
+                                       const FasterBASIC::ControlFlowGraph* cfg,
+                                       std::set<int>& outIds) {
+    if (!initBlock || !cfg) return;
+
+    // We do a simple BFS/DFS from the init block's successors, stopping at
+    // the exit block.  Every block reached that is NOT the exit block is
+    // part of the loop and should be suppressed.
+    std::set<int> visited;
+    std::vector<int> worklist;
+
+    // Seed with init block's successors
+    for (const auto& e : getOutEdgesIndexed(initBlock->id)) {
+        if (e.targetBlock != exitBlockId) {
+            worklist.push_back(e.targetBlock);
+        }
+    }
+
+    while (!worklist.empty()) {
+        int bid = worklist.back();
+        worklist.pop_back();
+        if (bid == exitBlockId) continue;
+        if (bid == initBlock->id) continue;  // don't loop back to init
+        if (visited.count(bid)) continue;
+        visited.insert(bid);
+        outIds.insert(bid);
+
+        // Follow successors
+        const auto& edges = getOutEdgesIndexed(bid);
+        for (const auto& e : edges) {
+            if (!visited.count(e.targetBlock) && e.targetBlock != exitBlockId) {
+                worklist.push_back(e.targetBlock);
+            }
+        }
+    }
+}
+
+void CFGEmitter::computeReachability(const FasterBASIC::ControlFlowGraph* cfg) {
     if (!cfg) return;
     
     reachabilityCache_.clear();

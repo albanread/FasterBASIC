@@ -200,7 +200,7 @@ callable(Ref r, Fn *fn)
 static int
 isneon(int op)
 {
-	return INRANGE(op, Oneonldr, Oneonaddv);
+	return INRANGE(op, Oneonldr, Oneondup);
 }
 
 static void
@@ -212,13 +212,24 @@ sel(Ins i, Fn *fn)
 
 	/* Pass NEON opcodes through unchanged.
 	 * Their address arguments (GPR temporaries) still
-	 * need fixarg() so slot refs get materialized. */
+	 * need fixarg() so slot refs get materialized.
+	 * For NEON arithmetic ops (neonadd..neonmax), arg[0]
+	 * is an integer arrangement constant — skip fixarg.
+	 * For neondup, arg[0] is arrangement, arg[1] is GPR. */
 	if (isneon(i.op)) {
 		emiti(i);
 		iarg = curi->arg;
-		fixarg(&iarg[0], Kl, 0, fn);
-		if (rtype(i.arg[1]) != -1 && !req(i.arg[1], R))
-			fixarg(&iarg[1], Kl, 0, fn);
+		if (INRANGE(i.op, Oneonldr, Oneonstr2)) {
+			/* load/store ops: arg[0] is an address */
+			fixarg(&iarg[0], Kl, 0, fn);
+		} else if (i.op == Oneondup) {
+			/* dup: arg[0] is arrangement constant (skip),
+			 * arg[1] is GPR scalar value */
+			if (rtype(i.arg[1]) != -1 && !req(i.arg[1], R))
+				fixarg(&iarg[1], Kl, 0, fn);
+		}
+		/* neonadd..neonmax, neonaddv: arg[0] is an integer
+		 * arrangement constant or absent — no fixarg needed */
 		return;
 	}
 

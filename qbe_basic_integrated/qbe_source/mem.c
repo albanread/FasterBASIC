@@ -281,6 +281,11 @@ coalesce(Fn *fn)
 				x = BIT(storesz(i)) - 1;
 				store(arg[1], x, ip--, i, fn, sl);
 			}
+			if (isneonstore(i->op)) {
+				/* NEON 128-bit store: 16 bytes */
+				x = NBit >= 16 ? BIT(16) - 1 : (bits)-1;
+				store(arg[0], x, ip--, i, fn, sl);
+			}
 			if (i->op == Oblit0) {
 				assert((i+1)->op == Oblit1);
 				assert(rtype((i+1)->arg[0]) == RInt);

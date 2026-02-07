@@ -536,6 +536,17 @@ void basic_error_msg(const char* message);
 // Check array bounds (internal use)
 void basic_check_bounds(BasicArray* array, int32_t* indices);
 
+// NEON loop vectorization support (Phase 3)
+// Get raw data pointer for direct NEON access (bypasses per-element bounds checking)
+void* array_get_data_ptr(BasicArray* array);
+
+// Get element size in bytes
+size_t array_get_element_size(BasicArray* array);
+
+// Validate that a contiguous range [start_idx, end_idx] is within bounds
+// for dimension 0.  Called once before a NEON-vectorized loop.
+void array_check_range(BasicArray* array, int32_t start_idx, int32_t end_idx);
+
 // Array bounds error handler (for descriptor-based arrays)
 void basic_array_bounds_error(int64_t index, int64_t lower, int64_t upper);
 

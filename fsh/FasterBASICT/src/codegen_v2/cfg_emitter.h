@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <set>
 #include <vector>
 #include "../fasterbasic_cfg.h"
 #include "qbe_builder.h"
@@ -224,6 +225,14 @@ private:
     // Current loop condition (for FOR/WHILE headers)
     std::string currentLoopCondition_;
 
+    // === NEON Phase 3: SIMD loop vectorization state ===
+
+    // Set of block IDs whose normal content emission should be suppressed
+    // because they belong to a FOR loop that was replaced by a NEON
+    // vectorized loop.  Populated by emitBlock() when a FOR init block
+    // is successfully vectorized; checked for header/body/increment blocks.
+    std::set<int> simdReplacedBlocks_;
+
     // Pre-built index: blockId → vector of out-edges.
     // Built once per CFG in buildEdgeIndex() and used by every
     // getOutEdgesIndexed() call, turning O(E)-per-lookup into O(1).
@@ -249,6 +258,34 @@ private:
      */
     std::vector<FasterBASIC::CFGEdge> getOutEdges(const FasterBASIC::BasicBlock* block,
                                                    const FasterBASIC::ControlFlowGraph* cfg);
+
+    // === NEON Phase 3 helpers ===
+
+    /**
+     * Find the exit block of a FOR loop starting from its init block.
+     * Follows init → FALLTHROUGH → header → CONDITIONAL_FALSE → exit.
+     *
+     * @param initBlock  The FOR init block
+     * @param cfg        The CFG
+     * @return Exit block ID, or -1 if not found
+     */
+    int findForExitBlock(const FasterBASIC::BasicBlock* initBlock,
+                         const FasterBASIC::ControlFlowGraph* cfg);
+
+    /**
+     * Collect all block IDs that belong to a FOR loop (header, body,
+     * increment) so their normal emission can be suppressed after NEON
+     * vectorization replaces the loop.
+     *
+     * @param initBlock  The FOR init block
+     * @param exitBlockId The exit block ID (not collected)
+     * @param cfg        The CFG
+     * @param outIds     Set to fill with block IDs to suppress
+     */
+    void collectForLoopBlocks(const FasterBASIC::BasicBlock* initBlock,
+                              int exitBlockId,
+                              const FasterBASIC::ControlFlowGraph* cfg,
+                              std::set<int>& outIds);
     
     /**
      * Emit statements in a block

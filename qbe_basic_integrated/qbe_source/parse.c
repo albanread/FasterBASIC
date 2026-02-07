@@ -143,7 +143,7 @@ enum {
 	TMask = 16383, /* for temps hash */
 	BMask = 8191, /* for blocks hash */
 
-	K = 26900255, /* found using tools/lexh.c (updated for NEON opcodes) */
+	K = 320942661, /* found using tools/lexh_neon.c (updated for Phase 2 NEON opcodes) */
 	M = 23,
 };
 
@@ -626,6 +626,14 @@ parseline(PState ps)
 		case Oneonadd:
 		case Oneonsub:
 		case Oneonmul:
+		case Oneonaddv:
+		case Oneondiv:
+		case Oneonneg:
+		case Oneonabs:
+		case Oneonfma:
+		case Oneonmin:
+		case Oneonmax:
+		case Oneondup:
 			/* operations without result */
 			r = R;
 			k = Kw;

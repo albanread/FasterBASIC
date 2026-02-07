@@ -4,6 +4,8 @@
 #include <sstream>
 #include <cmath>
 #include <iostream>
+#include <cstring>
+#include <cstdlib>
 
 namespace fbc {
 
@@ -1344,15 +1346,14 @@ std::string ASTEmitter::emitTypeConversion(const std::string& value,
         return value;
     }
     
-    // Handle special two-step conversions for integer to double
+    // Handle integer to double conversions — go directly to double
+    // NOTE: QBE's swtof/sltof can target "d" (double) directly.
+    // The old code went int→single→double which lost precision for
+    // integers > ~16M (SINGLE has only ~7 decimal digits of precision).
     if (convOp == "INT_TO_DOUBLE_W" || convOp == "INT_TO_DOUBLE_L") {
-        // QBE doesn't have direct int→double, must go int→float→double
-        std::string floatTemp = builder_.newTemp();
-        std::string op1 = (convOp == "INT_TO_DOUBLE_W") ? "swtof" : "sltof";
-        builder_.emitConvert(floatTemp, "s", op1, value);
-        
         std::string result = builder_.newTemp();
-        builder_.emitConvert(result, "d", "exts", floatTemp);
+        std::string op1 = (convOp == "INT_TO_DOUBLE_W") ? "swtof" : "sltof";
+        builder_.emitConvert(result, "d", op1, value);
         return result;
     }
     
@@ -1752,38 +1753,53 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
         BaseType targetType = getVariableType(stmt->variable);
         
         if (targetType == BaseType::USER_DEFINED) {
+            // Get the UDT type name and definition for the target variable
+            std::string currentFunc = symbolMapper_.getCurrentFunction();
+            const auto* targetVarSymbol = semantic_.lookupVariableScoped(stmt->variable, currentFunc);
+            if (!targetVarSymbol) {
+                builder_.emitComment("ERROR: Target UDT variable not found: " + stmt->variable);
+                return;
+            }
+            
+            std::string targetUDTName = targetVarSymbol->typeName;
+            if (targetUDTName.empty()) {
+                targetUDTName = targetVarSymbol->typeDesc.udtName;
+            }
+            
+            const auto& symbolTable = semantic_.getSymbolTable();
+            auto udtIt = symbolTable.types.find(targetUDTName);
+            if (udtIt == symbolTable.types.end()) {
+                builder_.emitComment("ERROR: UDT type not found: " + targetUDTName);
+                return;
+            }
+            
+            const auto& udtDef = udtIt->second;
+            
+            // Get target UDT base address
+            std::string targetAddr = getVariableAddress(stmt->variable);
+            
+            // ── NEON Phase 2: try element-wise UDT arithmetic first ──
+            // Detects C = A + B (and -, *, /) where A, B, C are the same
+            // SIMD-eligible UDT type and emits NEON vector instructions.
+            if (tryEmitNEONArithmetic(stmt, targetAddr, udtDef, symbolTable.types)) {
+                builder_.emitComment("End NEON UDT arithmetic assignment");
+                return;
+            }
+            
+            // ── Scalar fallback for UDT arithmetic (when NEON disabled) ──
+            // Detects C = A + B (and -, *, /) where A, B, C are the same
+            // UDT type and emits scalar field-by-field arithmetic.
+            if (emitScalarUDTArithmetic(stmt, targetAddr, udtDef, symbolTable.types)) {
+                builder_.emitComment("End scalar UDT arithmetic assignment");
+                return;
+            }
+            
             // Target is a UDT - check if source is also a UDT (or UDT member access)
             BaseType sourceType = getExpressionType(stmt->value.get());
             
             if (sourceType == BaseType::USER_DEFINED) {
                 // UDT-to-UDT assignment: P2 = P1
                 builder_.emitComment("UDT-to-UDT assignment: " + stmt->variable + " = <UDT>");
-                
-                // Get the UDT type name for target
-                std::string currentFunc = symbolMapper_.getCurrentFunction();
-                const auto* targetVarSymbol = semantic_.lookupVariableScoped(stmt->variable, currentFunc);
-                if (!targetVarSymbol) {
-                    builder_.emitComment("ERROR: Target UDT variable not found: " + stmt->variable);
-                    return;
-                }
-                
-                std::string targetUDTName = targetVarSymbol->typeName;
-                if (targetUDTName.empty()) {
-                    targetUDTName = targetVarSymbol->typeDesc.udtName;
-                }
-                
-                // Look up the UDT definition
-                const auto& symbolTable = semantic_.getSymbolTable();
-                auto udtIt = symbolTable.types.find(targetUDTName);
-                if (udtIt == symbolTable.types.end()) {
-                    builder_.emitComment("ERROR: UDT type not found: " + targetUDTName);
-                    return;
-                }
-                
-                const auto& udtDef = udtIt->second;
-                
-                // Get target UDT base address
-                std::string targetAddr = getVariableAddress(stmt->variable);
                 
                 // Get source UDT address based on source expression type
                 std::string sourceAddr;
@@ -1867,6 +1883,66 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
         }
     }
     
+    // ── Array element UDT assignment: Arr(i) = <UDT expr> ──
+    // Must be handled specially because the generic path would store
+    // only a pointer (storel) instead of copying the full UDT data.
+    if (!stmt->indices.empty()) {
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto arrIt = symbolTable.arrays.find(stmt->variable);
+        if (arrIt != symbolTable.arrays.end() &&
+            arrIt->second.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+
+            std::string udtTypeName = arrIt->second.elementTypeDesc.udtName;
+            auto udtIt = symbolTable.types.find(udtTypeName);
+            if (udtIt != symbolTable.types.end()) {
+                const auto& udtDef = udtIt->second;
+
+                // Compute the target array element address
+                std::string targetAddr = emitArrayElementAddress(stmt->variable, stmt->indices);
+
+                // Try NEON arithmetic first: Arr(i) = A + B
+                if (tryEmitNEONArithmetic(stmt, targetAddr, udtDef, symbolTable.types)) {
+                    builder_.emitComment("End NEON UDT array element arithmetic");
+                    return;
+                }
+
+                // Try scalar UDT arithmetic fallback: Arr(i) = A + B (when NEON disabled)
+                if (emitScalarUDTArithmetic(stmt, targetAddr, udtDef, symbolTable.types)) {
+                    builder_.emitComment("End scalar UDT array element arithmetic");
+                    return;
+                }
+
+                // Check if source is also a UDT expression
+                BaseType sourceType = getExpressionType(stmt->value.get());
+                if (sourceType == BaseType::USER_DEFINED) {
+                    std::string sourceAddr;
+                    bool sourceOk = true;
+
+                    if (stmt->value->getType() == ASTNodeType::EXPR_VARIABLE) {
+                        const auto* varExpr = static_cast<const VariableExpression*>(stmt->value.get());
+                        sourceAddr = getVariableAddress(varExpr->name);
+                    } else if (stmt->value->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+                        const auto* srcArrExpr = static_cast<const ArrayAccessExpression*>(stmt->value.get());
+                        sourceAddr = emitArrayElementAddress(srcArrExpr->name, srcArrExpr->indices);
+                    } else if (stmt->value->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+                        sourceAddr = emitMemberAccessExpression(
+                            static_cast<const MemberAccessExpression*>(stmt->value.get()));
+                    } else {
+                        builder_.emitComment("WARNING: Unsupported UDT source for array element, falling through");
+                        sourceOk = false;
+                    }
+
+                    if (sourceOk) {
+                        builder_.emitComment("UDT array element copy: " + stmt->variable + "(...) = <UDT>");
+                        emitUDTCopyFieldByField(sourceAddr, targetAddr, udtDef, symbolTable.types);
+                        builder_.emitComment("End UDT array element copy");
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     // Determine target type based on whether it's an array or scalar
     BaseType targetType;
     
@@ -3847,6 +3923,184 @@ void ASTEmitter::clearArrayElementCache() {
 }
 
 // =============================================================================
+// NEON Phase 2: Element-wise UDT arithmetic helpers
+// =============================================================================
+
+int ASTEmitter::simdArrangementCode(const FasterBASIC::TypeDeclarationStatement::SIMDInfo& info) {
+    // Map SIMDInfo to the integer constant encoding used in NEON IL opcodes:
+    //   0 = Kw  (.4s integer)
+    //   1 = Kl  (.2d integer)
+    //   2 = Ks  (.4s float)
+    //   3 = Kd  (.2d float)
+    using SIMDType = FasterBASIC::TypeDeclarationStatement::SIMDType;
+    switch (info.type) {
+        case SIMDType::V4S:
+        case SIMDType::V4S_PAD1:
+        case SIMDType::QUAD:
+            return info.isFloatingPoint ? 2 : 0;  // .4s float or .4s int
+        case SIMDType::V2D:
+        case SIMDType::PAIR:
+            return info.isFloatingPoint ? 3 : 1;  // .2d float or .2d int
+        default:
+            return info.isFloatingPoint ? 2 : 0;  // default to .4s
+    }
+}
+
+std::string ASTEmitter::getUDTTypeNameForExpr(const FasterBASIC::Expression* expr) {
+    if (!expr) return "";
+
+    std::string currentFunc = symbolMapper_.getCurrentFunction();
+
+    if (expr->getType() == ASTNodeType::EXPR_VARIABLE) {
+        const auto* varExpr = static_cast<const VariableExpression*>(expr);
+        const auto* varSym = semantic_.lookupVariableScoped(varExpr->name, currentFunc);
+        if (varSym && varSym->typeDesc.baseType == BaseType::USER_DEFINED) {
+            return varSym->typeName.empty() ? varSym->typeDesc.udtName : varSym->typeName;
+        }
+    } else if (expr->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+        const auto* arrExpr = static_cast<const ArrayAccessExpression*>(expr);
+        const auto& symbolTable = semantic_.getSymbolTable();
+        auto it = symbolTable.arrays.find(arrExpr->name);
+        if (it != symbolTable.arrays.end() &&
+            it->second.elementTypeDesc.baseType == BaseType::USER_DEFINED) {
+            return it->second.elementTypeDesc.udtName;
+        }
+    } else if (expr->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+        // For nested UDT member access like container.innerUDT
+        // Walk the chain to find the terminal UDT type
+        const auto* memberExpr = static_cast<const MemberAccessExpression*>(expr);
+
+        // Find the root variable
+        const Expression* root = memberExpr->object.get();
+        std::vector<std::string> chain;
+        chain.push_back(memberExpr->memberName);
+        while (root->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+            const auto* ma = static_cast<const MemberAccessExpression*>(root);
+            chain.push_back(ma->memberName);
+            root = ma->object.get();
+        }
+        std::reverse(chain.begin(), chain.end());
+
+        std::string rootUDTName;
+        if (root->getType() == ASTNodeType::EXPR_VARIABLE) {
+            const auto* rootVar = static_cast<const VariableExpression*>(root);
+            const auto* rootSym = semantic_.lookupVariableScoped(rootVar->name, currentFunc);
+            if (!rootSym || rootSym->typeDesc.baseType != BaseType::USER_DEFINED) return "";
+            rootUDTName = rootSym->typeName.empty() ? rootSym->typeDesc.udtName : rootSym->typeName;
+        } else {
+            return "";
+        }
+
+        // Traverse the chain to find the terminal field's UDT type
+        const auto& symbolTable = semantic_.getSymbolTable();
+        std::string currentUDT = rootUDTName;
+        for (const auto& name : chain) {
+            auto udtIt = symbolTable.types.find(currentUDT);
+            if (udtIt == symbolTable.types.end()) return "";
+            const auto* fld = udtIt->second.findField(name);
+            if (!fld) return "";
+            if (fld->typeDesc.baseType == BaseType::USER_DEFINED) {
+                currentUDT = fld->typeDesc.udtName;
+            } else {
+                return "";  // terminal field is not a UDT
+            }
+        }
+        return currentUDT;
+    }
+
+    return "";
+}
+
+std::string ASTEmitter::getUDTAddressForExpr(const FasterBASIC::Expression* expr) {
+    if (!expr) return "";
+
+    if (expr->getType() == ASTNodeType::EXPR_VARIABLE) {
+        const auto* varExpr = static_cast<const VariableExpression*>(expr);
+        return getVariableAddress(varExpr->name);
+    } else if (expr->getType() == ASTNodeType::EXPR_ARRAY_ACCESS) {
+        const auto* arrExpr = static_cast<const ArrayAccessExpression*>(expr);
+        return emitArrayElementAddress(arrExpr->name, arrExpr->indices);
+    } else if (expr->getType() == ASTNodeType::EXPR_MEMBER_ACCESS) {
+        return emitMemberAccessExpression(static_cast<const MemberAccessExpression*>(expr));
+    }
+
+    return "";
+}
+
+bool ASTEmitter::tryEmitNEONArithmetic(
+        const FasterBASIC::LetStatement* stmt,
+        const std::string& targetAddr,
+        const FasterBASIC::TypeSymbol& udtDef,
+        const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) {
+
+    // Check kill-switch
+    static int neonArithChecked = 0;
+    static int neonArithEnabled = 1;
+    if (!neonArithChecked) {
+        const char *env = getenv("ENABLE_NEON_ARITH");
+        if (env) {
+            neonArithEnabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+        }
+        neonArithChecked = 1;
+    }
+    if (!neonArithEnabled) return false;
+
+    // The UDT must be SIMD-eligible and contain no string fields
+    auto simdInfo = typeManager_.getSIMDInfo(udtDef);
+    if (!simdInfo.isValid() || !simdInfo.isFullQ) return false;
+    if (typeManager_.hasStringFields(udtDef, udtMap)) return false;
+
+    // The value expression must be a binary expression
+    if (!stmt->value || stmt->value->getType() != ASTNodeType::EXPR_BINARY) return false;
+
+    const auto* binExpr = static_cast<const BinaryExpression*>(stmt->value.get());
+
+    // Only handle arithmetic operators: +, -, *, /
+    std::string neonOp;
+    switch (binExpr->op) {
+        case TokenType::PLUS:    neonOp = "neonadd"; break;
+        case TokenType::MINUS:   neonOp = "neonsub"; break;
+        case TokenType::MULTIPLY: neonOp = "neonmul"; break;
+        case TokenType::DIVIDE:  neonOp = "neondiv"; break;
+        default: return false;
+    }
+
+    // Division is only supported for float arrangements
+    if ((neonOp == "neondiv") && !simdInfo.isFloatingPoint) return false;
+
+    // Both operands must be the same UDT type as the target
+    std::string leftUDT = getUDTTypeNameForExpr(binExpr->left.get());
+    std::string rightUDT = getUDTTypeNameForExpr(binExpr->right.get());
+
+    if (leftUDT.empty() || rightUDT.empty()) return false;
+    if (leftUDT != udtDef.name || rightUDT != udtDef.name) return false;
+
+    // All checks passed — emit NEON arithmetic sequence
+    int arrCode = simdArrangementCode(simdInfo);
+
+    // Get addresses of left and right operands
+    std::string leftAddr = getUDTAddressForExpr(binExpr->left.get());
+    std::string rightAddr = getUDTAddressForExpr(binExpr->right.get());
+
+    if (leftAddr.empty() || rightAddr.empty()) return false;
+
+    builder_.emitComment("NEON arithmetic (" + udtDef.name + ", "
+        + std::string(simdInfo.arrangement()) + "): "
+        + neonOp + " → 4 instructions");
+
+    // neonldr  leftAddr   → loads into q28
+    // neonldr2 rightAddr  → loads into q29
+    // neon<op> arrCode    → v28 = v28 op v29
+    // neonstr  targetAddr → stores q28 to target
+    builder_.emitRaw("    neonldr " + leftAddr);
+    builder_.emitRaw("    neonldr2 " + rightAddr);
+    builder_.emitRaw("    " + neonOp + " " + std::to_string(arrCode));
+    builder_.emitRaw("    neonstr " + targetAddr);
+
+    return true;
+}
+
+// =============================================================================
 // emitUDTCopyFieldByField - Recursive UDT field-by-field copy
 // =============================================================================
 // Copies all fields from sourceAddr to targetAddr for the given UDT definition.
@@ -3857,6 +4111,110 @@ void ASTEmitter::clearArrayElementCache() {
 // total ≤ 128 bits) and has no string fields, emit a single NEON 128-bit
 // load/store pair instead of per-field scalar copies.  This is controlled by
 // the ENABLE_NEON_COPY environment variable (default: enabled).
+
+// =============================================================================
+// emitScalarUDTArithmetic - Scalar fallback for UDT element-wise arithmetic
+// =============================================================================
+// When NEON arithmetic is disabled (kill-switch) or the UDT is not SIMD-eligible,
+// this function provides a scalar fallback that performs field-by-field arithmetic.
+// Handles +, -, *, / for UDTs whose fields are all numeric (no strings).
+//
+// Pattern: C = A op B  where A, B, C are the same UDT type.
+// For each field: C.field = A.field op B.field
+
+bool ASTEmitter::emitScalarUDTArithmetic(
+        const FasterBASIC::LetStatement* stmt,
+        const std::string& targetAddr,
+        const FasterBASIC::TypeSymbol& udtDef,
+        const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) {
+
+    // The value expression must be a binary expression
+    if (!stmt->value || stmt->value->getType() != ASTNodeType::EXPR_BINARY) return false;
+
+    const auto* binExpr = static_cast<const BinaryExpression*>(stmt->value.get());
+
+    // Only handle arithmetic operators: +, -, *, /
+    std::string qbeOp;
+    switch (binExpr->op) {
+        case TokenType::PLUS:     qbeOp = "add"; break;
+        case TokenType::MINUS:    qbeOp = "sub"; break;
+        case TokenType::MULTIPLY: qbeOp = "mul"; break;
+        case TokenType::DIVIDE:   qbeOp = "div"; break;
+        default: return false;
+    }
+
+    // UDT must not contain string fields (no arithmetic on strings)
+    if (typeManager_.hasStringFields(udtDef, udtMap)) return false;
+
+    // Both operands must be the same UDT type as the target
+    std::string leftUDT = getUDTTypeNameForExpr(binExpr->left.get());
+    std::string rightUDT = getUDTTypeNameForExpr(binExpr->right.get());
+
+    if (leftUDT.empty() || rightUDT.empty()) return false;
+    if (leftUDT != udtDef.name || rightUDT != udtDef.name) return false;
+
+    // Get addresses of left and right operands
+    std::string leftAddr = getUDTAddressForExpr(binExpr->left.get());
+    std::string rightAddr = getUDTAddressForExpr(binExpr->right.get());
+
+    if (leftAddr.empty() || rightAddr.empty()) return false;
+
+    builder_.emitComment("Scalar UDT arithmetic (" + udtDef.name + "): field-by-field " + qbeOp);
+
+    // Iterate over all fields and emit scalar arithmetic for each
+    int64_t offset = 0;
+    for (size_t i = 0; i < udtDef.fields.size(); ++i) {
+        const auto& field = udtDef.fields[i];
+        BaseType fieldType = field.typeDesc.baseType;
+
+        // Skip non-numeric fields (nested UDTs handled recursively if needed)
+        if (fieldType == BaseType::STRING) continue;
+
+        if (fieldType == BaseType::USER_DEFINED) {
+            // For nested UDTs, we would need to recurse — skip for now
+            auto nestedIt = udtMap.find(field.typeDesc.udtName);
+            if (nestedIt != udtMap.end()) {
+                offset += typeManager_.getUDTSizeRecursive(nestedIt->second, udtMap);
+            }
+            continue;
+        }
+
+        std::string qbeType = typeManager_.getQBEType(fieldType);
+
+        // Calculate field addresses
+        std::string leftFieldAddr = builder_.newTemp();
+        std::string rightFieldAddr = builder_.newTemp();
+        std::string dstFieldAddr = builder_.newTemp();
+
+        if (offset > 0) {
+            builder_.emitBinary(leftFieldAddr, "l", "add", leftAddr, std::to_string(offset));
+            builder_.emitBinary(rightFieldAddr, "l", "add", rightAddr, std::to_string(offset));
+            builder_.emitBinary(dstFieldAddr, "l", "add", targetAddr, std::to_string(offset));
+        } else {
+            builder_.emitRaw("    " + leftFieldAddr + " =l copy " + leftAddr);
+            builder_.emitRaw("    " + rightFieldAddr + " =l copy " + rightAddr);
+            builder_.emitRaw("    " + dstFieldAddr + " =l copy " + targetAddr);
+        }
+
+        // Load left and right values
+        std::string leftVal = builder_.newTemp();
+        std::string rightVal = builder_.newTemp();
+        builder_.emitLoad(leftVal, qbeType, leftFieldAddr);
+        builder_.emitLoad(rightVal, qbeType, rightFieldAddr);
+
+        // Perform the arithmetic operation
+        std::string result = builder_.newTemp();
+        builder_.emitBinary(result, qbeType, qbeOp, leftVal, rightVal);
+
+        // Store result to target field
+        builder_.emitStore(qbeType, result, dstFieldAddr);
+
+        // Advance offset for next field
+        offset += typeManager_.getTypeSize(fieldType);
+    }
+
+    return true;
+}
 
 void ASTEmitter::emitUDTCopyFieldByField(
         const std::string& sourceAddr,
@@ -3951,6 +4309,605 @@ void ASTEmitter::emitUDTCopyFieldByField(
         } else {
             offset += typeManager_.getTypeSize(fieldType);
         }
+    }
+}
+
+// =============================================================================
+// NEON Phase 3: Array Loop Vectorization
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Helper: check if an expression is a simple variable reference to the loop
+// index variable (handles normalized names like "i%", "i_INT", etc.)
+// ---------------------------------------------------------------------------
+bool ASTEmitter::isLoopIndexVar(const FasterBASIC::Expression* expr,
+                                const std::string& indexVar) const {
+    if (!expr || expr->getType() != ASTNodeType::EXPR_VARIABLE) return false;
+    const auto* ve = static_cast<const FasterBASIC::VariableExpression*>(expr);
+    if (ve->name == indexVar) return true;
+
+    // Normalize both names by stripping type suffixes and comparing base names.
+    // The semantic analyzer may normalize "i%" → "i_INT", "x#" → "x_DOUBLE", etc.
+    // We need to handle all combinations.
+    auto stripToBase = [](const std::string& s) -> std::string {
+        std::string r = s;
+        // Strip trailing BASIC type-suffix character ('%', '#', '!', '&', '$')
+        if (!r.empty()) {
+            char c = r.back();
+            if (c == '%' || c == '#' || c == '!' || c == '&' || c == '$')
+                r.pop_back();
+        }
+        // Strip trailing semantic-analyzer type suffix (_INT, _DOUBLE, _SINGLE, _LONG, _STRING)
+        static const char* suffixes[] = {
+            "_INT", "_DOUBLE", "_SINGLE", "_LONG", "_STRING", "_FLOAT",
+            "_INTEGER", nullptr
+        };
+        for (const char** sp = suffixes; *sp; ++sp) {
+            std::string suf(*sp);
+            if (r.size() > suf.size() &&
+                r.compare(r.size() - suf.size(), suf.size(), suf) == 0) {
+                r.erase(r.size() - suf.size());
+                break;
+            }
+        }
+        return r;
+    };
+
+    std::string baseExpr = stripToBase(ve->name);
+    std::string baseIdx  = stripToBase(indexVar);
+    return baseExpr == baseIdx;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: try to evaluate an expression as a compile-time integer constant
+// ---------------------------------------------------------------------------
+bool ASTEmitter::tryEvalConstantInt(const FasterBASIC::Expression* expr,
+                                     int& outVal) const {
+    if (!expr) return false;
+    if (expr->getType() == ASTNodeType::EXPR_NUMBER) {
+        const auto* num = static_cast<const FasterBASIC::NumberExpression*>(expr);
+        double v = num->value;
+        if (v == (int)v) {
+            outVal = (int)v;
+            return true;
+        }
+    }
+    // Negative constant: unary minus on a number literal
+    if (expr->getType() == ASTNodeType::EXPR_UNARY) {
+        const auto* un = static_cast<const FasterBASIC::UnaryExpression*>(expr);
+        if (un->op == FasterBASIC::TokenType::MINUS) {
+            int inner;
+            if (tryEvalConstantInt(un->expr.get(), inner)) {
+                outVal = -inner;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: get the QBE name for an array descriptor pointer (load-ready)
+// ---------------------------------------------------------------------------
+std::string ASTEmitter::getArrayDescriptorPtr(const std::string& arrayName) {
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto arrIt = symbolTable.arrays.find(arrayName);
+    if (arrIt == symbolTable.arrays.end()) return "";
+    const auto& arraySymbol = arrIt->second;
+    std::string descName = symbolMapper_.getArrayDescriptorName(arrayName);
+    bool isGlobal = arraySymbol.functionScope.empty();
+    if (isGlobal && descName[0] != '$') descName = "$" + descName;
+    else if (!isGlobal && descName[0] != '%') descName = "%" + descName;
+    return descName;
+}
+
+// ---------------------------------------------------------------------------
+// matchWholeUDTBinaryOp — detect: C(i) = A(i) OP B(i)
+// ---------------------------------------------------------------------------
+bool ASTEmitter::matchWholeUDTBinaryOp(const FasterBASIC::LetStatement* stmt,
+                                        const std::string& indexVar,
+                                        SIMDLoopInfo& info) {
+    using namespace FasterBASIC;
+
+    // Must be an array element assignment with no member chain
+    if (stmt->indices.size() != 1 || !stmt->memberChain.empty()) return false;
+    // Index must be the loop variable
+    if (!isLoopIndexVar(stmt->indices[0].get(), indexVar)) return false;
+    // Value must be a binary expression
+    if (!stmt->value || stmt->value->getType() != ASTNodeType::EXPR_BINARY) return false;
+
+    const auto* binExpr = static_cast<const BinaryExpression*>(stmt->value.get());
+
+    // Determine operation
+    std::string op;
+    switch (binExpr->op) {
+        case TokenType::PLUS:     op = "add"; break;
+        case TokenType::MINUS:    op = "sub"; break;
+        case TokenType::MULTIPLY: op = "mul"; break;
+        case TokenType::DIVIDE:   op = "div"; break;
+        default: return false;
+    }
+
+    // Both sides must be array accesses with the same loop index
+    if (!binExpr->left || binExpr->left->getType() != ASTNodeType::EXPR_ARRAY_ACCESS) return false;
+    if (!binExpr->right || binExpr->right->getType() != ASTNodeType::EXPR_ARRAY_ACCESS) return false;
+
+    const auto* leftArr  = static_cast<const ArrayAccessExpression*>(binExpr->left.get());
+    const auto* rightArr = static_cast<const ArrayAccessExpression*>(binExpr->right.get());
+
+    if (leftArr->indices.size() != 1 || !isLoopIndexVar(leftArr->indices[0].get(), indexVar)) return false;
+    if (rightArr->indices.size() != 1 || !isLoopIndexVar(rightArr->indices[0].get(), indexVar)) return false;
+
+    // All three arrays must be arrays of the same SIMD-eligible UDT
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto destIt = symbolTable.arrays.find(stmt->variable);
+    auto srcAIt = symbolTable.arrays.find(leftArr->name);
+    auto srcBIt = symbolTable.arrays.find(rightArr->name);
+    if (destIt == symbolTable.arrays.end() || srcAIt == symbolTable.arrays.end() || srcBIt == symbolTable.arrays.end())
+        return false;
+
+    const auto& destSym = destIt->second;
+    const auto& srcASym = srcAIt->second;
+    const auto& srcBSym = srcBIt->second;
+
+    // Must be UDT element types
+    if (destSym.elementTypeDesc.baseType != BaseType::USER_DEFINED) return false;
+    if (srcASym.elementTypeDesc.baseType != BaseType::USER_DEFINED) return false;
+    if (srcBSym.elementTypeDesc.baseType != BaseType::USER_DEFINED) return false;
+
+    // Must be the same UDT type
+    std::string udtName = destSym.elementTypeDesc.udtName;
+    if (srcASym.elementTypeDesc.udtName != udtName || srcBSym.elementTypeDesc.udtName != udtName)
+        return false;
+
+    // Look up the UDT and check SIMD eligibility
+    auto udtIt = symbolTable.types.find(udtName);
+    if (udtIt == symbolTable.types.end()) return false;
+    const auto& udtDef = udtIt->second;
+    auto simdInfo = typeManager_.getSIMDInfo(udtDef);
+    if (!simdInfo.isValid() || !simdInfo.isFullQ) return false;
+    if (typeManager_.hasStringFields(udtDef, symbolTable.types)) return false;
+
+    // Division is only supported for float arrangements
+    if (op == "div" && !simdInfo.isFloatingPoint) return false;
+
+    // Build the operand list
+    auto findOrAdd = [&](const std::string& name, bool readOnly) -> int {
+        for (size_t i = 0; i < info.operands.size(); ++i) {
+            if (info.operands[i].arrayName == name) {
+                if (!readOnly) info.operands[i].isReadOnly = false;
+                return (int)i;
+            }
+        }
+        SIMDLoopInfo::ArrayOperand ao;
+        ao.arrayName   = name;
+        ao.udtTypeName = udtName;
+        ao.simdInfo    = simdInfo;
+        ao.isReadOnly  = readOnly;
+        info.operands.push_back(ao);
+        return (int)(info.operands.size() - 1);
+    };
+
+    info.srcAArrayIndex = findOrAdd(leftArr->name, true);
+    info.srcBArrayIndex = findOrAdd(rightArr->name, true);
+    info.destArrayIndex = findOrAdd(stmt->variable, false);
+    info.operation      = op;
+    info.arrangementCode = simdArrangementCode(simdInfo);
+    info.elemSizeBytes   = simdInfo.totalBytes;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// matchWholeUDTCopy — detect: B(i) = A(i)
+// ---------------------------------------------------------------------------
+bool ASTEmitter::matchWholeUDTCopy(const FasterBASIC::LetStatement* stmt,
+                                    const std::string& indexVar,
+                                    SIMDLoopInfo& info) {
+    using namespace FasterBASIC;
+
+    if (stmt->indices.size() != 1 || !stmt->memberChain.empty()) return false;
+    if (!isLoopIndexVar(stmt->indices[0].get(), indexVar)) return false;
+
+    // Value must be an array access with the loop index
+    if (!stmt->value || stmt->value->getType() != ASTNodeType::EXPR_ARRAY_ACCESS) return false;
+    const auto* srcArr = static_cast<const ArrayAccessExpression*>(stmt->value.get());
+    if (srcArr->indices.size() != 1 || !isLoopIndexVar(srcArr->indices[0].get(), indexVar)) return false;
+
+    // Both arrays must be of the same SIMD-eligible UDT
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto destIt = symbolTable.arrays.find(stmt->variable);
+    auto srcIt  = symbolTable.arrays.find(srcArr->name);
+    if (destIt == symbolTable.arrays.end() || srcIt == symbolTable.arrays.end()) return false;
+
+    if (destIt->second.elementTypeDesc.baseType != BaseType::USER_DEFINED) return false;
+    if (srcIt->second.elementTypeDesc.baseType  != BaseType::USER_DEFINED) return false;
+    std::string udtName = destIt->second.elementTypeDesc.udtName;
+    if (srcIt->second.elementTypeDesc.udtName != udtName) return false;
+
+    auto udtIt = symbolTable.types.find(udtName);
+    if (udtIt == symbolTable.types.end()) return false;
+    const auto& udtDef = udtIt->second;
+    auto simdInfo = typeManager_.getSIMDInfo(udtDef);
+    if (!simdInfo.isValid() || !simdInfo.isFullQ) return false;
+    if (typeManager_.hasStringFields(udtDef, symbolTable.types)) return false;
+
+    SIMDLoopInfo::ArrayOperand srcOp;
+    srcOp.arrayName   = srcArr->name;
+    srcOp.udtTypeName = udtName;
+    srcOp.simdInfo    = simdInfo;
+    srcOp.isReadOnly  = true;
+    info.operands.push_back(srcOp);
+    info.srcAArrayIndex = 0;
+    info.srcBArrayIndex = -1;
+
+    SIMDLoopInfo::ArrayOperand dstOp;
+    dstOp.arrayName   = stmt->variable;
+    dstOp.udtTypeName = udtName;
+    dstOp.simdInfo    = simdInfo;
+    dstOp.isReadOnly  = false;
+    info.operands.push_back(dstOp);
+    info.destArrayIndex = 1;
+
+    info.operation       = "copy";
+    info.arrangementCode = simdArrangementCode(simdInfo);
+    info.elemSizeBytes   = simdInfo.totalBytes;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// matchFieldByFieldOp — detect N LetStatements that cover all fields of a
+// SIMD-eligible UDT with the same binary op:
+//   C(i).X = A(i).X OP B(i).X
+//   C(i).Y = A(i).Y OP B(i).Y
+//   ...
+// ---------------------------------------------------------------------------
+bool ASTEmitter::matchFieldByFieldOp(
+        const std::vector<FasterBASIC::StatementPtr>& body,
+        const std::string& indexVar,
+        SIMDLoopInfo& info) {
+    using namespace FasterBASIC;
+
+    if (body.empty()) return false;
+
+    // All statements must be LetStatements
+    for (const auto& s : body) {
+        if (!s || s->getType() != ASTNodeType::STMT_LET) return false;
+    }
+
+    // Analyse the first statement to extract arrays, operation, and UDT type
+    const auto* first = static_cast<const LetStatement*>(body[0].get());
+    if (first->indices.size() != 1 || first->memberChain.size() != 1) return false;
+    if (!isLoopIndexVar(first->indices[0].get(), indexVar)) return false;
+    if (!first->value || first->value->getType() != ASTNodeType::EXPR_BINARY) return false;
+
+    const auto* bin = static_cast<const BinaryExpression*>(first->value.get());
+    std::string op;
+    switch (bin->op) {
+        case TokenType::PLUS:     op = "add"; break;
+        case TokenType::MINUS:    op = "sub"; break;
+        case TokenType::MULTIPLY: op = "mul"; break;
+        case TokenType::DIVIDE:   op = "div"; break;
+        default: return false;
+    }
+    FasterBASIC::TokenType expectedOp = bin->op;
+
+    // Both operands must be member accesses on array elements
+    auto extractArrayMember = [&](const Expression* expr, std::string& arrName,
+                                   std::string& fieldName) -> bool {
+        if (!expr || expr->getType() != ASTNodeType::EXPR_MEMBER_ACCESS) return false;
+        const auto* mem = static_cast<const MemberAccessExpression*>(expr);
+        fieldName = mem->memberName;
+        if (!mem->object || mem->object->getType() != ASTNodeType::EXPR_ARRAY_ACCESS) return false;
+        const auto* arr = static_cast<const ArrayAccessExpression*>(mem->object.get());
+        arrName = arr->name;
+        if (arr->indices.size() != 1 || !isLoopIndexVar(arr->indices[0].get(), indexVar)) return false;
+        return true;
+    };
+
+    std::string destArrayName = first->variable;
+    std::string srcAArrayName, srcBArrayName;
+    std::string fieldA, fieldB;
+    if (!extractArrayMember(bin->left.get(), srcAArrayName, fieldA)) return false;
+    if (!extractArrayMember(bin->right.get(), srcBArrayName, fieldB)) return false;
+
+    // The first statement's member chain field and the source fields must match
+    if (first->memberChain[0] != fieldA || first->memberChain[0] != fieldB) return false;
+
+    // Look up the UDT
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto destArrIt = symbolTable.arrays.find(destArrayName);
+    auto srcAArrIt = symbolTable.arrays.find(srcAArrayName);
+    auto srcBArrIt = symbolTable.arrays.find(srcBArrayName);
+    if (destArrIt == symbolTable.arrays.end() || srcAArrIt == symbolTable.arrays.end() ||
+        srcBArrIt == symbolTable.arrays.end()) return false;
+
+    if (destArrIt->second.elementTypeDesc.baseType != BaseType::USER_DEFINED) return false;
+    std::string udtName = destArrIt->second.elementTypeDesc.udtName;
+    if (srcAArrIt->second.elementTypeDesc.udtName != udtName ||
+        srcBArrIt->second.elementTypeDesc.udtName != udtName) return false;
+
+    auto udtIt = symbolTable.types.find(udtName);
+    if (udtIt == symbolTable.types.end()) return false;
+    const auto& udtDef = udtIt->second;
+    auto simdInfo = typeManager_.getSIMDInfo(udtDef);
+    if (!simdInfo.isValid() || !simdInfo.isFullQ) return false;
+    if (typeManager_.hasStringFields(udtDef, symbolTable.types)) return false;
+    if (op == "div" && !simdInfo.isFloatingPoint) return false;
+
+    // We need exactly as many statements as UDT fields
+    if (body.size() != udtDef.fields.size()) return false;
+
+    // Verify every statement matches the pattern with the same arrays and op
+    std::set<std::string> coveredFields;
+    for (const auto& s : body) {
+        const auto* let = static_cast<const LetStatement*>(s.get());
+        if (let->variable != destArrayName) return false;
+        if (let->indices.size() != 1 || !isLoopIndexVar(let->indices[0].get(), indexVar)) return false;
+        if (let->memberChain.size() != 1) return false;
+        if (!let->value || let->value->getType() != ASTNodeType::EXPR_BINARY) return false;
+        const auto* b = static_cast<const BinaryExpression*>(let->value.get());
+        if (b->op != expectedOp) return false;
+        std::string sA, sB, fA, fB;
+        if (!extractArrayMember(b->left.get(), sA, fA)) return false;
+        if (!extractArrayMember(b->right.get(), sB, fB)) return false;
+        if (sA != srcAArrayName || sB != srcBArrayName) return false;
+        if (let->memberChain[0] != fA || let->memberChain[0] != fB) return false;
+        coveredFields.insert(let->memberChain[0]);
+    }
+
+    // All UDT fields must be covered
+    for (const auto& f : udtDef.fields) {
+        if (coveredFields.find(f.name) == coveredFields.end()) return false;
+    }
+
+    // Build the info
+    auto findOrAdd = [&](const std::string& name, bool readOnly) -> int {
+        for (size_t i = 0; i < info.operands.size(); ++i) {
+            if (info.operands[i].arrayName == name) {
+                if (!readOnly) info.operands[i].isReadOnly = false;
+                return (int)i;
+            }
+        }
+        SIMDLoopInfo::ArrayOperand ao;
+        ao.arrayName   = name;
+        ao.udtTypeName = udtName;
+        ao.simdInfo    = simdInfo;
+        ao.isReadOnly  = readOnly;
+        info.operands.push_back(ao);
+        return (int)(info.operands.size() - 1);
+    };
+
+    info.srcAArrayIndex  = findOrAdd(srcAArrayName, true);
+    info.srcBArrayIndex  = findOrAdd(srcBArrayName, true);
+    info.destArrayIndex  = findOrAdd(destArrayName, false);
+    info.operation       = op;
+    info.arrangementCode = simdArrangementCode(simdInfo);
+    info.elemSizeBytes   = simdInfo.totalBytes;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// analyzeSIMDLoop — main entry point for Phase 3 loop analysis
+// ---------------------------------------------------------------------------
+SIMDLoopInfo ASTEmitter::analyzeSIMDLoop(const FasterBASIC::ForStatement* forStmt) {
+    using namespace FasterBASIC;
+    SIMDLoopInfo info;
+    info.isVectorizable = false;
+
+    if (!forStmt) return info;
+
+    // --- Kill-switch check ---
+    static int neonLoopChecked  = 0;
+    static int neonLoopEnabled  = 1;
+    if (!neonLoopChecked) {
+        const char* env = getenv("ENABLE_NEON_LOOP");
+        if (env) {
+            neonLoopEnabled = (strcmp(env, "1") == 0 || strcmp(env, "true") == 0);
+        }
+        neonLoopChecked = 1;
+    }
+    if (!neonLoopEnabled) return info;
+
+    // --- Step must be 1 (or absent, which defaults to 1) ---
+    info.stepVal = 1;
+    if (forStmt->step) {
+        int sv;
+        if (!tryEvalConstantInt(forStmt->step.get(), sv) || sv != 1)
+            return info;
+    }
+
+    // --- Index variable ---
+    info.indexVar = forStmt->variable;
+
+    // --- Start / end values (may be constants or runtime expressions) ---
+    if (tryEvalConstantInt(forStmt->start.get(), info.startVal))
+        info.startIsConstant = true;
+    if (tryEvalConstantInt(forStmt->end.get(), info.endVal))
+        info.endIsConstant = true;
+
+    // --- Body pattern matching ---
+    const auto& body = forStmt->body;
+    if (body.empty()) return info;
+
+    // Check for disqualifying statement types (function calls, branches, etc.)
+    for (const auto& s : body) {
+        if (!s) return info;
+        ASTNodeType t = s->getType();
+        if (t != ASTNodeType::STMT_LET) return info; // Only LET statements allowed
+    }
+
+    // Try Pattern A: single whole-UDT binary op — C(i) = A(i) OP B(i)
+    if (body.size() == 1) {
+        const auto* let = static_cast<const LetStatement*>(body[0].get());
+        if (matchWholeUDTBinaryOp(let, info.indexVar, info)) {
+            info.isVectorizable = true;
+            return info;
+        }
+        // Try Pattern B: whole-UDT copy — B(i) = A(i)
+        if (matchWholeUDTCopy(let, info.indexVar, info)) {
+            info.isVectorizable = true;
+            return info;
+        }
+    }
+
+    // Try Pattern C: field-by-field op covering all fields
+    if (matchFieldByFieldOp(body, info.indexVar, info)) {
+        info.isVectorizable = true;
+        return info;
+    }
+
+    return info;
+}
+
+// ---------------------------------------------------------------------------
+// emitSIMDLoop — emit the NEON-vectorized loop
+// ---------------------------------------------------------------------------
+void ASTEmitter::emitSIMDLoop(const FasterBASIC::ForStatement* forStmt,
+                               const SIMDLoopInfo& info,
+                               const std::string& exitLabel) {
+    using namespace FasterBASIC;
+
+    builder_.emitComment("=== NEON Phase 3: Vectorized array loop ===");
+    builder_.emitComment("Pattern: " + info.operation
+        + " | arrays: " + std::to_string(info.operands.size())
+        + " | elemSize: " + std::to_string(info.elemSizeBytes) + "B");
+
+    // --- 1. Evaluate loop start/end into QBE word temporaries ---
+    std::string startW = emitExpressionAs(forStmt->start.get(), BaseType::INTEGER);
+    std::string endW   = emitExpressionAs(forStmt->end.get(),   BaseType::INTEGER);
+
+    // --- 2. Bounds-check every array for the range [start, end] ---
+    for (const auto& op : info.operands) {
+        std::string descName = getArrayDescriptorPtr(op.arrayName);
+        if (descName.empty()) {
+            builder_.emitComment("ERROR: cannot find descriptor for array: " + op.arrayName);
+            return;
+        }
+        std::string arrPtr = builder_.newTemp();
+        builder_.emitLoad(arrPtr, "l", descName);
+        builder_.emitComment("Bounds-check array: " + op.arrayName);
+        builder_.emitCall("", "", "array_check_range",
+                         "l " + arrPtr + ", w " + startW + ", w " + endW);
+    }
+
+    // --- 3. Get data pointers for all arrays ---
+    std::vector<std::string> basePtrs;
+    for (const auto& op : info.operands) {
+        std::string descName = getArrayDescriptorPtr(op.arrayName);
+        std::string arrPtr = builder_.newTemp();
+        builder_.emitLoad(arrPtr, "l", descName);
+        std::string dataPtr = builder_.newTemp();
+        builder_.emitCall(dataPtr, "l", "array_get_data_ptr", "l " + arrPtr);
+        basePtrs.push_back(dataPtr);
+    }
+
+    // --- 4. Compute byte offsets ---
+    // startOffset = startVal * elemSize (in bytes)
+    // count = endVal - startVal + 1
+    // totalBytes = count * elemSize
+    std::string startL = builder_.newTemp();
+    builder_.emitInstruction(startL + " =l extsw " + startW);
+    std::string endL = builder_.newTemp();
+    builder_.emitInstruction(endL + " =l extsw " + endW);
+
+    std::string elemSizeL = builder_.newTemp();
+    builder_.emitRaw("    " + elemSizeL + " =l copy " + std::to_string(info.elemSizeBytes));
+
+    std::string startOff = builder_.newTemp();
+    builder_.emitBinary(startOff, "l", "mul", startL, elemSizeL);
+
+    std::string count = builder_.newTemp();
+    builder_.emitBinary(count, "l", "sub", endL, startL);
+    std::string count1 = builder_.newTemp();
+    builder_.emitBinary(count1, "l", "add", count, "1");
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1, elemSizeL);
+
+    // --- 5. Compute cursor start and end pointers ---
+    // We iterate using a pointer to the destination array and compute
+    // corresponding source pointers from offsets.
+    // Alloc stack slots for the current byte-offset cursor and end offset
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l alloc8 8");
+    builder_.emitRaw("    storel " + startOff + ", " + curOff);
+
+    std::string endOff = builder_.newTemp();
+    builder_.emitBinary(endOff, "l", "add", startOff, totalBytes);
+    std::string endOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + endOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel " + endOff + ", " + endOffSlot);
+
+    // --- 6. Emit the loop ---
+    int loopId = builder_.getNextLabelId();
+    std::string headerLabel = "neon_loop_hdr_" + std::to_string(loopId);
+    std::string bodyLabel   = "neon_loop_body_" + std::to_string(loopId);
+    std::string doneLabel   = "neon_loop_done_" + std::to_string(loopId);
+
+    builder_.emitJump(headerLabel);
+    builder_.emitLabel(headerLabel);
+
+    // Load current offset and end offset
+    std::string curOffVal = builder_.newTemp();
+    builder_.emitRaw("    " + curOffVal + " =l loadl " + curOff);
+    std::string endOffVal = builder_.newTemp();
+    builder_.emitRaw("    " + endOffVal + " =l loadl " + endOffSlot);
+    std::string done = builder_.newTemp();
+    builder_.emitRaw("    " + done + " =w cugel " + curOffVal + ", " + endOffVal);
+    builder_.emitBranch(done, doneLabel, bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+
+    // Reload current offset (SSA)
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOff);
+
+    if (info.operation == "copy") {
+        // --- Copy pattern: ldr q28 from srcA, str q28 to dest ---
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", basePtrs[info.srcAArrayIndex], off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", basePtrs[info.destArrayIndex], off);
+
+        builder_.emitRaw("    neonldr " + srcAddr);
+        builder_.emitRaw("    neonstr " + dstAddr);
+    } else {
+        // --- Arithmetic pattern: ldr q28, ldr2 q29, op, str q28 ---
+        std::string srcAAddr = builder_.newTemp();
+        builder_.emitBinary(srcAAddr, "l", "add", basePtrs[info.srcAArrayIndex], off);
+        std::string srcBAddr = builder_.newTemp();
+        builder_.emitBinary(srcBAddr, "l", "add", basePtrs[info.srcBArrayIndex], off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", basePtrs[info.destArrayIndex], off);
+
+        builder_.emitRaw("    neonldr " + srcAAddr);
+        builder_.emitRaw("    neonldr2 " + srcBAddr);
+
+        // Map operation name to NEON opcode
+        std::string neonOp = "neon" + info.operation; // neonadd, neonsub, etc.
+        builder_.emitRaw("    " + neonOp + " " + std::to_string(info.arrangementCode));
+        builder_.emitRaw("    neonstr " + dstAddr);
+    }
+
+    // Advance offset by element size
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(info.elemSizeBytes));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOff);
+    builder_.emitJump(headerLabel);
+
+    // --- 7. Loop done ---
+    builder_.emitLabel(doneLabel);
+
+    // Set loop variable to endVal + 1 (BASIC FOR semantics: variable is
+    // one step past end after loop completes)
+    std::string finalVal = builder_.newTemp();
+    builder_.emitBinary(finalVal, "w", "add", endW, "1");
+    storeVariable(forStmt->variable, finalVal);
+
+    builder_.emitComment("=== End NEON vectorized loop ===");
+
+    // Jump to the exit block (skipping the scalar loop body/condition/increment)
+    if (!exitLabel.empty()) {
+        builder_.emitJump(exitLabel);
     }
 }
 

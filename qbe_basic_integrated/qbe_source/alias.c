@@ -198,10 +198,16 @@ fillalias(Fn *fn)
 			if (i->op != Oblit0) {
 				if (!isload(i->op))
 					esc(i->arg[0], fn);
-				if (!isstore(i->op))
+				if (!isstore(i->op) && !isneonstore(i->op))
 				if (i->op != Oargc)
 					esc(i->arg[1], fn);
 			}
+			/* NEON 128-bit stores write 16 bytes
+			 * through their address argument;
+			 * mark the target as escaped so that
+			 * load forwarding does not skip them */
+			if (isneonstore(i->op))
+				esc(i->arg[0], fn);
 			if (i->op == Oblit0) {
 				++i;
 				assert(i->op == Oblit1);

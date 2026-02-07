@@ -28,6 +28,8 @@ char *tok[] = {
 	/* ARM64 NEON vector operations */
 	"neonldr", "neonstr", "neonldr2", "neonstr2",
 	"neonadd", "neonsub", "neonmul", "neonaddv",
+	"neondiv", "neonneg", "neonabs", "neonfma",
+	"neonmin", "neonmax", "neondup",
 
 	"call", "phi", "jmp", "jnz", "ret", "hlt", "export",
 	"function", "type", "data", "section", "align", "dbgfile",

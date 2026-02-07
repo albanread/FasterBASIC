@@ -706,6 +706,49 @@ free(bounds);
 return array;
 }
 
+// =============================================================================
+// NEON Loop Vectorization Support
+// =============================================================================
+
+// Get raw data pointer for direct NEON access (bypasses per-element bounds checking)
+void* array_get_data_ptr(BasicArray* array) {
+    if (!array || !array->data) return NULL;
+    return array->data;
+}
+
+// Get element size in bytes
+size_t array_get_element_size(BasicArray* array) {
+    if (!array) return 0;
+    return array->element_size;
+}
+
+// Validate that a contiguous range [start_idx, end_idx] is within bounds
+// for dimension 0.  Called once before a NEON-vectorized loop to replace
+// per-element bounds checking.
+void array_check_range(BasicArray* array, int32_t start_idx, int32_t end_idx) {
+    if (!array) {
+        basic_error_msg("NEON loop: null array pointer");
+        return;
+    }
+    if (!array->data) {
+        basic_error_msg("NEON loop: array has no data (not allocated?)");
+        return;
+    }
+    if (array->dimensions < 1) {
+        basic_error_msg("NEON loop: array has no dimensions");
+        return;
+    }
+    int32_t lower = array->bounds[0];
+    int32_t upper = array->bounds[1];
+    if (start_idx < lower || end_idx > upper) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+            "NEON loop: array range [%d, %d] out of bounds [%d, %d]",
+            start_idx, end_idx, lower, upper);
+        basic_error_msg(msg);
+    }
+}
+
 // Erase an array (deallocate memory but keep descriptor)
 void array_erase(BasicArray* array) {
     if (!array) return;
