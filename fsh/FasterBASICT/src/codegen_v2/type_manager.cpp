@@ -364,6 +364,13 @@ std::string TypeManager::getReturnVariableName(const std::string& funcName,
     if (suffix.empty()) {
         return funcName;  // VOID / UNKNOWN – bare name
     }
+    // Avoid double-suffixing: if the parser already mangled the name
+    // with the type suffix (e.g. MakeGreeting$ → MakeGreeting_STRING),
+    // don't append _STRING again.
+    if (suffix.size() <= funcName.size() &&
+        funcName.compare(funcName.size() - suffix.size(), suffix.size(), suffix) == 0) {
+        return funcName;
+    }
     return funcName + suffix;
 }
 

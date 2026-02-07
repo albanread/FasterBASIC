@@ -772,8 +772,18 @@ void CFGEmitter::emitExitBlockTerminator() {
     // SAMM: If returning a CLASS instance, RETAIN it to the parent scope
     // so it survives the current scope's cleanup. This is essential for
     // factory functions that create and return objects.
-    if (returnType == BaseType::CLASS_INSTANCE) {
+    if (returnType == BaseType::CLASS_INSTANCE && astEmitter_.isSAMMEnabled()) {
         builder_.emitComment("SAMM: RETAIN returned CLASS instance to parent scope");
+        builder_.emitCall("", "", "samm_retain_parent", "l " + retTemp);
+    }
+
+    // SAMM: If returning a STRING, RETAIN it to the parent scope so it
+    // survives the current scope's cleanup.  String descriptors are now
+    // auto-tracked by SAMM in every scope, so without RETAIN the
+    // returned string would be released on scope exit before the caller
+    // can use it.
+    if (returnType == BaseType::STRING && astEmitter_.isSAMMEnabled()) {
+        builder_.emitComment("SAMM: RETAIN returned STRING to parent scope");
         builder_.emitCall("", "", "samm_retain_parent", "l " + retTemp);
     }
 

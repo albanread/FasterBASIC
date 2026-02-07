@@ -44,7 +44,7 @@ extern "C" {
 typedef enum {
     SAMM_ALLOC_UNKNOWN = 0,
     SAMM_ALLOC_OBJECT,     /* CLASS instance (vtable + fields)     */
-    SAMM_ALLOC_STRING,     /* String descriptor                    */
+    SAMM_ALLOC_STRING,     /* String descriptor (StringDescriptor) */
     SAMM_ALLOC_ARRAY,      /* Dynamic array                        */
     SAMM_ALLOC_LIST,       /* List header (future — Phase 4)       */
     SAMM_ALLOC_LIST_ATOM,  /* List node/atom (future — Phase 4)    */
@@ -254,17 +254,39 @@ void samm_track_list(void* list_header_ptr);
 void* samm_alloc_list_atom(void);
 
 /* ========================================================================= */
-/* String Tracking (Phase 2)                                                  */
+/* String Tracking                                                            */
+/*                                                                            */
+/* String descriptors (StringDescriptor*) allocated by the runtime's          */
+/* string_new_* / string_concat / string_from_* functions are automatically   */
+/* tracked in the current SAMM scope. On scope exit, each tracked string      */
+/* receives a string_release() call which decrements the refcount and frees   */
+/* the descriptor + its data buffer when the refcount reaches zero.           */
+/*                                                                            */
+/* If a string must survive its creating scope (e.g., returned from a         */
+/* FUNCTION or METHOD), use samm_retain_parent() to move it to the parent     */
+/* scope before the current scope exits.                                      */
 /* ========================================================================= */
 
 /**
  * Track a string descriptor allocation in the current scope.
- * On scope exit, the cleanup worker calls string_pool_free rather
- * than raw free(). Phase 2 stub — currently a no-op.
+ * On scope exit, the cleanup worker calls string_release() which
+ * decrements the refcount and frees when it reaches zero.
  *
- * @param string_desc_ptr  Pointer to the string descriptor
+ * @param string_desc_ptr  Pointer to the StringDescriptor
  */
 void samm_track_string(void* string_desc_ptr);
+
+/**
+ * Allocate a zeroed StringDescriptor via calloc and automatically
+ * track it in the current SAMM scope. The descriptor is initialised
+ * with refcount=1 and dirty=1. The caller is responsible for setting
+ * encoding, allocating the data buffer, etc.
+ *
+ * When SAMM is disabled this still allocates but does not track.
+ *
+ * @return Pointer to a zeroed StringDescriptor, or NULL on failure
+ */
+void* samm_alloc_string(void);
 
 /* ========================================================================= */
 /* Destructor Registration                                                    */
@@ -309,6 +331,8 @@ typedef struct {
     uint64_t retain_calls;              /* Total samm_retain* calls          */
     uint64_t total_bytes_allocated;     /* Cumulative bytes allocated        */
     uint64_t total_bytes_freed;         /* Cumulative bytes freed            */
+    uint64_t strings_tracked;           /* Total samm_track_string calls     */
+    uint64_t strings_cleaned;           /* Strings cleaned by scope exit     */
     int      current_scope_depth;       /* Current scope nesting depth       */
     int      peak_scope_depth;          /* Maximum scope depth observed      */
     size_t   bloom_memory_bytes;        /* Bloom filter memory usage         */

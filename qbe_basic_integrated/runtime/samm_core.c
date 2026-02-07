@@ -30,11 +30,17 @@
  */
 
 #include "samm_bridge.h"
+#include "string_descriptor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
 #include <inttypes.h>
+
+/* Forward-declare string_release so we can call it from cleanup without
+ * pulling in the full string_pool.h header chain (which is only needed
+ * for pool-based allocation, not for release). string_release is defined
+ * in string_utf32.c and declared in string_descriptor.h (included above). */
 
 /* ========================================================================= */
 /* Platform: stdatomic vs __sync builtins                                     */
@@ -253,6 +259,8 @@ typedef struct {
     samm_atomic_u64 stat_retain_calls;
     samm_atomic_u64 stat_total_bytes_allocated;
     samm_atomic_u64 stat_total_bytes_freed;
+    samm_atomic_u64 stat_strings_tracked;
+    samm_atomic_u64 stat_strings_cleaned;
     double          stat_total_cleanup_time_ms;  /* protected by queue_mutex */
 } SAMMState;
 
@@ -328,8 +336,13 @@ static void cleanup_batch(SAMMCleanupBatch* batch) {
                     free(ptr);
                     break;
                 case SAMM_ALLOC_STRING:
-                    /* Phase 2: call string_pool_free. For now, just free. */
-                    free(ptr);
+                    /* Call string_release which decrements the refcount and
+                     * frees the descriptor's data + utf8_cache + the
+                     * descriptor itself when refcount reaches 0.  If the
+                     * string was retained elsewhere (refcount > 1), this
+                     * just drops SAMM's ownership claim. */
+                    string_release((StringDescriptor*)ptr);
+                    SAMM_ATOMIC_INC(g_samm.stat_strings_cleaned);
                     break;
                 default:
                     default_generic_cleanup(ptr);
@@ -923,10 +936,27 @@ void* samm_alloc_list_atom(void) {
 /* ========================================================================= */
 
 void samm_track_string(void* string_desc_ptr) {
-    /* Phase 2: track as SAMM_ALLOC_STRING so the worker calls
-     * string_pool_free instead of raw free.
-     * For now, track as generic so it at least gets freed. */
+    if (!string_desc_ptr) return;
     samm_track(string_desc_ptr, SAMM_ALLOC_STRING);
+    SAMM_ATOMIC_INC(g_samm.stat_strings_tracked);
+}
+
+/* ========================================================================= */
+/* Public API: String Allocation (pool + track)                                */
+/* ========================================================================= */
+
+void* samm_alloc_string(void) {
+    /* Allocate a zeroed StringDescriptor via calloc (same strategy as
+     * string_new_* functions in string_utf32.c) and track it in the
+     * current SAMM scope so it is automatically released on scope exit. */
+    StringDescriptor* desc = (StringDescriptor*)calloc(1, sizeof(StringDescriptor));
+    if (!desc) return NULL;
+    desc->refcount = 1;
+    desc->dirty    = 1;
+    if (g_samm.enabled) {
+        samm_track_string(desc);
+    }
+    return desc;
 }
 
 /* ========================================================================= */
@@ -957,6 +987,8 @@ void samm_get_stats(SAMMStats* out) {
     out->retain_calls          = SAMM_ATOMIC_LOAD(g_samm.stat_retain_calls);
     out->total_bytes_allocated = SAMM_ATOMIC_LOAD(g_samm.stat_total_bytes_allocated);
     out->total_bytes_freed     = SAMM_ATOMIC_LOAD(g_samm.stat_total_bytes_freed);
+    out->strings_tracked       = SAMM_ATOMIC_LOAD(g_samm.stat_strings_tracked);
+    out->strings_cleaned       = SAMM_ATOMIC_LOAD(g_samm.stat_strings_cleaned);
 
     pthread_mutex_lock(&g_samm.scope_mutex);
     out->current_scope_depth = g_samm.scope_depth;
@@ -983,6 +1015,8 @@ void samm_print_stats(void) {
     fprintf(stderr, "  Objects allocated:    %" PRIu64 "\n", s.objects_allocated);
     fprintf(stderr, "  Objects freed (DEL):  %" PRIu64 "\n", s.objects_freed);
     fprintf(stderr, "  Objects cleaned (bg): %" PRIu64 "\n", s.objects_cleaned);
+    fprintf(stderr, "  Strings tracked:      %" PRIu64 "\n", s.strings_tracked);
+    fprintf(stderr, "  Strings cleaned:      %" PRIu64 "\n", s.strings_cleaned);
     fprintf(stderr, "  Cleanup batches:      %" PRIu64 "\n", s.cleanup_batches);
     fprintf(stderr, "  Double-free catches:  %" PRIu64 "\n", s.double_free_attempts);
     fprintf(stderr, "  RETAIN calls:         %" PRIu64 "\n", s.retain_calls);

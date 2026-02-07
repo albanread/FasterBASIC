@@ -2714,6 +2714,16 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
                 builder_.emitCall("", "", "samm_retain_parent", "l " + value);
             }
 
+            // SAMM: If returning a STRING from a METHOD, RETAIN it to the
+            // parent scope so it survives the current method scope's cleanup.
+            // String descriptors are now auto-tracked by SAMM in every scope,
+            // so without RETAIN the returned string would be released on
+            // scope exit before the caller can use it.
+            if (isSAMMEnabled() && methodReturnType_ == FasterBASIC::BaseType::STRING) {
+                builder_.emitComment("SAMM: RETAIN returned STRING to parent scope");
+                builder_.emitCall("", "", "samm_retain_parent", "l " + value);
+            }
+
             // SAMM: Exit METHOD scope before returning. All tracked
             // allocations (except RETAINed ones) are queued for cleanup.
             if (isSAMMEnabled()) {
@@ -6840,15 +6850,29 @@ void ASTEmitter::emitIfDirect(const FasterBASIC::IfStatement* stmt) {
 
 // ---------------------------------------------------------------------------
 // bodyContainsDim — recursively check whether a statement list contains any
-// DIM statement (at any nesting depth inside FOR/IF/WHILE/DO bodies).
+// DIM statement or string-producing operation (at any nesting depth inside
+// FOR/IF/WHILE/DO bodies).
 // Used to gate SAMM loop-iteration scope emission: we only pay the cost of
 // samm_enter_scope / samm_exit_scope when the loop actually allocates.
+// With SAMM string tracking, string operations (assignments to $ variables,
+// PRINT of strings, etc.) also allocate and should trigger loop scopes.
 // ---------------------------------------------------------------------------
 bool ASTEmitter::bodyContainsDim(const std::vector<FasterBASIC::StatementPtr>& body) {
     for (const auto& s : body) {
         if (!s) continue;
         switch (s->getType()) {
             case FasterBASIC::ASTNodeType::STMT_DIM:
+                return true;
+            // LET assignment to a string variable (name ends with '$')
+            // creates a new string descriptor that should be scope-tracked.
+            case FasterBASIC::ASTNodeType::STMT_LET: {
+                const auto* let = static_cast<const FasterBASIC::LetStatement*>(s.get());
+                if (!let->variable.empty() && let->variable.back() == '$') return true;
+                break;
+            }
+            // PRINT statements frequently concatenate strings, creating
+            // temporaries that benefit from per-iteration cleanup.
+            case FasterBASIC::ASTNodeType::STMT_PRINT:
                 return true;
             case FasterBASIC::ASTNodeType::STMT_FOR: {
                 const auto* f = static_cast<const FasterBASIC::ForStatement*>(s.get());

@@ -9,9 +9,25 @@
 #include "string_descriptor.h"
 #include "array_descriptor.h"
 #include "basic_runtime.h"
+#include "samm_bridge.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// ---------------------------------------------------------------------------
+// SAMM auto-tracking helper
+// ---------------------------------------------------------------------------
+// Every leaf string allocation function (string_new_ascii, string_new_utf8,
+// string_new_capacity, etc.) calls this before returning a freshly allocated
+// StringDescriptor.  When SAMM is enabled the descriptor is registered in the
+// current scope so that it is automatically released (via string_release) when
+// the scope exits.  When SAMM is disabled this is a no-op.
+// ---------------------------------------------------------------------------
+static inline void samm_auto_track(StringDescriptor* desc) {
+    if (desc && samm_is_enabled()) {
+        samm_track_string(desc);
+    }
+}
 
 // Helper macros for encoding-aware data access
 #define STR_CHAR(str, i) (str->encoding == STRING_ENCODING_ASCII ? \
@@ -190,6 +206,7 @@ StringDescriptor* string_new_ascii(const char* ascii_str) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
@@ -202,6 +219,7 @@ StringDescriptor* string_new_ascii_len(const uint8_t* data, int64_t length) {
             desc->encoding = STRING_ENCODING_ASCII;
             desc->dirty = 1;
         }
+        samm_auto_track(desc);
         return desc;
     }
     
@@ -222,6 +240,7 @@ StringDescriptor* string_new_ascii_len(const uint8_t* data, int64_t length) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
@@ -235,6 +254,7 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
             desc->encoding = STRING_ENCODING_UTF32;
             desc->dirty = 1;
         }
+        samm_auto_track(desc);
         return desc;
     }
     
@@ -248,6 +268,7 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
     }
     
     // If pure ASCII, use ASCII encoding for efficiency
+    // (string_new_ascii auto-tracks via samm_auto_track)
     if (is_ascii) {
         return string_new_ascii(utf8_str);
     }
@@ -262,6 +283,7 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
             desc->encoding = STRING_ENCODING_UTF32;
             desc->dirty = 1;
         }
+        samm_auto_track(desc);
         return desc;
     }
     
@@ -285,6 +307,7 @@ StringDescriptor* string_new_utf8(const char* utf8_str) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
@@ -297,6 +320,7 @@ StringDescriptor* string_new_utf32(const uint32_t* data, int64_t length) {
             desc->encoding = STRING_ENCODING_UTF32;
             desc->dirty = 1;
         }
+        samm_auto_track(desc);
         return desc;
     }
     
@@ -317,6 +341,7 @@ StringDescriptor* string_new_utf32(const uint32_t* data, int64_t length) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
@@ -340,6 +365,7 @@ StringDescriptor* string_new_capacity(int64_t capacity) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
@@ -362,6 +388,7 @@ StringDescriptor* string_new_ascii_capacity(int64_t capacity) {
     desc->dirty = 1;
     desc->utf8_cache = NULL;
     
+    samm_auto_track(desc);
     return desc;
 }
 
