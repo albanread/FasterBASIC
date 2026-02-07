@@ -22,7 +22,14 @@ CFGEmitter::CFGEmitter(QBEBuilder& builder, TypeManager& typeManager,
     , astEmitter_(astEmitter)
     , currentFunction_("")
     , currentCFG_(nullptr)
+    , sammPreamble_(SAMMPreamble::NONE)
+    , sammPreambleLabel_()
 {
+}
+
+void CFGEmitter::setSAMMPreamble(SAMMPreamble type, const std::string& label) {
+    sammPreamble_ = type;
+    sammPreambleLabel_ = label;
 }
 
 // =============================================================================
@@ -133,6 +140,8 @@ void CFGEmitter::emitCFG(const ControlFlowGraph* cfg, const std::string& functio
     }
     
     currentCFG_ = nullptr;
+    sammPreamble_ = SAMMPreamble::NONE;
+    sammPreambleLabel_.clear();
     exitFunction();
 }
 
@@ -159,8 +168,18 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
     builder_.emitComment(blockInfo);
     builder_.emitLabel(label);
     
-    // If this is the entry block (block 0), allocate stack space for all local variables
+    // If this is the entry block (block 0), emit SAMM preamble (if set)
+    // and allocate stack space for all local variables.
+    // The preamble MUST be emitted after the label because QBE requires
+    // all instructions to be inside a labeled block.
     if (blockId == 0) {
+        if (sammPreamble_ == SAMMPreamble::MAIN_INIT) {
+            builder_.emitComment("SAMM: Initialise scope-aware memory management");
+            builder_.emitCall("", "", "samm_init", "");
+        } else if (sammPreamble_ == SAMMPreamble::SCOPE_ENTER) {
+            builder_.emitComment("SAMM: Enter " + sammPreambleLabel_ + " scope");
+            builder_.emitCall("", "", "samm_enter_scope", "");
+        }
         const auto& symbolTable = astEmitter_.getSymbolTable();
         
         // Get function parameters from CFG (these are the actual QBE parameter names)
@@ -276,6 +295,14 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         }
     }
     
+    // Pre-allocate stack slots for ALL FOR / FOR EACH loops in the function.
+    // QBE requires alloc instructions to be in the start block; loops that
+    // are nested inside other loops would otherwise emit allocs in non-start
+    // blocks, triggering a QBE filllive assertion.
+    if (blockId == 0) {
+        preAllocateAllLoopSlots(cfg);
+    }
+
     // Check if this block was replaced by a NEON vectorized loop — if so,
     // emit only the label (for branch targets) but skip all content and
     // emit a jump to the exit block instead.
@@ -300,6 +327,26 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
             std::string condition = astEmitter_.emitForCondition(forStmt);
             // Store condition for use by terminator
             currentLoopCondition_ = condition;
+        }
+    }
+    
+    // Check if this is a FOR...IN loop header - emit condition check
+    if (block->isLoopHeader && block->label.find("ForIn_Header") != std::string::npos) {
+        // Find the ForInStatement in the predecessor ForIn_Init block
+        for (int predId : block->predecessors) {
+            if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* predBlock = cfg->blocks[predId].get();
+                if (predBlock && predBlock->label.find("ForIn_Init") != std::string::npos) {
+                    for (const Statement* stmt : predBlock->statements) {
+                        if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
+                            const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
+                            std::string condition = astEmitter_.emitForEachCondition(forInStmt);
+                            currentLoopCondition_ = condition;
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
     
@@ -356,6 +403,90 @@ void CFGEmitter::emitBlock(const BasicBlock* block, const ControlFlowGraph* cfg)
         }
     }
     
+    // Check if this is a FOR...IN loop increment block - emit increment
+    if (block->label.find("ForIn_Increment") != std::string::npos) {
+        // Find the ForInStatement by following back-edge to header, then to init
+        for (int succId : block->successors) {
+            if (succId >= 0 && succId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* headerBlock = cfg->blocks[succId].get();
+                if (headerBlock && headerBlock->label.find("ForIn_Header") != std::string::npos) {
+                    for (int predId : headerBlock->predecessors) {
+                        if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                            const BasicBlock* initBlock = cfg->blocks[predId].get();
+                            if (initBlock && initBlock->label.find("ForIn_Init") != std::string::npos) {
+                                for (const Statement* stmt : initBlock->statements) {
+                                    if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
+                                        const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
+                                        astEmitter_.emitForEachIncrement(forInStmt);
+                                        goto forin_increment_done;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        forin_increment_done: ;
+    }
+    
+    // Check if this is a FOR...IN loop body block - emit body preamble
+    // (load current array element into loop variable) before statements
+    if (block->label.find("ForIn_Body") != std::string::npos) {
+        // Find the ForInStatement by going body -> header -> init
+        for (int predId : block->predecessors) {
+            if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* headerBlock = cfg->blocks[predId].get();
+                if (headerBlock && headerBlock->label.find("ForIn_Header") != std::string::npos) {
+                    for (int hpredId : headerBlock->predecessors) {
+                        if (hpredId >= 0 && hpredId < static_cast<int>(cfg->blocks.size())) {
+                            const BasicBlock* initBlock = cfg->blocks[hpredId].get();
+                            if (initBlock && initBlock->label.find("ForIn_Init") != std::string::npos) {
+                                for (const Statement* stmt : initBlock->statements) {
+                                    if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
+                                        const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
+                                        astEmitter_.emitForEachBodyPreamble(forInStmt);
+                                        goto forin_preamble_done;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        forin_preamble_done: ;
+    }
+    
+    // Check if this is a FOR...IN loop exit block - emit cleanup
+    // (frees the hashmap keys array allocated during init, if applicable)
+    if (block->label.find("ForIn_Exit") != std::string::npos) {
+        // Trace back to the header (predecessor of exit via false edge),
+        // then to the init block (predecessor of header) to find the ForInStatement.
+        for (int predId : block->predecessors) {
+            if (predId >= 0 && predId < static_cast<int>(cfg->blocks.size())) {
+                const BasicBlock* headerBlock = cfg->blocks[predId].get();
+                if (headerBlock && headerBlock->label.find("ForIn_Header") != std::string::npos) {
+                    for (int hpredId : headerBlock->predecessors) {
+                        if (hpredId >= 0 && hpredId < static_cast<int>(cfg->blocks.size())) {
+                            const BasicBlock* initBlock = cfg->blocks[hpredId].get();
+                            if (initBlock && initBlock->label.find("ForIn_Init") != std::string::npos) {
+                                for (const Statement* stmt : initBlock->statements) {
+                                    if (stmt && stmt->getType() == ASTNodeType::STMT_FOR_IN) {
+                                        const ForInStatement* forInStmt = static_cast<const ForInStatement*>(stmt);
+                                        astEmitter_.emitForEachCleanup(forInStmt);
+                                        goto forin_cleanup_done;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        forin_cleanup_done: ;
+    }
+
     // === NEON Phase 3: try to vectorize FOR loops ===
     // When we are about to emit the statements of a FOR init block (the
     // block whose statements contain the STMT_FOR), analyse the loop body.
@@ -466,6 +597,12 @@ void CFGEmitter::emitReturnStatementValue(const ReturnStatement* returnStmt) {
 
 void CFGEmitter::emitExitBlockTerminator() {
     if (currentFunction_.empty() || currentFunction_ == "main") {
+        // SAMM: Shutdown scope-aware memory management before program exit.
+        // This drains the cleanup queue, stops the background worker, and
+        // ensures all destructors have run before the process terminates.
+        builder_.emitComment("SAMM: Shutdown scope-aware memory management");
+        builder_.emitCall("", "", "samm_shutdown", "");
+
         builder_.emitComment("Implicit return 0");
         builder_.emitReturn("0");
         return;
@@ -475,6 +612,10 @@ void CFGEmitter::emitExitBlockTerminator() {
     const auto& symbolTable = astEmitter_.getSymbolTable();
     auto funcIt = symbolTable.functions.find(currentFunction_);
     if (funcIt == symbolTable.functions.end()) {
+        // Unknown function — still exit scope to avoid leak
+        builder_.emitComment("SAMM: Exit scope (unknown function)");
+        builder_.emitCall("", "", "samm_exit_scope", "");
+
         builder_.emitComment("WARNING: block with no out-edges (missing return?)");
         builder_.emitReturn();
         return;
@@ -485,6 +626,10 @@ void CFGEmitter::emitExitBlockTerminator() {
 
     // SUBs have VOID return type – just return without a value
     if (returnType == BaseType::VOID) {
+        // SAMM: Exit SUB scope before returning
+        builder_.emitComment("SAMM: Exit SUB scope");
+        builder_.emitCall("", "", "samm_exit_scope", "");
+
         builder_.emitComment("SUB exit - no return value");
         builder_.emitReturn();
         return;
@@ -496,6 +641,20 @@ void CFGEmitter::emitExitBlockTerminator() {
     std::string retTemp = builder_.newTemp();
 
     builder_.emitLoad(retTemp, qbeType, mangledName);
+
+    // SAMM: If returning a CLASS instance, RETAIN it to the parent scope
+    // so it survives the current scope's cleanup. This is essential for
+    // factory functions that create and return objects.
+    if (returnType == BaseType::CLASS_INSTANCE) {
+        builder_.emitComment("SAMM: RETAIN returned CLASS instance to parent scope");
+        builder_.emitCall("", "", "samm_retain_parent", "l " + retTemp);
+    }
+
+    // SAMM: Exit FUNCTION scope before returning.
+    // Tracked allocations (except RETAINed ones) are queued for cleanup.
+    builder_.emitComment("SAMM: Exit FUNCTION scope");
+    builder_.emitCall("", "", "samm_exit_scope", "");
+
     builder_.emitReturn(retTemp);
 }
 
@@ -974,6 +1133,30 @@ void CFGEmitter::reset() {
     outEdgeIndex_.clear();
     simdReplacedBlocks_.clear();
     currentCFG_ = nullptr;
+}
+
+void CFGEmitter::preAllocateAllLoopSlots(const FasterBASIC::ControlFlowGraph* cfg) {
+    // Pre-allocate shared scratch buffers (bounds array for DIM,
+    // indices array for array access) so that no alloc instructions
+    // are emitted in non-start blocks.
+    astEmitter_.preAllocateSharedBuffers();
+
+    // Scan every block in the CFG for FOR and FOR EACH statements.
+    // For each one found, call the ASTEmitter pre-allocation method so
+    // that the alloc instructions are emitted in the current (entry) block.
+    for (const auto& blockPtr : cfg->blocks) {
+        if (!blockPtr) continue;
+        for (const FasterBASIC::Statement* stmt : blockPtr->statements) {
+            if (!stmt) continue;
+            if (stmt->getType() == FasterBASIC::ASTNodeType::STMT_FOR_IN) {
+                const auto* forInStmt = static_cast<const FasterBASIC::ForInStatement*>(stmt);
+                astEmitter_.preAllocateForEachSlots(forInStmt);
+            } else if (stmt->getType() == FasterBASIC::ASTNodeType::STMT_FOR) {
+                const auto* forStmt = static_cast<const FasterBASIC::ForStatement*>(stmt);
+                astEmitter_.preAllocateForSlots(forStmt);
+            }
+        }
+    }
 }
 
 // =============================================================================

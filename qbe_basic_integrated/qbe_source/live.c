@@ -100,12 +100,31 @@ Again:
 				}
 			}
 			if (!req(i->to, R)) {
-				assert(rtype(i->to) == RTmp);
-				t = i->to.val;
-				if (bshas(b->in, t))
-					nlv[KBASE(f->tmp[t].cls)]--;
-				bsset(b->gen, t);
-				bsclr(b->in, t);
+				if (rtype(i->to) == RSlot) {
+					/* After register allocation, rega()
+					 * may emit copy instructions whose
+					 * destination is an RSlot (stack slot)
+					 * in edge-splitting blocks.  This
+					 * happens when spill() converts a
+					 * phi destination to a slot and rega()
+					 * later materialises a parallel-move
+					 * copy into that slot.
+					 *
+					 * Stack slots are not tracked in the
+					 * liveness bitsets, so we skip the
+					 * destination processing here.  The
+					 * arguments (source operands) are
+					 * still processed below to keep
+					 * register liveness correct.
+					 */
+				} else {
+					assert(rtype(i->to) == RTmp);
+					t = i->to.val;
+					if (bshas(b->in, t))
+						nlv[KBASE(f->tmp[t].cls)]--;
+					bsset(b->gen, t);
+					bsclr(b->in, t);
+				}
 			}
 			for (k=0; k<2; k++)
 				switch (rtype(i->arg[k])) {

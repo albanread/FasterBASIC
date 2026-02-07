@@ -186,6 +186,11 @@ ControlFlowGraph* CFGBuilder::buildFromProgram(const Program& program) {
                 continue;
             }
             
+            if (auto* forInStmt = dynamic_cast<const ForInStatement*>(stmt.get())) {
+                currentBlock = buildForIn(*forInStmt, currentBlock, nullptr, nullptr, nullptr, nullptr);
+                continue;
+            }
+            
             if (auto* forStmt = dynamic_cast<const ForStatement*>(stmt.get())) {
                 currentBlock = buildFor(*forStmt, currentBlock, nullptr, nullptr, nullptr, nullptr);
                 continue;

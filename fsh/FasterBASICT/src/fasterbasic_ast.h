@@ -152,6 +152,13 @@ enum class ASTNodeType {
     STMT_CALL,
     STMT_DEF,
 
+    // CLASS & Object System
+    STMT_CLASS,             // CLASS ... END CLASS
+    STMT_METHOD,            // METHOD ... END METHOD (inside CLASS)
+    STMT_CONSTRUCTOR,       // CONSTRUCTOR ... END CONSTRUCTOR
+    STMT_DESTRUCTOR,        // DESTRUCTOR ... END DESTRUCTOR
+    STMT_DELETE,            // DELETE obj
+
     // Expressions
     EXPR_BINARY,
     EXPR_UNARY,
@@ -164,6 +171,13 @@ enum class ASTNodeType {
     EXPR_IIF,
     EXPR_MEMBER_ACCESS,
     EXPR_METHOD_CALL,
+
+    // CLASS & Object System Expressions
+    EXPR_NEW,               // NEW ClassName(args)
+    EXPR_ME,                // ME (current object reference)
+    EXPR_SUPER_CALL,        // SUPER.Method() or SUPER() in constructor
+    EXPR_IS_TYPE,           // obj IS ClassName / obj IS NOTHING
+    EXPR_NOTHING,           // NOTHING (null object reference)
 };
 
 // =============================================================================
@@ -1994,6 +2008,7 @@ public:
         std::string asTypeName;        // For AS TypeName declarations (user-defined types)
         TokenType asTypeKeyword;       // For AS built-in type keywords (preserves UBYTE vs BYTE, etc.)
         bool hasAsType;                // true if AS TypeName was specified
+        ExpressionPtr initializer;     // For DIM x AS Foo = NEW Foo() (class instance init)
 
         ArrayDim(const std::string& n, TokenType suffix = TokenType::UNKNOWN)
             : name(n), typeSuffix(suffix), asTypeKeyword(TokenType::UNKNOWN), hasAsType(false) {}
@@ -2828,6 +2843,245 @@ public:
         return oss.str();
     }
 };
+
+// =============================================================================
+// CLASS & Object System AST Nodes
+// =============================================================================
+
+class MethodStatement : public Statement {
+public:
+    std::string methodName;
+    std::vector<std::string> parameters;
+    std::vector<TokenType> parameterTypes;
+    std::vector<std::string> parameterAsTypes;
+    std::vector<bool> parameterIsByRef;
+    TokenType returnTypeSuffix;
+    std::string returnTypeAsName;
+    bool hasReturnType;
+    std::vector<StatementPtr> body;
+
+    MethodStatement(const std::string& name)
+        : methodName(name), returnTypeSuffix(TokenType::UNKNOWN), hasReturnType(false) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_METHOD; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "METHOD " << methodName << "(";
+        for (size_t i = 0; i < parameters.size(); i++) {
+            if (i > 0) oss << ", ";
+            oss << parameters[i];
+        }
+        oss << ")";
+        if (hasReturnType) oss << " AS " << returnTypeAsName;
+        oss << "\n";
+        for (const auto& stmt : body) {
+            oss << stmt->toString(indent + 1);
+        }
+        return oss.str();
+    }
+};
+
+class ConstructorStatement : public Statement {
+public:
+    std::vector<std::string> parameters;
+    std::vector<TokenType> parameterTypes;
+    std::vector<std::string> parameterAsTypes;
+    std::vector<bool> parameterIsByRef;
+    std::vector<StatementPtr> body;
+    // SUPER call info (extracted during parsing)
+    bool hasSuperCall;
+    std::vector<ExpressionPtr> superArgs;
+
+    ConstructorStatement()
+        : hasSuperCall(false) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_CONSTRUCTOR; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "CONSTRUCTOR(";
+        for (size_t i = 0; i < parameters.size(); i++) {
+            if (i > 0) oss << ", ";
+            oss << parameters[i];
+        }
+        oss << ")\n";
+        if (hasSuperCall) {
+            oss << makeIndent(indent + 1) << "SUPER(";
+            for (size_t i = 0; i < superArgs.size(); i++) {
+                if (i > 0) oss << ", ";
+                oss << superArgs[i]->toString(0);
+            }
+            oss << ")\n";
+        }
+        for (const auto& stmt : body) {
+            oss << stmt->toString(indent + 1);
+        }
+        return oss.str();
+    }
+};
+
+class DestructorStatement : public Statement {
+public:
+    std::vector<StatementPtr> body;
+
+    DestructorStatement() = default;
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_DESTRUCTOR; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "DESTRUCTOR()\n";
+        for (const auto& stmt : body) {
+            oss << stmt->toString(indent + 1);
+        }
+        return oss.str();
+    }
+};
+
+class ClassStatement : public Statement {
+public:
+    std::string className;
+    std::string parentClassName;                                // empty if no EXTENDS
+    std::vector<TypeDeclarationStatement::TypeField> fields;
+    std::unique_ptr<ConstructorStatement> constructor;          // nullable
+    std::unique_ptr<DestructorStatement> destructor;             // nullable
+    std::vector<std::unique_ptr<MethodStatement>> methods;
+
+    ClassStatement(const std::string& name)
+        : className(name) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_CLASS; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "CLASS " << className;
+        if (!parentClassName.empty()) oss << " EXTENDS " << parentClassName;
+        oss << "\n";
+        for (const auto& field : fields) {
+            oss << makeIndent(indent + 1) << field.name << " AS " << field.typeName << "\n";
+        }
+        if (constructor) {
+            oss << constructor->toString(indent + 1);
+        }
+        if (destructor) {
+            oss << destructor->toString(indent + 1);
+        }
+        for (const auto& method : methods) {
+            oss << method->toString(indent + 1);
+        }
+        return oss.str();
+    }
+};
+
+class DeleteStatement : public Statement {
+public:
+    std::string variableName;
+
+    DeleteStatement(const std::string& varName)
+        : variableName(varName) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::STMT_DELETE; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "DELETE " << variableName << "\n";
+        return oss.str();
+    }
+};
+
+class NewExpression : public Expression {
+public:
+    std::string className;
+    std::vector<ExpressionPtr> arguments;
+
+    NewExpression(const std::string& name)
+        : className(name) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_NEW; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "NEW " << className << "(";
+        for (size_t i = 0; i < arguments.size(); i++) {
+            if (i > 0) oss << ", ";
+            oss << arguments[i]->toString(0);
+        }
+        oss << ")";
+        return oss.str();
+    }
+};
+
+class MeExpression : public Expression {
+public:
+    MeExpression() = default;
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_ME; }
+
+    std::string toString(int indent = 0) const override {
+        return makeIndent(indent) + "ME";
+    }
+};
+
+class NothingExpression : public Expression {
+public:
+    NothingExpression() = default;
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_NOTHING; }
+
+    std::string toString(int indent = 0) const override {
+        return makeIndent(indent) + "NOTHING";
+    }
+};
+
+class SuperCallExpression : public Expression {
+public:
+    std::string methodName;                 // empty for SUPER() constructor call
+    std::vector<ExpressionPtr> arguments;
+    bool isConstructorCall;                 // true for SUPER(), false for SUPER.Method()
+
+    SuperCallExpression(const std::string& method, bool isCtor)
+        : methodName(method), isConstructorCall(isCtor) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_SUPER_CALL; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "SUPER";
+        if (!isConstructorCall) oss << "." << methodName;
+        oss << "(";
+        for (size_t i = 0; i < arguments.size(); i++) {
+            if (i > 0) oss << ", ";
+            oss << arguments[i]->toString(0);
+        }
+        oss << ")";
+        return oss.str();
+    }
+};
+
+class IsTypeExpression : public Expression {
+public:
+    ExpressionPtr object;
+    std::string className;              // class name for IS ClassName
+    bool isNothingCheck;                // true for IS NOTHING
+
+    IsTypeExpression(ExpressionPtr obj, const std::string& cls, bool nothingCheck)
+        : object(std::move(obj)), className(cls), isNothingCheck(nothingCheck) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_IS_TYPE; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << object->toString(0) << " IS ";
+        if (isNothingCheck) oss << "NOTHING";
+        else oss << className;
+        return oss.str();
+    }
+};
+
+// =============================================================================
+// Program (Complete BASIC program)
+// =============================================================================
 
 // Complete BASIC program
 class Program : public ASTNode {

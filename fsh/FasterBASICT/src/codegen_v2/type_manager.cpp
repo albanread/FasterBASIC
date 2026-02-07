@@ -37,8 +37,15 @@ std::string TypeManager::getQBEType(BasicType basicType) const {
             return "l";  // UDT is a pointer to struct
             
         case BasicType::OBJECT:
-            return "l";  // Object is a pointer to runtime object
-            
+        case BasicType::CLASS_INSTANCE:
+        case BasicType::POINTER:
+        case BasicType::ARRAY_DESC:
+        case BasicType::STRING_DESC:
+            return "l";  // All pointer/reference types are 64-bit
+
+        case BasicType::LOOP_INDEX:
+            return "w";  // Loop indices are integers
+
         case BasicType::UNKNOWN:
         default:
             return "w";  // Default to word for unknown types
@@ -80,10 +87,17 @@ int TypeManager::getTypeSize(BasicType basicType) const {
         case BasicType::UNICODE:
         case BasicType::USER_DEFINED:
         case BasicType::OBJECT:
+        case BasicType::CLASS_INSTANCE:
+        case BasicType::POINTER:
+        case BasicType::ARRAY_DESC:
+        case BasicType::STRING_DESC:
             return 8;  // Pointers and 64-bit types
             
         case BasicType::VOID:
             return 0;
+
+        case BasicType::LOOP_INDEX:
+            return 4;
             
         case BasicType::UNKNOWN:
         default:
@@ -104,6 +118,7 @@ int TypeManager::getTypeAlignment(BasicType basicType) const {
         case BasicType::INTEGER:
         case BasicType::UINTEGER:
         case BasicType::SINGLE:
+        case BasicType::LOOP_INDEX:
             return 4;
 
         case BasicType::LONG:
@@ -113,6 +128,10 @@ int TypeManager::getTypeAlignment(BasicType basicType) const {
         case BasicType::UNICODE:
         case BasicType::USER_DEFINED:
         case BasicType::OBJECT:
+        case BasicType::CLASS_INSTANCE:
+        case BasicType::POINTER:
+        case BasicType::ARRAY_DESC:
+        case BasicType::STRING_DESC:
             return 8;
 
         case BasicType::VOID:
@@ -301,6 +320,9 @@ std::string TypeManager::getTypeName(BasicType basicType) const {
         case BasicType::UNICODE:        return "UNICODE";
         case BasicType::VOID:           return "VOID";
         case BasicType::USER_DEFINED:   return "USER_DEFINED";
+        case BasicType::CLASS_INSTANCE: return "CLASS_INSTANCE";
+        case BasicType::OBJECT:         return "OBJECT";
+        case BasicType::POINTER:        return "POINTER";
         case BasicType::UNKNOWN:        return "UNKNOWN";
         default:                        return "UNKNOWN";
     }

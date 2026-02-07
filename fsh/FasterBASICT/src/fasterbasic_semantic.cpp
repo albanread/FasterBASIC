@@ -359,6 +359,7 @@ void SemanticAnalyzer::pass1_collectDeclarations(Program& program) {
     collectLabels(program);
     // NOTE: collectOptionStatements removed - options are now collected by parser
     collectTypeDeclarations(program);  // Collect TYPE/END TYPE declarations first
+    collectClassDeclarations(program);  // Collect CLASS/END CLASS declarations (after TYPE, before constants)
     collectConstantStatements(program);  // Collect constants BEFORE DIM statements (they may use constants)
     collectGlobalStatements(program);  // Collect GLOBAL variable declarations
     collectDimStatements(program);
@@ -538,6 +539,277 @@ void SemanticAnalyzer::collectTypeDeclarations(Program& program) {
             }
         }
     }
+}
+
+// =============================================================================
+// CLASS Declaration Collection
+// =============================================================================
+
+void SemanticAnalyzer::collectClassDeclarations(Program& program) {
+    // Collect all CLASS declarations in pass 1
+    for (const auto& line : program.lines) {
+        for (const auto& stmt : line->statements) {
+            if (stmt->getType() == ASTNodeType::STMT_CLASS) {
+                processClassStatement(static_cast<const ClassStatement&>(*stmt));
+            }
+        }
+    }
+}
+
+void SemanticAnalyzer::processClassStatement(const ClassStatement& stmt) {
+    std::string upperName = stmt.className;
+    std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+
+    // Check for duplicate class names
+    if (m_symbolTable.lookupClass(upperName)) {
+        error(SemanticErrorType::DUPLICATE_CLASS,
+              "CLASS '" + stmt.className + "' is already defined",
+              stmt.location);
+        return;
+    }
+
+    // Allocate a unique class ID
+    int classId = m_symbolTable.allocateClassId(upperName);
+
+    ClassSymbol cls(stmt.className, classId);
+    cls.declaration = stmt.location;
+
+    // Resolve parent class (if EXTENDS)
+    if (!stmt.parentClassName.empty()) {
+        ClassSymbol* parent = m_symbolTable.lookupClass(stmt.parentClassName);
+        if (!parent) {
+            error(SemanticErrorType::UNDEFINED_CLASS,
+                  "CLASS '" + stmt.parentClassName + "' is not defined (used as parent of '" + stmt.className + "')",
+                  stmt.location);
+            return;
+        }
+
+        // Check for circular inheritance (simple check: parent must not be self)
+        if (parent->classId == classId) {
+            error(SemanticErrorType::CIRCULAR_INHERITANCE,
+                  "Circular inheritance detected: " + stmt.className + " extends itself",
+                  stmt.location);
+            return;
+        }
+
+        cls.parentClass = parent;
+
+        // Inherit fields from parent
+        for (const auto& pf : parent->fields) {
+            ClassSymbol::FieldInfo inherited = pf;
+            inherited.inherited = true;
+            cls.fields.push_back(inherited);
+        }
+
+        // Inherit method slots from parent
+        for (const auto& pm : parent->methods) {
+            cls.methods.push_back(pm);
+        }
+    }
+
+    // Compute field offsets for own fields
+    int currentOffset = ClassSymbol::headerSize;  // Start after vtable_ptr + class_id
+
+    // Account for inherited fields
+    if (cls.parentClass) {
+        currentOffset = cls.parentClass->objectSize;
+    }
+
+    // Add own fields
+    for (const auto& field : stmt.fields) {
+        ClassSymbol::FieldInfo fi;
+        fi.name = field.name;
+        fi.inherited = false;
+
+        // Determine field type descriptor
+        if (field.isBuiltIn) {
+            fi.typeDesc = keywordToDescriptor(field.builtInType);
+        } else {
+            // Check if it's a CLASS type or a TYPE
+            ClassSymbol* fieldClass = m_symbolTable.lookupClass(field.typeName);
+            if (fieldClass) {
+                fi.typeDesc = TypeDescriptor::makeClassInstance(field.typeName);
+            } else {
+                fi.typeDesc = TypeDescriptor(BaseType::USER_DEFINED);
+                fi.typeDesc.udtName = field.typeName;
+            }
+        }
+
+        // Compute alignment and offset
+        int fieldSize = 8;  // Default: pointer-sized (strings, objects)
+        int alignment = 8;
+        if (fi.typeDesc.baseType == BaseType::INTEGER || fi.typeDesc.baseType == BaseType::UINTEGER ||
+            fi.typeDesc.baseType == BaseType::SINGLE) {
+            fieldSize = 4;
+            alignment = 4;
+        } else if (fi.typeDesc.baseType == BaseType::BYTE || fi.typeDesc.baseType == BaseType::UBYTE) {
+            fieldSize = 1;
+            alignment = 1;
+        } else if (fi.typeDesc.baseType == BaseType::SHORT || fi.typeDesc.baseType == BaseType::USHORT) {
+            fieldSize = 2;
+            alignment = 2;
+        }
+
+        // Align offset
+        if (currentOffset % alignment != 0) {
+            currentOffset += alignment - (currentOffset % alignment);
+        }
+
+        fi.offset = currentOffset;
+        currentOffset += fieldSize;
+
+        cls.fields.push_back(fi);
+    }
+
+    // Pad to 8-byte alignment
+    if (currentOffset % 8 != 0) {
+        currentOffset += 8 - (currentOffset % 8);
+    }
+    cls.objectSize = currentOffset;
+
+    // Process methods — assign vtable slots
+    for (const auto& method : stmt.methods) {
+        // Check if this overrides a parent method
+        bool isOverride = false;
+        int existingSlot = -1;
+
+        for (size_t i = 0; i < cls.methods.size(); i++) {
+            std::string existUpper = cls.methods[i].name;
+            std::transform(existUpper.begin(), existUpper.end(), existUpper.begin(), ::toupper);
+            std::string newUpper = method->methodName;
+            std::transform(newUpper.begin(), newUpper.end(), newUpper.begin(), ::toupper);
+
+            if (existUpper == newUpper) {
+                isOverride = true;
+                existingSlot = static_cast<int>(i);
+                break;
+            }
+        }
+
+        ClassSymbol::MethodInfo mi;
+        mi.name = method->methodName;
+        mi.mangledName = stmt.className + "__" + method->methodName;
+        mi.isOverride = isOverride;
+        mi.originClass = stmt.className;
+
+        // Build parameter type list
+        for (size_t p = 0; p < method->parameterTypes.size(); p++) {
+            if (method->parameterTypes[p] != TokenType::UNKNOWN && method->parameterTypes[p] != TokenType::IDENTIFIER) {
+                mi.parameterTypes.push_back(keywordToDescriptor(method->parameterTypes[p]));
+            } else if (method->parameterTypes[p] == TokenType::IDENTIFIER) {
+                // Could be a CLASS type or UDT
+                ClassSymbol* pClass = m_symbolTable.lookupClass(method->parameterAsTypes[p]);
+                if (pClass) {
+                    mi.parameterTypes.push_back(TypeDescriptor::makeClassInstance(method->parameterAsTypes[p]));
+                } else {
+                    TypeDescriptor td(BaseType::USER_DEFINED);
+                    td.udtName = method->parameterAsTypes[p];
+                    mi.parameterTypes.push_back(td);
+                }
+            } else {
+                mi.parameterTypes.push_back(TypeDescriptor(BaseType::UNKNOWN));
+            }
+        }
+
+        // Return type
+        if (method->hasReturnType) {
+            if (method->returnTypeSuffix != TokenType::UNKNOWN && method->returnTypeSuffix != TokenType::IDENTIFIER) {
+                mi.returnType = keywordToDescriptor(method->returnTypeSuffix);
+            } else if (method->returnTypeSuffix == TokenType::IDENTIFIER) {
+                ClassSymbol* rClass = m_symbolTable.lookupClass(method->returnTypeAsName);
+                if (rClass) {
+                    mi.returnType = TypeDescriptor::makeClassInstance(method->returnTypeAsName);
+                } else {
+                    mi.returnType = TypeDescriptor(BaseType::USER_DEFINED);
+                    mi.returnType.udtName = method->returnTypeAsName;
+                }
+            }
+        } else {
+            mi.returnType = TypeDescriptor(BaseType::VOID);
+        }
+
+        if (isOverride) {
+            // Validate override signature: parameter count, types, and return type must match
+            const auto& parentMethod = cls.methods[existingSlot];
+
+            // Check parameter count
+            if (mi.parameterTypes.size() != parentMethod.parameterTypes.size()) {
+                error(SemanticErrorType::CLASS_ERROR,
+                      "METHOD '" + mi.name + "' override in CLASS '" + stmt.className +
+                      "' has " + std::to_string(mi.parameterTypes.size()) +
+                      " parameter(s), but parent '" + parentMethod.originClass +
+                      "' declares " + std::to_string(parentMethod.parameterTypes.size()),
+                      method->location);
+            } else {
+                // Check each parameter type
+                for (size_t p = 0; p < mi.parameterTypes.size(); p++) {
+                    if (mi.parameterTypes[p].baseType != BaseType::UNKNOWN &&
+                        parentMethod.parameterTypes[p].baseType != BaseType::UNKNOWN &&
+                        mi.parameterTypes[p] != parentMethod.parameterTypes[p]) {
+                        error(SemanticErrorType::CLASS_ERROR,
+                              "METHOD '" + mi.name + "' override in CLASS '" + stmt.className +
+                              "': parameter " + std::to_string(p + 1) + " type mismatch (" +
+                              mi.parameterTypes[p].toString() + " vs parent " +
+                              parentMethod.parameterTypes[p].toString() + ")",
+                              method->location);
+                        break;
+                    }
+                }
+            }
+
+            // Check return type
+            if (mi.returnType.baseType != BaseType::UNKNOWN &&
+                parentMethod.returnType.baseType != BaseType::UNKNOWN &&
+                mi.returnType != parentMethod.returnType) {
+                error(SemanticErrorType::CLASS_ERROR,
+                      "METHOD '" + mi.name + "' override in CLASS '" + stmt.className +
+                      "': return type mismatch (" + mi.returnType.toString() +
+                      " vs parent " + parentMethod.returnType.toString() + ")",
+                      method->location);
+            }
+
+            // Override existing slot — replace the method info
+            mi.vtableSlot = cls.methods[existingSlot].vtableSlot;
+            cls.methods[existingSlot] = mi;
+        } else {
+            // New method — append to vtable
+            mi.vtableSlot = cls.getMethodCount();
+            cls.methods.push_back(mi);
+        }
+    }
+
+    // Process constructor
+    if (stmt.constructor) {
+        cls.hasConstructor = true;
+        cls.constructorMangledName = stmt.className + "__CONSTRUCTOR";
+
+        for (size_t p = 0; p < stmt.constructor->parameterTypes.size(); p++) {
+            if (stmt.constructor->parameterTypes[p] != TokenType::UNKNOWN &&
+                stmt.constructor->parameterTypes[p] != TokenType::IDENTIFIER) {
+                cls.constructorParamTypes.push_back(keywordToDescriptor(stmt.constructor->parameterTypes[p]));
+            } else if (stmt.constructor->parameterTypes[p] == TokenType::IDENTIFIER) {
+                ClassSymbol* pClass = m_symbolTable.lookupClass(stmt.constructor->parameterAsTypes[p]);
+                if (pClass) {
+                    cls.constructorParamTypes.push_back(TypeDescriptor::makeClassInstance(stmt.constructor->parameterAsTypes[p]));
+                } else {
+                    TypeDescriptor td(BaseType::USER_DEFINED);
+                    td.udtName = stmt.constructor->parameterAsTypes[p];
+                    cls.constructorParamTypes.push_back(td);
+                }
+            } else {
+                cls.constructorParamTypes.push_back(TypeDescriptor(BaseType::UNKNOWN));
+            }
+        }
+    }
+
+    // Process destructor
+    if (stmt.destructor) {
+        cls.hasDestructor = true;
+        cls.destructorMangledName = stmt.className + "__DESTRUCTOR";
+    }
+
+    // Register the class in the symbol table
+    m_symbolTable.classes[upperName] = cls;
 }
 
 void SemanticAnalyzer::processTypeDeclarationStatement(const TypeDeclarationStatement* stmt) {
@@ -1087,7 +1359,7 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
         // Check if this is a scalar user-defined type declaration
         // DIM P AS Point (no dimensions) should create a variable, not an array
         if (arrayDim.dimensions.empty() && arrayDim.hasAsType && !arrayDim.asTypeName.empty()) {
-            // This is a scalar UDT variable declaration (inside function or global)
+            // This is a scalar UDT or CLASS variable declaration (inside function or global)
             if (m_symbolTable.variables.find(arrayDim.name) != m_symbolTable.variables.end()) {
                 error(SemanticErrorType::ARRAY_REDECLARED,
                       "Variable '" + arrayDim.name + "' already declared",
@@ -1095,7 +1367,18 @@ void SemanticAnalyzer::processDimStatement(const DimStatement& stmt) {
                 continue;
             }
             
-            // Check if the type exists
+            // Check if the type is a CLASS first, then fall back to TYPE
+            const ClassSymbol* cls = m_symbolTable.lookupClass(arrayDim.asTypeName);
+            if (cls) {
+                // CLASS instance variable — pointer semantics, heap-allocated
+                TypeDescriptor typeDesc = TypeDescriptor::makeClassInstance(arrayDim.asTypeName);
+                
+                VariableSymbol* sym = declareVariableD(arrayDim.name, typeDesc, stmt.location, true);
+                // Scope is already set by declareVariableD() using getCurrentScope()
+                continue;
+            }
+            
+            // Check if the type exists as a TYPE declaration
             if (m_symbolTable.types.find(arrayDim.asTypeName) == m_symbolTable.types.end()) {
                 error(SemanticErrorType::UNDEFINED_TYPE,
                       "Type '" + arrayDim.asTypeName + "' not defined",
@@ -1998,7 +2281,9 @@ void SemanticAnalyzer::validateLetStatement(const LetStatement& stmt) {
                 return;
             }
             
-            if (arrSym->elementTypeDesc.baseType != BaseType::USER_DEFINED) {
+            if (arrSym->elementTypeDesc.baseType != BaseType::USER_DEFINED &&
+                arrSym->elementTypeDesc.baseType != BaseType::CLASS_INSTANCE &&
+                !arrSym->elementTypeDesc.isClassType) {
                 error(SemanticErrorType::TYPE_MISMATCH,
                       "Cannot use member access on non-UDT array '" + stmt.variable + "'",
                       stmt.location);
@@ -2006,6 +2291,9 @@ void SemanticAnalyzer::validateLetStatement(const LetStatement& stmt) {
             }
             
             baseTypeName = arrSym->asTypeName;
+            if (baseTypeName.empty() && arrSym->elementTypeDesc.isClassType) {
+                baseTypeName = arrSym->elementTypeDesc.className;
+            }
         } else {
             // Simple variable with member access: Player.X = 42
             auto* varSym = lookupVariable(stmt.variable);
@@ -2016,7 +2304,9 @@ void SemanticAnalyzer::validateLetStatement(const LetStatement& stmt) {
                 return;
             }
             
-            if (varSym->typeDesc.baseType != BaseType::USER_DEFINED) {
+            if (varSym->typeDesc.baseType != BaseType::USER_DEFINED &&
+                varSym->typeDesc.baseType != BaseType::CLASS_INSTANCE &&
+                !varSym->typeDesc.isClassType) {
                 error(SemanticErrorType::TYPE_MISMATCH,
                       "Cannot use member access on non-UDT variable '" + stmt.variable + "'",
                       stmt.location);
@@ -2028,9 +2318,54 @@ void SemanticAnalyzer::validateLetStatement(const LetStatement& stmt) {
             if (baseTypeName.empty()) {
                 baseTypeName = varSym->typeDesc.udtName;
             }
+            // Fall back to className for CLASS instance variables
+            if (baseTypeName.empty() && varSym->typeDesc.isClassType) {
+                baseTypeName = varSym->typeDesc.className;
+            }
         }
         
-        // Look up the UDT type
+        // Look up the UDT type — check CLASS first, then TYPE
+        const ClassSymbol* classSym = m_symbolTable.lookupClass(baseTypeName);
+        if (classSym) {
+            // CLASS member access — validate the field chain
+            const ClassSymbol* currentClass = classSym;
+            for (size_t i = 0; i < stmt.memberChain.size(); i++) {
+                const std::string& memberName = stmt.memberChain[i];
+                const ClassSymbol::FieldInfo* fieldInfo = currentClass->findField(memberName);
+                if (!fieldInfo) {
+                    error(SemanticErrorType::UNDEFINED_FIELD,
+                          "CLASS '" + currentClass->name + "' has no field '" + memberName + "'",
+                          stmt.location);
+                    return;
+                }
+                // If this is not the last member in the chain, resolve the next type
+                if (i + 1 < stmt.memberChain.size()) {
+                    if (fieldInfo->typeDesc.isClassType) {
+                        currentClass = m_symbolTable.lookupClass(fieldInfo->typeDesc.className);
+                        if (!currentClass) {
+                            error(SemanticErrorType::UNDEFINED_CLASS,
+                                  "CLASS '" + fieldInfo->typeDesc.className + "' is not defined",
+                                  stmt.location);
+                            return;
+                        }
+                    } else if (fieldInfo->typeDesc.baseType == BaseType::USER_DEFINED) {
+                        // Switch to TYPE-based member access for remaining chain
+                        break;
+                    } else {
+                        error(SemanticErrorType::TYPE_MISMATCH,
+                              "Field '" + memberName + "' is not a class or type — cannot access members",
+                              stmt.location);
+                        return;
+                    }
+                }
+            }
+            // Validate the assigned expression
+            if (stmt.value) {
+                validateExpression(*stmt.value);
+            }
+            return;
+        }
+
         TypeSymbol* typeSymbol = lookupType(baseTypeName);
         if (!typeSymbol) {
             error(SemanticErrorType::UNDEFINED_TYPE,

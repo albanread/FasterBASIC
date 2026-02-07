@@ -115,6 +115,17 @@ public:
      */
     void emitGosubReturnStack();
 
+    // === CLASS System Emission ===
+    
+    /**
+     * Emit all CLASS-related declarations: class name strings, vtables,
+     * constructor/destructor/method functions.
+     * Must be called after string constants are emitted and before/after
+     * the main function (vtable data before, method functions after).
+     * @param program Program AST root (to find ClassStatement nodes)
+     */
+    void emitClassDeclarations(const FasterBASIC::Program* program);
+
     // === Main Program Generation ===
     
     /**
@@ -177,6 +188,9 @@ private:
     // DATA segment
     FasterBASIC::DataPreprocessorResult dataValues_;
     
+    // Program AST pointer (kept for CLASS emission after main function)
+    const FasterBASIC::Program* program_ = nullptr;
+    
     // === Helper Methods ===
     
     /**
@@ -218,6 +232,65 @@ private:
      * @return List of function symbols
      */
     std::vector<FasterBASIC::FunctionSymbol*> getFunctions();
+    
+    // === CLASS Emission Helpers ===
+    
+    /**
+     * Emit a class name string constant: data $classname_Foo = { b "Foo", b 0 }
+     * @param cls ClassSymbol to emit the name for
+     */
+    void emitClassNameString(const FasterBASIC::ClassSymbol& cls);
+    
+    /**
+     * Emit a vtable data section for a class.
+     * Layout: [class_id, parent_vtable, class_name, destructor, method0, method1, ...]
+     * @param cls ClassSymbol to emit the vtable for
+     */
+    void emitClassVtable(const FasterBASIC::ClassSymbol& cls);
+    
+    /**
+     * Emit a METHOD as a standalone QBE function: $ClassName__MethodName(l %me, ...)
+     * @param classStmt The ClassStatement AST node (contains method bodies)
+     * @param method The MethodStatement AST node
+     * @param cls The ClassSymbol (for field/type info)
+     */
+    void emitClassMethod(const FasterBASIC::ClassStatement& classStmt,
+                         const FasterBASIC::MethodStatement& method,
+                         const FasterBASIC::ClassSymbol& cls);
+    
+    /**
+     * Emit a CONSTRUCTOR as a standalone QBE function: $ClassName__CONSTRUCTOR(l %me, ...)
+     * @param classStmt The ClassStatement AST node
+     * @param ctor The ConstructorStatement AST node
+     * @param cls The ClassSymbol
+     */
+    void emitClassConstructor(const FasterBASIC::ClassStatement& classStmt,
+                              const FasterBASIC::ConstructorStatement& ctor,
+                              const FasterBASIC::ClassSymbol& cls);
+    
+    /**
+     * Emit a DESTRUCTOR as a standalone QBE function: $ClassName__DESTRUCTOR(l %me)
+     * @param classStmt The ClassStatement AST node
+     * @param dtor The DestructorStatement AST node
+     * @param cls The ClassSymbol
+     */
+    void emitClassDestructor(const FasterBASIC::ClassStatement& classStmt,
+                             const FasterBASIC::DestructorStatement& dtor,
+                             const FasterBASIC::ClassSymbol& cls);
+    
+    /**
+     * Helper: get QBE type string for a TypeDescriptor ("w", "l", "s", "d")
+     * @param td TypeDescriptor
+     * @return QBE type suffix
+     */
+    std::string getQBETypeForDescriptor(const FasterBASIC::TypeDescriptor& td);
+    
+    /**
+     * Helper: get QBE parameter type string for a method/constructor parameter
+     * @param td TypeDescriptor of the parameter
+     * @return QBE type suffix
+     */
+    std::string getQBEParamType(const FasterBASIC::TypeDescriptor& td);
     
     // === String Collection (Phase 1) ===
     

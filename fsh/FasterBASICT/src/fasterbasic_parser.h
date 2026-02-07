@@ -275,6 +275,14 @@ private:
     StatementPtr parseSubStatement();
     StatementPtr parseCallStatement();
     
+    // CLASS & Object System parsing
+    StatementPtr parseClassDeclaration();
+    StatementPtr parseDeleteStatement();
+    std::unique_ptr<MethodStatement> parseMethodDeclaration();
+    std::unique_ptr<ConstructorStatement> parseConstructorDeclaration();
+    std::unique_ptr<DestructorStatement> parseDestructorDeclaration();
+    ExpressionPtr parseNewExpression();
+    
     // Graphics and sound statements
     StatementPtr parseClsStatement();
     StatementPtr parseGclsStatement();

@@ -104,6 +104,18 @@ BasicBlock* CFGBuilder::buildStatementRange(
             continue;
         }
         
+        if (auto* forInStmt = dynamic_cast<const ForInStatement*>(stmt.get())) {
+            currentBlock = buildForIn(
+                *forInStmt,
+                currentBlock,
+                currentLoop,
+                currentSelect,
+                currentTry,
+                currentSub
+            );
+            continue;
+        }
+        
         if (auto* forStmt = dynamic_cast<const ForStatement*>(stmt.get())) {
             currentBlock = buildFor(
                 *forStmt,

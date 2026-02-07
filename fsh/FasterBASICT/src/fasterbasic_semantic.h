@@ -24,6 +24,8 @@
 #include <memory>
 #include <sstream>
 
+#include <algorithm>
+
 namespace FasterBASIC {
 
 // =============================================================================
@@ -51,6 +53,7 @@ inline const char* typeToString(VariableType type) {
         case VariableType::USER_DEFINED: return "USER_DEFINED";
         case VariableType::UNICODE: return "UNICODE";
         case VariableType::VOID: return "VOID";
+        case VariableType::ADAPTIVE: return "ADAPTIVE";
         case VariableType::UNKNOWN: return "UNKNOWN";
     }
     return "UNKNOWN";
@@ -90,6 +93,9 @@ enum class BaseType {
     // Runtime object types (registered in RuntimeObjectRegistry)
     OBJECT,         // Runtime object (HASHMAP, FILE, etc.) - use objectTypeName to identify
     
+    // CLASS instance type
+    CLASS_INSTANCE, // User-defined CLASS instance (heap-allocated, pointer semantics)
+    
     // Special types
     VOID,           // No value (for SUB)
     UNKNOWN         // Not yet determined
@@ -118,20 +124,32 @@ struct TypeDescriptor {
     std::vector<int> arrayDims;     // Array dimensions (empty if not array)
     BaseType elementType;           // For arrays/pointers: type of element
     
+    // CLASS instance support
+    bool isClassType = false;       // true = CLASS (heap pointer), false = TYPE (value)
+    std::string className;          // Name of CLASS (populated when isClassType == true)
+    
     // Constructors
     TypeDescriptor()
-        : baseType(BaseType::UNKNOWN), attributes(TYPE_ATTR_NONE), udtTypeId(-1), elementType(BaseType::UNKNOWN) {}
+        : baseType(BaseType::UNKNOWN), attributes(TYPE_ATTR_NONE), udtTypeId(-1), elementType(BaseType::UNKNOWN), isClassType(false) {}
     
     explicit TypeDescriptor(BaseType bt)
-        : baseType(bt), attributes(TYPE_ATTR_NONE), udtTypeId(-1), elementType(BaseType::UNKNOWN) {}
+        : baseType(bt), attributes(TYPE_ATTR_NONE), udtTypeId(-1), elementType(BaseType::UNKNOWN), isClassType(false) {}
     
     TypeDescriptor(BaseType bt, uint32_t attrs)
-        : baseType(bt), attributes(attrs), udtTypeId(-1), elementType(BaseType::UNKNOWN) {}
+        : baseType(bt), attributes(attrs), udtTypeId(-1), elementType(BaseType::UNKNOWN), isClassType(false) {}
     
     // Static factory method for creating object types
     static TypeDescriptor makeObject(const std::string& typeName) {
         TypeDescriptor desc(BaseType::OBJECT);
         desc.objectTypeName = typeName;
+        return desc;
+    }
+    
+    // Factory: create a CLASS instance type descriptor
+    static TypeDescriptor makeClassInstance(const std::string& clsName) {
+        TypeDescriptor desc(BaseType::CLASS_INSTANCE);
+        desc.isClassType = true;
+        desc.className = clsName;
         return desc;
     }
     
@@ -146,6 +164,7 @@ struct TypeDescriptor {
     bool isHidden() const { return (attributes & TYPE_ATTR_HIDDEN) != 0; }
     bool isUserDefined() const { return baseType == BaseType::USER_DEFINED; }
     bool isObject() const { return baseType == BaseType::OBJECT; }
+    bool isClassInstance() const { return baseType == BaseType::CLASS_INSTANCE || isClassType; }
     
     bool isInteger() const {
         return baseType == BaseType::BYTE || baseType == BaseType::UBYTE ||
@@ -295,6 +314,7 @@ struct TypeDescriptor {
             case BaseType::STRING_DESC: oss << "STRING_DESC"; break;
             case BaseType::OBJECT: oss << "OBJECT:" << objectTypeName; break;
             case BaseType::LOOP_INDEX: oss << "LOOP_INDEX"; break;
+            case BaseType::CLASS_INSTANCE: oss << "CLASS:" << className; break;
             case BaseType::VOID: oss << "VOID"; break;
             case BaseType::UNKNOWN: oss << "UNKNOWN"; break;
         }
@@ -793,12 +813,106 @@ struct TypeSymbol {
     }
 };
 
+// =============================================================================
+// ClassSymbol — describes a CLASS declaration (fields, methods, vtable layout)
+// =============================================================================
+
+struct ClassSymbol {
+    std::string name;
+    int classId;                        // unique, assigned at registration time
+    ClassSymbol* parentClass;           // nullptr for root classes
+    SourceLocation declaration;
+    bool isDeclared;
+
+    // Object layout
+    int objectSize;                     // total bytes including header + padding
+    static constexpr int headerSize = 16; // 16 (vtable ptr + class_id)
+
+    // Fields (includes inherited)
+    struct FieldInfo {
+        std::string name;
+        TypeDescriptor typeDesc;
+        int offset;                     // byte offset from object start
+        bool inherited;                 // true if from parent class
+    };
+    std::vector<FieldInfo> fields;
+
+    // Methods (includes inherited)
+    struct MethodInfo {
+        std::string name;
+        std::string mangledName;        // "ClassName__MethodName"
+        int vtableSlot;                 // index in method portion of vtable
+        bool isOverride;                // true if overriding parent method
+        std::string originClass;        // class where method was first defined
+        // Signature info for validation
+        std::vector<TypeDescriptor> parameterTypes;
+        TypeDescriptor returnType;
+    };
+    std::vector<MethodInfo> methods;
+
+    // Constructor & destructor
+    bool hasConstructor;
+    std::string constructorMangledName; // "ClassName__CONSTRUCTOR"
+    std::vector<TypeDescriptor> constructorParamTypes;
+    bool hasDestructor;
+    std::string destructorMangledName;  // "ClassName__DESTRUCTOR"
+
+    ClassSymbol()
+        : classId(0), parentClass(nullptr), isDeclared(false),
+          objectSize(headerSize), hasConstructor(false), hasDestructor(false) {}
+    
+    ClassSymbol(const std::string& n, int id)
+        : name(n), classId(id), parentClass(nullptr), isDeclared(true),
+          objectSize(headerSize), hasConstructor(false), hasDestructor(false),
+          constructorMangledName(n + "__CONSTRUCTOR"),
+          destructorMangledName(n + "__DESTRUCTOR") {}
+
+    // Find a field by name (case-insensitive)
+    const FieldInfo* findField(const std::string& fieldName) const {
+        std::string upperName = fieldName;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        for (const auto& f : fields) {
+            std::string upperField = f.name;
+            std::transform(upperField.begin(), upperField.end(), upperField.begin(), ::toupper);
+            if (upperField == upperName) return &f;
+        }
+        return nullptr;
+    }
+
+    // Find a method by name (case-insensitive)
+    const MethodInfo* findMethod(const std::string& methodName) const {
+        std::string upperName = methodName;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        for (const auto& m : methods) {
+            std::string upperMethod = m.name;
+            std::transform(upperMethod.begin(), upperMethod.end(), upperMethod.begin(), ::toupper);
+            if (upperMethod == upperName) return &m;
+        }
+        return nullptr;
+    }
+
+    // Total number of method slots (for vtable sizing)
+    int getMethodCount() const { return static_cast<int>(methods.size()); }
+
+    // Check if this class is a subclass of another
+    bool isSubclassOf(const ClassSymbol* other) const {
+        if (!other) return false;
+        const ClassSymbol* current = this;
+        while (current) {
+            if (current->classId == other->classId) return true;
+            current = current->parentClass;
+        }
+        return false;
+    }
+};
+
 // Complete symbol table
 struct SymbolTable {
     std::unordered_map<std::string, VariableSymbol> variables;
     std::unordered_map<std::string, ArraySymbol> arrays;
     std::unordered_map<std::string, FunctionSymbol> functions;
     std::unordered_map<std::string, TypeSymbol> types;  // User-defined types (TYPE/END TYPE)
+    std::unordered_map<std::string, ClassSymbol> classes;  // CLASS declarations
     std::unordered_map<int, LineNumberSymbol> lineNumbers;
     std::unordered_map<std::string, LabelSymbol> labels;  // Symbolic labels
     std::unordered_map<std::string, ConstantSymbol> constants;  // Compile-time constants
@@ -817,6 +931,9 @@ struct SymbolTable {
     std::unordered_map<std::string, int> typeNameToId;  // UDT name -> unique type ID
     int nextTypeId = 1;  // Next available UDT type ID
     
+    // Class ID allocation for CLASS system
+    int nextClassId = 1;  // 0 is reserved for NOTHING
+    
     // Allocate a new type ID for a UDT
     int allocateTypeId(const std::string& typeName) {
         auto it = typeNameToId.find(typeName);
@@ -834,6 +951,29 @@ struct SymbolTable {
         return (it != typeNameToId.end()) ? it->second : -1;
     }
 
+    // Allocate a new class ID
+    int allocateClassId(const std::string& className) {
+        int id = nextClassId++;
+        return id;
+    }
+    
+    // Look up a class by name (case-insensitive)
+    ClassSymbol* lookupClass(const std::string& name) {
+        std::string upperName = name;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        auto it = classes.find(upperName);
+        if (it != classes.end()) return &it->second;
+        return nullptr;
+    }
+    
+    const ClassSymbol* lookupClass(const std::string& name) const {
+        std::string upperName = name;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        auto it = classes.find(upperName);
+        if (it != classes.end()) return &it->second;
+        return nullptr;
+    }
+    
     std::string toString() const;
     
     // Helper: Generate a scope-qualified key for symbol table lookup
@@ -978,7 +1118,12 @@ enum class SemanticErrorType {
     CIRCULAR_TYPE_DEPENDENCY,
     INVALID_TYPE_FIELD,
     TYPE_ERROR,
-    ARGUMENT_COUNT_MISMATCH
+    ARGUMENT_COUNT_MISMATCH,
+    // CLASS-related errors
+    UNDEFINED_CLASS,
+    DUPLICATE_CLASS,
+    CIRCULAR_INHERITANCE,
+    CLASS_ERROR
 };
 
 struct SemanticError {
@@ -1103,6 +1248,7 @@ private:
     void collectForEachVariables(Program& program);
     void collectConstantStatements(Program& program);
     void collectTypeDeclarations(Program& program);  // Collect TYPE/END TYPE declarations
+    void collectClassDeclarations(Program& program);  // Collect CLASS/END CLASS declarations
     void collectTimerHandlers(Program& program);  // Collect AFTER/EVERY handlers in pass1
 
     void processDimStatement(const DimStatement& stmt);
@@ -1112,6 +1258,7 @@ private:
     void processDataStatement(const DataStatement& stmt, int lineNumber,
                              const std::string& dataLabel);
     void processConstantStatement(const ConstantStatement& stmt);
+    void processClassStatement(const ClassStatement& stmt);
     void processTypeDeclarationStatement(const TypeDeclarationStatement* stmt);
 
     // Pass 2: Validation

@@ -61,6 +61,173 @@ std::string ASTEmitter::emitExpression(const Expression* expr) {
         case ASTNodeType::EXPR_MEMBER_ACCESS:
             return emitMemberAccessExpression(static_cast<const MemberAccessExpression*>(expr));
             
+        // CLASS & Object System expressions
+        case ASTNodeType::EXPR_NEW: {
+            const auto* newExpr = static_cast<const NewExpression*>(expr);
+            const auto& symbolTable = semantic_.getSymbolTable();
+            const ClassSymbol* cls = symbolTable.lookupClass(newExpr->className);
+            if (!cls) {
+                builder_.emitComment("ERROR: CLASS '" + newExpr->className + "' not defined");
+                return "0";
+            }
+            
+            builder_.emitComment("NEW " + newExpr->className + "()");
+            
+            // 1. Allocate object via class_object_new(size, vtable, class_id)
+            auto sizeTemp = builder_.newTemp();
+            builder_.emitRaw("    " + sizeTemp + " =l copy " + std::to_string(cls->objectSize) + "\n");
+            
+            auto vtableTemp = builder_.newTemp();
+            builder_.emitRaw("    " + vtableTemp + " =l copy $vtable_" + cls->name + "\n");
+            
+            auto classIdTemp = builder_.newTemp();
+            builder_.emitRaw("    " + classIdTemp + " =l copy " + std::to_string(cls->classId) + "\n");
+            
+            auto objTemp = builder_.newTemp();
+            builder_.emitRaw("    " + objTemp + " =l call $class_object_new(l " + sizeTemp + ", l " + vtableTemp + ", l " + classIdTemp + ")\n");
+            
+            // 2. Call constructor (if any)
+            if (cls->hasConstructor) {
+                std::string callArgs = "l " + objTemp;
+                for (size_t i = 0; i < newExpr->arguments.size(); i++) {
+                    std::string argTemp = emitExpression(newExpr->arguments[i].get());
+                    // Determine arg type from constructor param types
+                    std::string argType = "l";
+                    if (i < cls->constructorParamTypes.size()) {
+                        if (cls->constructorParamTypes[i].baseType == FasterBASIC::BaseType::INTEGER ||
+                            cls->constructorParamTypes[i].baseType == FasterBASIC::BaseType::UINTEGER) {
+                            argType = "w";
+                        } else if (cls->constructorParamTypes[i].baseType == FasterBASIC::BaseType::DOUBLE) {
+                            argType = "d";
+                        } else if (cls->constructorParamTypes[i].baseType == FasterBASIC::BaseType::SINGLE) {
+                            argType = "s";
+                        }
+                    }
+                    callArgs += ", " + argType + " " + argTemp;
+                }
+                builder_.emitRaw("    call $" + cls->constructorMangledName + "(" + callArgs + ")\n");
+            }
+            
+            return objTemp;
+        }
+        
+        case ASTNodeType::EXPR_ME: {
+            // ME refers to the %me parameter (first parameter of METHOD/CONSTRUCTOR)
+            builder_.emitComment("ME (current object reference)");
+            return "%me";
+        }
+        
+        case ASTNodeType::EXPR_NOTHING: {
+            // NOTHING is the null object reference (0)
+            builder_.emitComment("NOTHING (null object reference)");
+            return "0";
+        }
+        
+        case ASTNodeType::EXPR_IS_TYPE: {
+            const auto* isExpr = static_cast<const IsTypeExpression*>(expr);
+            std::string objTemp = emitExpression(isExpr->object.get());
+            
+            if (isExpr->isNothingCheck) {
+                // obj IS NOTHING  →  ceql %obj, 0
+                builder_.emitComment("IS NOTHING check");
+                auto resultTemp = builder_.newTemp();
+                builder_.emitRaw("    " + resultTemp + " =w ceql " + objTemp + ", 0\n");
+                return resultTemp;
+            } else {
+                // obj IS ClassName  →  call $class_is_instance(obj, class_id)
+                const auto& symbolTable = semantic_.getSymbolTable();
+                const ClassSymbol* targetCls = symbolTable.lookupClass(isExpr->className);
+                if (!targetCls) {
+                    builder_.emitComment("ERROR: CLASS '" + isExpr->className + "' not defined for IS check");
+                    return "0";
+                }
+                builder_.emitComment("IS " + isExpr->className + " type check");
+                auto resultTemp = builder_.newTemp();
+                builder_.emitRaw("    " + resultTemp + " =w call $class_is_instance(l " + objTemp + ", l " + std::to_string(targetCls->classId) + ")\n");
+                return resultTemp;
+            }
+        }
+        
+        case ASTNodeType::EXPR_SUPER_CALL: {
+            const auto* superExpr = static_cast<const FasterBASIC::SuperCallExpression*>(expr);
+            if (superExpr->isConstructorCall) {
+                // SUPER() constructor call — should be handled in emitClassConstructor,
+                // but if it appears here as an expression, emit it as a void call.
+                if (currentClassContext_ && currentClassContext_->parentClass &&
+                    currentClassContext_->parentClass->hasConstructor) {
+                    builder_.emitComment("SUPER() constructor call");
+                    std::string callArgs = "l %me";
+                    for (size_t i = 0; i < superExpr->arguments.size(); i++) {
+                        std::string argTemp = emitExpression(superExpr->arguments[i].get());
+                        std::string argType = "l";
+                        if (i < currentClassContext_->parentClass->constructorParamTypes.size()) {
+                            auto pbt = currentClassContext_->parentClass->constructorParamTypes[i].baseType;
+                            if (pbt == FasterBASIC::BaseType::INTEGER || pbt == FasterBASIC::BaseType::UINTEGER)
+                                argType = "w";
+                            else if (pbt == FasterBASIC::BaseType::DOUBLE)
+                                argType = "d";
+                            else if (pbt == FasterBASIC::BaseType::SINGLE)
+                                argType = "s";
+                        }
+                        callArgs += ", " + argType + " " + argTemp;
+                    }
+                    builder_.emitRaw("    call $" + currentClassContext_->parentClass->constructorMangledName + "(" + callArgs + ")\n");
+                } else {
+                    builder_.emitComment("SUPER() — no parent constructor to call");
+                }
+                return "0";
+            } else {
+                // SUPER.Method() — direct (non-virtual) call to parent class method
+                if (!currentClassContext_ || !currentClassContext_->parentClass) {
+                    builder_.emitComment("ERROR: SUPER.Method() without parent class");
+                    return "0";
+                }
+                const auto* parentClass = currentClassContext_->parentClass;
+                const auto* methodInfo = parentClass->findMethod(superExpr->methodName);
+                if (!methodInfo) {
+                    builder_.emitComment("ERROR: parent class '" + parentClass->name + "' has no method '" + superExpr->methodName + "'");
+                    return "0";
+                }
+                builder_.emitComment("SUPER." + superExpr->methodName + "() — direct call to parent");
+                
+                // Build argument list: ME as first arg, then user args
+                std::string callArgs = "l %me";
+                for (size_t i = 0; i < superExpr->arguments.size(); i++) {
+                    FasterBASIC::BaseType paramBaseType = FasterBASIC::BaseType::LONG;
+                    std::string argType = "l";
+                    if (i < methodInfo->parameterTypes.size()) {
+                        paramBaseType = methodInfo->parameterTypes[i].baseType;
+                        if (paramBaseType == FasterBASIC::BaseType::INTEGER || paramBaseType == FasterBASIC::BaseType::UINTEGER)
+                            argType = "w";
+                        else if (paramBaseType == FasterBASIC::BaseType::DOUBLE)
+                            argType = "d";
+                        else if (paramBaseType == FasterBASIC::BaseType::SINGLE)
+                            argType = "s";
+                    }
+                    std::string argTemp = emitExpressionAs(superExpr->arguments[i].get(), paramBaseType);
+                    callArgs += ", " + argType + " " + argTemp;
+                }
+                
+                // Direct call (not virtual dispatch) to the parent's method
+                if (methodInfo->returnType.baseType == FasterBASIC::BaseType::VOID) {
+                    builder_.emitRaw("    call $" + methodInfo->mangledName + "(" + callArgs + ")\n");
+                    return "0";
+                } else {
+                    std::string retType = "l";
+                    if (methodInfo->returnType.baseType == FasterBASIC::BaseType::INTEGER ||
+                        methodInfo->returnType.baseType == FasterBASIC::BaseType::UINTEGER)
+                        retType = "w";
+                    else if (methodInfo->returnType.baseType == FasterBASIC::BaseType::DOUBLE)
+                        retType = "d";
+                    else if (methodInfo->returnType.baseType == FasterBASIC::BaseType::SINGLE)
+                        retType = "s";
+                    auto result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =" + retType + " call $" + methodInfo->mangledName + "(" + callArgs + ")\n");
+                    return result;
+                }
+            }
+        }
+        
         default:
             builder_.emitComment("ERROR: unsupported expression type");
             return "0";
@@ -220,6 +387,104 @@ std::string ASTEmitter::emitArrayAccessExpression(const ArrayAccessExpression* e
 }
 
 std::string ASTEmitter::emitMemberAccessExpression(const MemberAccessExpression* expr) {
+    // === CLASS Instance Member Access (fast path) ===
+    // If the base expression is a variable with CLASS_INSTANCE type, or ME,
+    // use pointer + offset access instead of stack-based UDT access.
+    {
+        const FasterBASIC::ClassSymbol* classSym = nullptr;
+        std::string objPtr;
+
+        if (expr->object->getType() == ASTNodeType::EXPR_ME) {
+            // ME.Field — %me is already a pointer to the object
+            objPtr = "%me";
+            // Use the current class context set by emitClassMethod/emitClassConstructor
+            if (currentClassContext_) {
+                classSym = currentClassContext_;
+            } else {
+                // Fallback: look up from the member name across all classes
+                const auto& symbolTable = semantic_.getSymbolTable();
+                for (const auto& pair : symbolTable.classes) {
+                    if (pair.second.findField(expr->memberName)) {
+                        classSym = &pair.second;
+                        break;
+                    }
+                }
+            }
+        } else if (expr->object->getType() == ASTNodeType::EXPR_VARIABLE) {
+            const auto* varExpr = static_cast<const VariableExpression*>(expr->object.get());
+            std::string currentFunc = symbolMapper_.getCurrentFunction();
+            const auto* vs = semantic_.lookupVariableScoped(varExpr->name, currentFunc);
+            if (vs && vs->typeDesc.isClassType) {
+                const auto& symbolTable = semantic_.getSymbolTable();
+                classSym = symbolTable.lookupClass(vs->typeDesc.className);
+                // Load the object pointer from the variable
+                objPtr = loadVariable(varExpr->name);
+            }
+        }
+
+        if (classSym) {
+            const auto* fieldInfo = classSym->findField(expr->memberName);
+            if (fieldInfo) {
+                builder_.emitComment("CLASS field access: " + classSym->name + "." + expr->memberName + " (offset " + std::to_string(fieldInfo->offset) + ")");
+
+                // Null-check before field access (skip for ME which is always valid)
+                if (objPtr != "%me") {
+                    int labelId = builder_.getNextLabelId();
+                    std::string nullLabel = "null_field_err_" + std::to_string(labelId);
+                    std::string accessLabel = "field_ok_" + std::to_string(labelId);
+
+                    auto isNull = builder_.newTemp();
+                    builder_.emitRaw("    " + isNull + " =w ceql " + objPtr + ", 0\n");
+                    builder_.emitRaw("    jnz " + isNull + ", @" + nullLabel + ", @" + accessLabel + "\n");
+
+                    builder_.emitLabel(nullLabel);
+                    std::string fieldNameLabel = builder_.registerString(expr->memberName);
+                    std::string locationStr = "line " + std::to_string(expr->location.line);
+                    std::string locationLabel = builder_.registerString(locationStr);
+                    builder_.emitRaw("    call $class_null_field_error(l $" + locationLabel + ", l $" + fieldNameLabel + ")\n");
+                    builder_.emitRaw("    hlt\n");
+
+                    builder_.emitLabel(accessLabel);
+                }
+
+                // Compute field address: obj + offset
+                auto fieldAddr = builder_.newTemp();
+                builder_.emitRaw("    " + fieldAddr + " =l add " + objPtr + ", " + std::to_string(fieldInfo->offset) + "\n");
+
+                // Load field value based on type
+                auto result = builder_.newTemp();
+                if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::INTEGER ||
+                    fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UINTEGER) {
+                    result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =w loadw " + fieldAddr + "\n");
+                } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SINGLE) {
+                    result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =s loads " + fieldAddr + "\n");
+                } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::DOUBLE) {
+                    result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =d loadd " + fieldAddr + "\n");
+                } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::BYTE ||
+                           fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UBYTE) {
+                    result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =w loadsb " + fieldAddr + "\n");
+                } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SHORT ||
+                           fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::USHORT) {
+                    result = builder_.newTemp();
+                    builder_.emitRaw("    " + result + " =w loadsh " + fieldAddr + "\n");
+                } else {
+                    // Default: pointer-sized load (STRING, CLASS_INSTANCE, LONG, etc.)
+                    builder_.emitRaw("    " + result + " =l loadl " + fieldAddr + "\n");
+                }
+
+                return result;
+            } else {
+                builder_.emitComment("ERROR: CLASS '" + classSym->name + "' has no field '" + expr->memberName + "'");
+                return "0";
+            }
+        }
+    }
+
+    // === Standard UDT member access below ===
     // Handle UDT member access (e.g., person.Name, point.X, Points(0).X, O.Item.Value)
     
     std::string basePtr;
@@ -1084,26 +1349,170 @@ std::string ASTEmitter::emitFunctionCall(const FunctionCallExpression* expr) {
     return "0";
 }
 
+void ASTEmitter::emitMethodBody(const std::vector<FasterBASIC::StatementPtr>& body) {
+    for (const auto& stmt : body) {
+        if (stmt) {
+            emitStatement(stmt.get());
+        }
+    }
+}
+
+void ASTEmitter::registerMethodParam(const std::string& name, const std::string& addr, FasterBASIC::BaseType type) {
+    methodParamAddresses_[name] = addr;
+    methodParamTypes_[name] = type;
+}
+
+void ASTEmitter::clearMethodParams() {
+    methodParamAddresses_.clear();
+    methodParamTypes_.clear();
+}
+
 std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
     if (!expr || !expr->object) {
         builder_.emitComment("ERROR: invalid method call expression");
         return "0";
     }
     
-    // Get the object expression - should be a variable
+    // Get the object expression - can be a variable or ME
     const VariableExpression* varExpr = dynamic_cast<const VariableExpression*>(expr->object.get());
-    if (!varExpr) {
+    const bool isMeCall = (expr->object->getType() == ASTNodeType::EXPR_ME);
+    
+    std::string objectName;
+    if (varExpr) {
+        objectName = varExpr->name;
+    } else if (isMeCall) {
+        objectName = "ME";
+    }
+    
+    if (!varExpr && !isMeCall) {
         builder_.emitComment("ERROR: method call on non-variable expression not yet supported");
         return "0";
     }
     
-    std::string objectName = varExpr->name;
     std::string methodName = expr->methodName;
-    
-    // Look up variable in symbol table (use lookupVariableLegacy for scoped names)
     const auto& symbolTable = semantic_.getSymbolTable();
-    const VariableSymbol* varSym = symbolTable.lookupVariableLegacy(objectName);
     
+    // === CLASS Instance Method Call (virtual dispatch) ===
+    {
+        const FasterBASIC::ClassSymbol* classSym = nullptr;
+        std::string objPtr;
+        
+        if (isMeCall) {
+            objPtr = "%me";
+            if (currentClassContext_) {
+                classSym = currentClassContext_;
+            } else {
+                for (const auto& pair : symbolTable.classes) {
+                    if (pair.second.findMethod(methodName)) {
+                        classSym = &pair.second;
+                        break;
+                    }
+                }
+            }
+        } else if (varExpr) {
+            std::string currentFunc = symbolMapper_.getCurrentFunction();
+            const auto* varSym = semantic_.lookupVariableScoped(varExpr->name, currentFunc);
+            if (!varSym) {
+                varSym = symbolTable.lookupVariableLegacy(varExpr->name);
+            }
+            if (varSym && varSym->typeDesc.isClassType) {
+                classSym = symbolTable.lookupClass(varSym->typeDesc.className);
+                objPtr = loadVariable(varExpr->name);
+            }
+        }
+        
+        if (classSym) {
+            const auto* methodInfo = classSym->findMethod(methodName);
+            if (!methodInfo) {
+                builder_.emitComment("ERROR: CLASS '" + classSym->name + "' has no method '" + methodName + "'");
+                return "0";
+            }
+            
+            builder_.emitComment("CLASS virtual dispatch: " + objectName + "." + methodName + "()");
+            
+            // Null check
+            int labelId = builder_.getNextLabelId();
+            std::string nullLabel = "null_err_" + std::to_string(labelId);
+            std::string dispatchLabel = "dispatch_" + std::to_string(labelId);
+            
+            auto isNull = builder_.newTemp();
+            builder_.emitRaw("    " + isNull + " =w ceql " + objPtr + ", 0\n");
+            builder_.emitRaw("    jnz " + isNull + ", @" + nullLabel + ", @" + dispatchLabel + "\n");
+            
+            // Null error block
+            builder_.emitLabel(nullLabel);
+            std::string methodNameLabel = builder_.registerString(methodName);
+            std::string locationStr = "line " + std::to_string(expr->location.line);
+            std::string locationLabel = builder_.registerString(locationStr);
+            builder_.emitRaw("    call $class_null_method_error(l $" + locationLabel + ", l $" + methodNameLabel + ")\n");
+            builder_.emitRaw("    hlt\n");
+            
+            // Dispatch block
+            builder_.emitLabel(dispatchLabel);
+            
+            // Load vtable pointer from object[0]
+            auto vtablePtr = builder_.newTemp();
+            builder_.emitRaw("    " + vtablePtr + " =l loadl " + objPtr + "\n");
+            
+            // Compute method slot address: vtable + VTABLE_METHODS_OFFSET + slot * 8
+            int slotOffset = 32 + methodInfo->vtableSlot * 8;
+            auto slotAddr = builder_.newTemp();
+            builder_.emitRaw("    " + slotAddr + " =l add " + vtablePtr + ", " + std::to_string(slotOffset) + "\n");
+            
+            // Load method function pointer
+            auto methodPtr = builder_.newTemp();
+            builder_.emitRaw("    " + methodPtr + " =l loadl " + slotAddr + "\n");
+            
+            // Build argument list: ME (obj) as first arg, then user args
+            std::string callArgs = "l " + objPtr;
+            for (size_t i = 0; i < expr->arguments.size(); i++) {
+                std::string argType = "l";
+                FasterBASIC::BaseType paramBaseType = FasterBASIC::BaseType::LONG;
+                if (i < methodInfo->parameterTypes.size()) {
+                    paramBaseType = methodInfo->parameterTypes[i].baseType;
+                    if (paramBaseType == FasterBASIC::BaseType::INTEGER ||
+                        paramBaseType == FasterBASIC::BaseType::UINTEGER) {
+                        argType = "w";
+                    } else if (paramBaseType == FasterBASIC::BaseType::DOUBLE) {
+                        argType = "d";
+                    } else if (paramBaseType == FasterBASIC::BaseType::SINGLE) {
+                        argType = "s";
+                    }
+                }
+                // Use emitExpressionAs to properly convert argument types
+                // (e.g. integer literal 5 → double 5.0 when param is DOUBLE)
+                std::string argTemp = emitExpressionAs(expr->arguments[i].get(), paramBaseType);
+                callArgs += ", " + argType + " " + argTemp;
+            }
+            
+            // Indirect call through method pointer
+            if (methodInfo->returnType.baseType == FasterBASIC::BaseType::VOID) {
+                builder_.emitRaw("    call " + methodPtr + "(" + callArgs + ")\n");
+                return "0";
+            } else {
+                std::string retType = "l";
+                if (methodInfo->returnType.baseType == FasterBASIC::BaseType::INTEGER ||
+                    methodInfo->returnType.baseType == FasterBASIC::BaseType::UINTEGER) {
+                    retType = "w";
+                } else if (methodInfo->returnType.baseType == FasterBASIC::BaseType::DOUBLE) {
+                    retType = "d";
+                } else if (methodInfo->returnType.baseType == FasterBASIC::BaseType::SINGLE) {
+                    retType = "s";
+                }
+                auto result = builder_.newTemp();
+                builder_.emitRaw("    " + result + " =" + retType + " call " + methodPtr + "(" + callArgs + ")\n");
+                return result;
+            }
+        }
+    }
+    
+    // === Runtime Object Method Call (HASHMAP, etc.) ===
+    if (!varExpr) {
+        builder_.emitComment("ERROR: method call requires a variable for runtime objects");
+        return "0";
+    }
+    
+    const VariableSymbol* varSym = symbolTable.lookupVariableLegacy(objectName);
     if (!varSym) {
         builder_.emitComment("ERROR: undefined variable " + objectName);
         return "0";
@@ -1111,34 +1520,28 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
     
     const FasterBASIC::TypeDescriptor& objectTypeDesc = varSym->typeDesc;
     
-    // Check if this is an object type with methods
     auto& registry = FasterBASIC::getRuntimeObjectRegistry();
     if (!registry.isObjectType(objectTypeDesc)) {
         builder_.emitComment("ERROR: method call on non-object type");
         return "0";
     }
     
-    // Get object descriptor
     const FasterBASIC::ObjectTypeDescriptor* objDesc = registry.getObjectType(objectTypeDesc.objectTypeName);
     if (!objDesc) {
         builder_.emitComment("ERROR: object type not found in registry");
         return "0";
     }
     
-    // Look up method in object descriptor
     const FasterBASIC::MethodSignature* method = objDesc->findMethod(methodName);
     if (!method) {
         builder_.emitComment("ERROR: object has no method '" + methodName + "'");
         return "0";
     }
     
-    // Emit comment
     builder_.emitComment(objDesc->typeName + " method: " + objectName + "." + methodName + "(...)");
     
-    // Load the object pointer
     std::string objectPtr = loadVariable(objectName);
     
-    // Validate argument count
     size_t requiredArgs = method->requiredParamCount();
     size_t totalArgs = method->totalParamCount();
     size_t providedArgs = expr->arguments.size();
@@ -1156,15 +1559,12 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
                            std::to_string(providedArgs));
     }
     
-    // Build argument list for runtime call
     std::string argsStr = "l " + objectPtr;
     
-    // Emit arguments according to method signature
     for (size_t i = 0; i < providedArgs && i < method->parameters.size(); ++i) {
         const auto& param = method->parameters[i];
         std::string argValue = emitExpressionAs(expr->arguments[i].get(), param.type);
         
-        // If parameter is a STRING, extract C string pointer for C runtime functions
         if (param.type == BaseType::STRING) {
             std::string cStringPtr = builder_.newTemp();
             builder_.emitCall(cStringPtr, "l", "string_to_utf8", "l " + argValue);
@@ -1175,18 +1575,14 @@ std::string ASTEmitter::emitMethodCall(const MethodCallExpression* expr) {
         }
     }
     
-    // Determine return type
     if (method->returnType == BaseType::UNKNOWN) {
-        // Void method - no return value
         builder_.emitCall("", "", method->runtimeFunctionName, argsStr);
         return "0";
     } else {
-        // Method returns a value
         std::string qbeReturnType = typeManager_.getQBEType(method->returnType);
         std::string result = builder_.newTemp();
         builder_.emitCall(result, qbeReturnType, method->runtimeFunctionName, argsStr);
         
-        // Special case: if method returns long but BASIC expects int, convert
         if (method->returnType == BaseType::LONG && qbeReturnType == "l") {
             std::string result32 = builder_.newTemp();
             builder_.emitInstruction(result32 + " =w copy " + result);
@@ -1424,12 +1820,24 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             break;
             
         case ASTNodeType::STMT_FOR:
-            emitForInit(static_cast<const ForStatement*>(stmt));
+            if (currentClassContext_) {
+                emitForDirect(static_cast<const ForStatement*>(stmt));
+            } else {
+                emitForInit(static_cast<const ForStatement*>(stmt));
+            }
+            break;
+            
+        case ASTNodeType::STMT_FOR_IN:
+            emitForEachInit(static_cast<const ForInStatement*>(stmt));
             break;
             
         case ASTNodeType::STMT_WHILE:
-            // WHILE condition is handled by CFG edges
-            builder_.emitComment("WHILE loop header");
+            if (currentClassContext_) {
+                emitWhileDirect(static_cast<const WhileStatement*>(stmt));
+            } else {
+                // WHILE condition is handled by CFG edges
+                builder_.emitComment("WHILE loop header");
+            }
             break;
             
         case ASTNodeType::STMT_DO:
@@ -1443,8 +1851,12 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             break;
             
         case ASTNodeType::STMT_IF:
-            // IF condition is handled by CFG edges
-            builder_.emitComment("IF statement");
+            if (currentClassContext_) {
+                emitIfDirect(static_cast<const IfStatement*>(stmt));
+            } else {
+                // IF condition is handled by CFG edges
+                builder_.emitComment("IF statement");
+            }
             break;
             
         case ASTNodeType::STMT_GOSUB:
@@ -1487,6 +1899,21 @@ void ASTEmitter::emitStatement(const Statement* stmt) {
             emitReturnStatement(static_cast<const ReturnStatement*>(stmt));
             break;
             
+        // CLASS & Object System statements
+        case ASTNodeType::STMT_CLASS:
+            // CLASS declarations are not executable — they are processed at compile time
+            // (vtable data and method functions are emitted separately)
+            builder_.emitComment("CLASS declaration (processed at compile time)");
+            break;
+            
+        case ASTNodeType::STMT_DELETE: {
+            const auto* delStmt = static_cast<const DeleteStatement*>(stmt);
+            builder_.emitComment("DELETE " + delStmt->variableName);
+            std::string varAddr = getVariableAddress(delStmt->variableName);
+            builder_.emitRaw("    call $class_object_delete(l " + varAddr + ")\n");
+            break;
+        }
+            
         default:
             builder_.emitComment("TODO: statement type " + std::to_string(static_cast<int>(stmt->getType())) + " not yet implemented");
             break;
@@ -1498,6 +1925,168 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
     clearArrayElementCache();
     // Check if this is UDT member assignment: udt.field = value or array(i).field = value
     if (!stmt->memberChain.empty()) {
+        // === CLASS Instance Member Assignment (fast path) ===
+        // Check if the base variable is a CLASS instance — use pointer + offset store
+        if (stmt->indices.empty()) {
+            // Special case: ME.Field = value  (inside METHOD/CONSTRUCTOR)
+            if (stmt->variable == "ME" && currentClassContext_) {
+                const auto& symbolTable = semantic_.getSymbolTable();
+                const FasterBASIC::ClassSymbol* classSym = currentClassContext_;
+                {
+                    std::string objPtr = "%me";
+                    const FasterBASIC::ClassSymbol* currentClass = classSym;
+
+                    // Traverse all but the last member (for nested access like ME.inner.field)
+                    for (size_t i = 0; i + 1 < stmt->memberChain.size(); i++) {
+                        const auto* fi = currentClass->findField(stmt->memberChain[i]);
+                        if (!fi) {
+                            builder_.emitComment("ERROR: CLASS '" + currentClass->name + "' has no field '" + stmt->memberChain[i] + "'");
+                            return;
+                        }
+                        auto addr = builder_.newTemp();
+                        builder_.emitRaw("    " + addr + " =l add " + objPtr + ", " + std::to_string(fi->offset) + "\n");
+                        objPtr = builder_.newTemp();
+                        builder_.emitRaw("    " + objPtr + " =l loadl " + addr + "\n");
+                        if (fi->typeDesc.isClassType) {
+                            currentClass = symbolTable.lookupClass(fi->typeDesc.className);
+                            if (!currentClass) {
+                                builder_.emitComment("ERROR: CLASS '" + fi->typeDesc.className + "' not defined");
+                                return;
+                            }
+                        }
+                    }
+
+                    const std::string& finalMember = stmt->memberChain.back();
+                    const auto* fieldInfo = currentClass->findField(finalMember);
+                    if (!fieldInfo) {
+                        builder_.emitComment("ERROR: CLASS '" + currentClass->name + "' has no field '" + finalMember + "'");
+                        return;
+                    }
+
+                    std::string chainStr = "ME";
+                    for (const auto& m : stmt->memberChain) chainStr += "." + m;
+                    builder_.emitComment("CLASS member assignment: " + chainStr + " (offset " + std::to_string(fieldInfo->offset) + ")");
+
+                    std::string val = emitExpression(stmt->value.get());
+
+                    auto fieldAddr = builder_.newTemp();
+                    builder_.emitRaw("    " + fieldAddr + " =l add " + objPtr + ", " + std::to_string(fieldInfo->offset) + "\n");
+
+                    if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::INTEGER ||
+                        fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UINTEGER) {
+                        builder_.emitRaw("    storew " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SINGLE) {
+                        builder_.emitRaw("    stores " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::DOUBLE) {
+                        builder_.emitRaw("    stored " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::BYTE ||
+                               fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UBYTE) {
+                        builder_.emitRaw("    storeb " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SHORT ||
+                               fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::USHORT) {
+                        builder_.emitRaw("    storeh " + val + ", " + fieldAddr + "\n");
+                    } else {
+                        builder_.emitRaw("    storel " + val + ", " + fieldAddr + "\n");
+                    }
+                    return;
+                }
+            }
+
+            std::string currentFunc = symbolMapper_.getCurrentFunction();
+            const auto* varSymbol = semantic_.lookupVariableScoped(stmt->variable, currentFunc);
+            if (varSymbol && varSymbol->typeDesc.isClassType) {
+                const auto& symbolTable = semantic_.getSymbolTable();
+                const FasterBASIC::ClassSymbol* classSym = symbolTable.lookupClass(varSymbol->typeDesc.className);
+                if (classSym) {
+                    // Walk the member chain through class fields
+                    std::string objPtr = loadVariable(stmt->variable);
+
+                    // Null-check before field store
+                    {
+                        int labelId = builder_.getNextLabelId();
+                        std::string nullLabel = "null_store_err_" + std::to_string(labelId);
+                        std::string okLabel = "store_ok_" + std::to_string(labelId);
+
+                        auto isNull = builder_.newTemp();
+                        builder_.emitRaw("    " + isNull + " =w ceql " + objPtr + ", 0\n");
+                        builder_.emitRaw("    jnz " + isNull + ", @" + nullLabel + ", @" + okLabel + "\n");
+
+                        builder_.emitLabel(nullLabel);
+                        std::string fieldNameLabel = builder_.registerString(stmt->memberChain.front());
+                        std::string locationStr = "line " + std::to_string(stmt->location.line);
+                        std::string locationLabel = builder_.registerString(locationStr);
+                        builder_.emitRaw("    call $class_null_field_error(l $" + locationLabel + ", l $" + fieldNameLabel + ")\n");
+                        builder_.emitRaw("    hlt\n");
+
+                        builder_.emitLabel(okLabel);
+                    }
+
+                    const FasterBASIC::ClassSymbol* currentClass = classSym;
+
+                    // Traverse all but the last member (for nested access like obj.inner.field)
+                    for (size_t i = 0; i + 1 < stmt->memberChain.size(); i++) {
+                        const auto* fi = currentClass->findField(stmt->memberChain[i]);
+                        if (!fi) {
+                            builder_.emitComment("ERROR: CLASS '" + currentClass->name + "' has no field '" + stmt->memberChain[i] + "'");
+                            return;
+                        }
+                        // Load the nested object pointer
+                        auto addr = builder_.newTemp();
+                        builder_.emitRaw("    " + addr + " =l add " + objPtr + ", " + std::to_string(fi->offset) + "\n");
+                        objPtr = builder_.newTemp();
+                        builder_.emitRaw("    " + objPtr + " =l loadl " + addr + "\n");
+                        if (fi->typeDesc.isClassType) {
+                            currentClass = symbolTable.lookupClass(fi->typeDesc.className);
+                            if (!currentClass) {
+                                builder_.emitComment("ERROR: CLASS '" + fi->typeDesc.className + "' not defined");
+                                return;
+                            }
+                        }
+                    }
+
+                    // Now assign to the final field
+                    const std::string& finalMember = stmt->memberChain.back();
+                    const auto* fieldInfo = currentClass->findField(finalMember);
+                    if (!fieldInfo) {
+                        builder_.emitComment("ERROR: CLASS '" + currentClass->name + "' has no field '" + finalMember + "'");
+                        return;
+                    }
+
+                    std::string chainStr = stmt->variable;
+                    for (const auto& m : stmt->memberChain) chainStr += "." + m;
+                    builder_.emitComment("CLASS member assignment: " + chainStr + " (offset " + std::to_string(fieldInfo->offset) + ")");
+
+                    // Emit the value expression
+                    std::string val = emitExpression(stmt->value.get());
+
+                    // Compute field address
+                    auto fieldAddr = builder_.newTemp();
+                    builder_.emitRaw("    " + fieldAddr + " =l add " + objPtr + ", " + std::to_string(fieldInfo->offset) + "\n");
+
+                    // Store based on field type
+                    if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::INTEGER ||
+                        fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UINTEGER) {
+                        builder_.emitRaw("    storew " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SINGLE) {
+                        builder_.emitRaw("    stores " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::DOUBLE) {
+                        builder_.emitRaw("    stored " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::BYTE ||
+                               fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::UBYTE) {
+                        builder_.emitRaw("    storeb " + val + ", " + fieldAddr + "\n");
+                    } else if (fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::SHORT ||
+                               fieldInfo->typeDesc.baseType == FasterBASIC::BaseType::USHORT) {
+                        builder_.emitRaw("    storeh " + val + ", " + fieldAddr + "\n");
+                    } else {
+                        // Default: pointer-sized store (STRING, CLASS_INSTANCE, LONG, etc.)
+                        builder_.emitRaw("    storel " + val + ", " + fieldAddr + "\n");
+                    }
+                    return;
+                }
+            }
+        }
+
+        // === Standard UDT member assignment below ===
         // Handle UDT member assignment (including nested: O.Item.Value = 99)
         if (!stmt->indices.empty()) {
             // Array element member assignment: Points(0).X = 10
@@ -2031,15 +2620,48 @@ void ASTEmitter::emitInputStatement(const InputStatement* stmt) {
 }
 
 void ASTEmitter::emitEndStatement(const EndStatement* stmt) {
-    // END statement - terminate execution
+    // END statement - terminate execution.
+    // SAMM: Must shut down scope-aware memory management before exiting
+    // so that the background cleanup worker is stopped, all pending
+    // destructors are called, and diagnostic metrics are printed.
+    builder_.emitComment("SAMM: Shutdown before END");
+    builder_.emitCall("", "", "samm_shutdown", "");
+
     builder_.emitComment("END statement - program exit");
     builder_.emitReturn("0");
 }
 
 void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
-    // RETURN statement - return from FUNCTION or SUB
+    // RETURN statement - return from FUNCTION, SUB, or METHOD
     if (stmt->returnValue) {
-        // FUNCTION return - evaluate expression and store in return variable
+        // === METHOD return (direct ret) ===
+        // If we're inside a METHOD body (methodReturnType_ != VOID), emit a
+        // direct QBE `ret <value>` instead of the FUNCTION-style
+        // store-to-return-var-and-jump pattern, because methods are standalone
+        // QBE functions that use ret directly.
+        if (methodReturnType_ != FasterBASIC::BaseType::VOID) {
+            std::string value = emitExpressionAs(stmt->returnValue.get(), methodReturnType_);
+
+            // SAMM: If returning a CLASS instance from a METHOD, RETAIN it
+            // to the parent scope so it survives the current method scope's
+            // cleanup. This is essential for factory methods and methods that
+            // create and return new objects.
+            if (methodReturnType_ == FasterBASIC::BaseType::CLASS_INSTANCE) {
+                builder_.emitComment("SAMM: RETAIN returned CLASS instance to parent scope");
+                builder_.emitCall("", "", "samm_retain_parent", "l " + value);
+            }
+
+            // SAMM: Exit METHOD scope before returning. All tracked
+            // allocations (except RETAINed ones) are queued for cleanup.
+            builder_.emitComment("SAMM: Exit METHOD scope");
+            builder_.emitCall("", "", "samm_exit_scope", "");
+
+            builder_.emitComment("METHOD RETURN");
+            builder_.emitReturn(value);
+            return;
+        }
+        
+        // === FUNCTION return (store + jump to exit block) ===
         std::string value = emitExpression(stmt->returnValue.get());
         
         // Get current function name
@@ -2067,10 +2689,24 @@ void ASTEmitter::emitReturnStatement(const ReturnStatement* stmt) {
         // Jump to exit block (block 1 by convention)
         builder_.emitJump("block_1");
     } else {
-        // SUB return (or RETURN from GOSUB) - no value
-        builder_.emitComment("RETURN statement (SUB/GOSUB)");
-        // For SUB, just jump to exit
-        builder_.emitJump("block_1");
+        // No return value — could be SUB, GOSUB RETURN, or void METHOD RETURN.
+        //
+        // Methods are emitted via emitMethodBody() (linear statement walk),
+        // NOT via CFG, so there is no block_1 exit block to jump to.
+        // Detect the method context and emit a direct `ret` with SAMM
+        // scope exit instead.
+        if (currentClassContext_ != nullptr) {
+            // We're inside a METHOD/CONSTRUCTOR body — emit direct return
+            builder_.emitComment("SAMM: Exit METHOD scope (early void RETURN)");
+            builder_.emitCall("", "", "samm_exit_scope", "");
+
+            builder_.emitComment("METHOD RETURN (void)");
+            builder_.emitReturn();
+        } else {
+            // SUB or GOSUB RETURN — jump to exit block (handled by CFG)
+            builder_.emitComment("RETURN statement (SUB/GOSUB)");
+            builder_.emitJump("block_1");
+        }
     }
 }
 
@@ -2163,7 +2799,31 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
         if (arrayDecl.dimensions.empty()) {
             builder_.emitComment("DIM scalar variable: " + arrayName);
             
-            // Check if this is an object type variable
+            // Check if this is a CLASS instance variable
+            if (arrayDecl.hasAsType) {
+                const auto& symbolTable = semantic_.getSymbolTable();
+                const FasterBASIC::ClassSymbol* cls = symbolTable.lookupClass(arrayDecl.asTypeName);
+                if (cls) {
+                    // CLASS instance variable — pointer semantics
+                    builder_.emitComment("DIM " + arrayName + " AS " + cls->name + " (CLASS instance)");
+                    
+                    // Get variable address
+                    std::string varAddr = getVariableAddress(arrayName);
+                    
+                    // If there's an initializer (e.g., = NEW ClassName(...)), emit it
+                    if (arrayDecl.initializer) {
+                        std::string initVal = emitExpression(arrayDecl.initializer.get());
+                        builder_.emitRaw("    storel " + initVal + ", " + varAddr + "\n");
+                    } else {
+                        // Default to NOTHING (0)
+                        builder_.emitRaw("    storel 0, " + varAddr + "\n");
+                    }
+                    
+                    continue;
+                }
+            }
+            
+            // Check if this is an object type variable (HASHMAP, etc.)
             if (arrayDecl.hasAsType) {
                 auto& registry = FasterBASIC::getRuntimeObjectRegistry();
                 
@@ -2206,6 +2866,71 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
                     
                     continue;
                 }
+            }
+            
+            // === DIM inside METHOD/CONSTRUCTOR/DESTRUCTOR body ===
+            // Method bodies don't go through CFGEmitter, so local variables
+            // are NOT pre-allocated. We must allocate a stack slot here and
+            // register it so loadVariable/storeVariable can find it.
+            if (currentClassContext_) {
+                // Determine the type from the DIM declaration
+                FasterBASIC::BaseType localType = FasterBASIC::BaseType::LONG;
+                if (arrayDecl.hasAsType) {
+                    std::string upper = arrayDecl.asTypeName;
+                    for (auto& c : upper) c = toupper(c);
+                    if (upper == "STRING") {
+                        localType = FasterBASIC::BaseType::STRING;
+                    } else if (upper == "INTEGER" || upper == "INT") {
+                        localType = FasterBASIC::BaseType::INTEGER;
+                    } else if (upper == "LONG") {
+                        localType = FasterBASIC::BaseType::LONG;
+                    } else if (upper == "DOUBLE") {
+                        localType = FasterBASIC::BaseType::DOUBLE;
+                    } else if (upper == "SINGLE") {
+                        localType = FasterBASIC::BaseType::SINGLE;
+                    }
+                } else {
+                    // Infer from suffix: name$->STRING, name%->INTEGER, name#->DOUBLE, name!->SINGLE
+                    char last = arrayName.empty() ? '\0' : arrayName.back();
+                    if (last == '$') localType = FasterBASIC::BaseType::STRING;
+                    else if (last == '%') localType = FasterBASIC::BaseType::INTEGER;
+                    else if (last == '#') localType = FasterBASIC::BaseType::DOUBLE;
+                    else if (last == '!') localType = FasterBASIC::BaseType::SINGLE;
+                }
+                
+                int slotSize = (localType == FasterBASIC::BaseType::INTEGER ||
+                                localType == FasterBASIC::BaseType::SINGLE) ? 4 : 8;
+                std::string varSlot = "%var_" + arrayName;
+                builder_.emitComment("METHOD-local DIM: " + arrayName);
+                builder_.emitRaw("    " + varSlot + " =l alloc8 " + std::to_string(slotSize) + "\n");
+                
+                // Zero-initialize
+                if (slotSize == 4) {
+                    builder_.emitRaw("    storew 0, " + varSlot + "\n");
+                } else {
+                    builder_.emitRaw("    storel 0, " + varSlot + "\n");
+                }
+                
+                // Register so load/store/getVariableAddress can resolve it
+                registerMethodParam(arrayName, varSlot, localType);
+                
+                // Handle initializer if present
+                if (arrayDecl.initializer) {
+                    std::string initVal = emitExpression(arrayDecl.initializer.get());
+                    if (localType == FasterBASIC::BaseType::STRING) {
+                        builder_.emitRaw("    storel " + initVal + ", " + varSlot + "\n");
+                    } else if (localType == FasterBASIC::BaseType::INTEGER) {
+                        builder_.emitRaw("    storew " + initVal + ", " + varSlot + "\n");
+                    } else if (localType == FasterBASIC::BaseType::SINGLE) {
+                        builder_.emitRaw("    stores " + initVal + ", " + varSlot + "\n");
+                    } else if (localType == FasterBASIC::BaseType::DOUBLE) {
+                        builder_.emitRaw("    stored " + initVal + ", " + varSlot + "\n");
+                    } else {
+                        builder_.emitRaw("    storel " + initVal + ", " + varSlot + "\n");
+                    }
+                }
+                
+                continue;
             }
             
             // NOTE: Local scalar variables are already allocated at function entry
@@ -2270,10 +2995,17 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
             continue;
         }
         
-        // Allocate bounds array on stack: [lower1, upper1, lower2, upper2, ...]
-        std::string boundsArrayPtr = builder_.newTemp();
-        int boundsSize = numDims * 2 * 4;  // 2 bounds per dimension, 4 bytes each (int32_t)
-        builder_.emitAlloc(boundsArrayPtr, boundsSize);
+        // Use the shared bounds buffer (pre-allocated in entry block) so
+        // that no alloc instructions are emitted in non-start blocks.
+        std::string boundsArrayPtr;
+        if (!sharedBoundsBuffer_.empty()) {
+            boundsArrayPtr = sharedBoundsBuffer_;
+        } else {
+            // Fallback: inline alloc (only safe if DIM is in entry block)
+            boundsArrayPtr = builder_.newTemp();
+            int boundsSize = numDims * 2 * 4;
+            builder_.emitAlloc(boundsArrayPtr, boundsSize);
+        }
         
         // Fill in bounds array
         for (int i = 0; i < numDims; i++) {
@@ -2645,6 +3377,11 @@ std::string ASTEmitter::normalizeVariableName(const std::string& varName) const 
         return forNormalized;
     }
     
+    // Check if this is a FOR EACH iteration variable (not in symbol table by design)
+    if (forEachVarTypes_.count(varName) > 0) {
+        return varName;  // Return raw name — loadVariable/storeVariable handle the rest
+    }
+    
     // Not a FOR loop variable - check if name already has a suffix
     // If it does, the parser already mangled it, so return as-is
     if (varName.find("_INT") != std::string::npos ||
@@ -2686,6 +3423,35 @@ std::string ASTEmitter::normalizeVariableName(const std::string& varName) const 
 std::string ASTEmitter::getVariableAddress(const std::string& varName) {
     // Normalize variable name using semantic analyzer's type inference
     std::string lookupName = normalizeVariableName(varName);
+    
+    // --- METHOD/CONSTRUCTOR parameter fallback ---
+    // Parameters registered via registerMethodParam() are not in the semantic
+    // symbol table.  Check our local parameter map first.
+    {
+        auto mpIt = methodParamAddresses_.find(varName);
+        if (mpIt != methodParamAddresses_.end()) {
+            return mpIt->second;
+        }
+        // Also try the normalized name
+        if (varName != lookupName) {
+            mpIt = methodParamAddresses_.find(lookupName);
+            if (mpIt != methodParamAddresses_.end()) {
+                return mpIt->second;
+            }
+        }
+    }
+    
+    // --- FOR EACH variable fallback ---
+    // FOR EACH iteration variables are not in the symbol table.  Their stack
+    // slot addresses are registered in globalVarAddresses_ during init/preamble.
+    if (forEachVarTypes_.count(lookupName) > 0) {
+        auto git = globalVarAddresses_.find(lookupName);
+        if (git != globalVarAddresses_.end()) {
+            return git->second;
+        }
+        builder_.emitComment("ERROR: FOR EACH variable address not yet allocated: " + lookupName);
+        return builder_.newTemp();
+    }
     
     // Look up variable with scoped lookup
     std::string currentFunc = symbolMapper_.getCurrentFunction();
@@ -2739,6 +3505,57 @@ std::string ASTEmitter::getVariableAddress(const std::string& varName) {
 std::string ASTEmitter::loadVariable(const std::string& varName) {
     // Normalize variable name using semantic analyzer's type inference
     std::string lookupName = normalizeVariableName(varName);
+    
+    // --- METHOD/CONSTRUCTOR parameter fallback ---
+    // Parameters registered via registerMethodParam() are not in the semantic
+    // symbol table.  Check our local parameter map first.
+    {
+        auto mpIt = methodParamAddresses_.find(varName);
+        std::string mpKey = varName;
+        if (mpIt == methodParamAddresses_.end() && varName != lookupName) {
+            mpIt = methodParamAddresses_.find(lookupName);
+            mpKey = lookupName;
+        }
+        if (mpIt != methodParamAddresses_.end()) {
+            std::string addr = mpIt->second;
+            BaseType mpType = BaseType::LONG;  // default: pointer
+            auto typeIt = methodParamTypes_.find(mpKey);
+            if (typeIt != methodParamTypes_.end()) {
+                mpType = typeIt->second;
+            }
+            std::string qbeT = typeManager_.getQBEType(mpType);
+            std::string loadOp;
+            if (qbeT == "w")      loadOp = "loadw";
+            else if (qbeT == "l") loadOp = "loadl";
+            else if (qbeT == "s") loadOp = "loads";
+            else if (qbeT == "d") loadOp = "loadd";
+            else                  loadOp = "loadl";
+            std::string result = builder_.newTemp();
+            builder_.emitRaw("    " + result + " =" + qbeT + " " + loadOp + " " + addr + "\n");
+            return result;
+        }
+    }
+    
+    // --- FOR EACH variable fallback ---
+    // FOR EACH iteration variables are not in the symbol table.  Their slot
+    // addresses and types are tracked by the emitter itself.
+    {
+        auto feIt = forEachVarTypes_.find(lookupName);
+        if (feIt != forEachVarTypes_.end()) {
+            std::string addr = getVariableAddress(lookupName);
+            BaseType feType = feIt->second;
+            std::string qbeT = typeManager_.getQBEType(feType);
+            std::string loadOp;
+            if (qbeT == "w")      loadOp = "loadw";
+            else if (qbeT == "l") loadOp = "loadl";
+            else if (qbeT == "s") loadOp = "loads";
+            else if (qbeT == "d") loadOp = "loadd";
+            else                  loadOp = "loadl";
+            std::string result = builder_.newTemp();
+            builder_.emitRaw("    " + result + " =" + qbeT + " " + loadOp + " " + addr);
+            return result;
+        }
+    }
     
     // Look up variable with scoped lookup
     std::string currentFunc = symbolMapper_.getCurrentFunction();
@@ -2794,6 +3611,18 @@ std::string ASTEmitter::loadVariable(const std::string& varName) {
 void ASTEmitter::storeVariable(const std::string& varName, const std::string& value) {
     // Normalize variable name using semantic analyzer's type inference
     std::string lookupName = normalizeVariableName(varName);
+    
+    // --- FOR EACH variable fallback ---
+    {
+        auto feIt = forEachVarTypes_.find(lookupName);
+        if (feIt != forEachVarTypes_.end()) {
+            std::string addr = getVariableAddress(lookupName);
+            BaseType feType = feIt->second;
+            std::string qbeT = typeManager_.getQBEType(feType);
+            builder_.emitStore(qbeT, value, addr);
+            return;
+        }
+    }
     
     BaseType varType = getVariableType(lookupName);
     std::string qbeType = typeManager_.getQBEType(varType);
@@ -2891,10 +3720,17 @@ std::string ASTEmitter::emitArrayAccess(const std::string& arrayName,
     std::string arrayPtr = builder_.newTemp();
     builder_.emitLoad(arrayPtr, "l", descName);
     
-    // Allocate space for indices array on stack (int32_t per index)
-    std::string indicesArrayPtr = builder_.newTemp();
-    int indicesSize = numIndices * 4;  // 4 bytes per int32_t
-    builder_.emitAlloc(indicesArrayPtr, indicesSize);
+    // Use the shared indices buffer (pre-allocated in entry block) so
+    // that no alloc instructions are emitted in non-start blocks.
+    std::string indicesArrayPtr;
+    if (!sharedIndicesBuffer_.empty()) {
+        indicesArrayPtr = sharedIndicesBuffer_;
+    } else {
+        // Fallback: inline alloc (only safe if this block is the entry block)
+        indicesArrayPtr = builder_.newTemp();
+        int indicesSize = numIndices * 4;
+        builder_.emitAlloc(indicesArrayPtr, indicesSize);
+    }
     
     // Store each index into the indices array
     for (int i = 0; i < numIndices; i++) {
@@ -3208,18 +4044,60 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
         case ASTNodeType::EXPR_METHOD_CALL: {
             const auto* methodExpr = static_cast<const MethodCallExpression*>(expr);
             
-            // Get object variable name from the method call's object
-            // For now, we only support direct variable references (e.g., dict.SIZE())
+            // === CLASS instance method return type resolution ===
+            // Check ME.Method() calls first
+            if (methodExpr->object->getType() == ASTNodeType::EXPR_ME) {
+                const FasterBASIC::ClassSymbol* cls = currentClassContext_;
+                if (!cls) {
+                    // Fallback: search all classes for the method
+                    for (const auto& pair : semantic_.getSymbolTable().classes) {
+                        if (pair.second.findMethod(methodExpr->methodName)) {
+                            cls = &pair.second;
+                            break;
+                        }
+                    }
+                }
+                if (cls) {
+                    const auto* mi = cls->findMethod(methodExpr->methodName);
+                    if (mi) {
+                        return mi->returnType.baseType;
+                    }
+                }
+            }
+            
+            // Check variable.Method() calls
             if (methodExpr->object->getType() == ASTNodeType::EXPR_VARIABLE) {
                 const auto* varExpr = static_cast<const VariableExpression*>(methodExpr->object.get());
                 std::string objectName = varExpr->name;
                 
                 // Look up the variable to get its type descriptor
-                auto varIt = semantic_.getSymbolTable().variables.find(objectName);
-                if (varIt != semantic_.getSymbolTable().variables.end()) {
-                    const FasterBASIC::TypeDescriptor& objectTypeDesc = varIt->second.typeDesc;
+                std::string currentFunc = symbolMapper_.getCurrentFunction();
+                const auto* varSym = semantic_.lookupVariableScoped(objectName, currentFunc);
+                if (!varSym) {
+                    varSym = semantic_.getSymbolTable().lookupVariableLegacy(objectName);
+                }
+                if (!varSym) {
+                    auto varIt = semantic_.getSymbolTable().variables.find(objectName);
+                    if (varIt != semantic_.getSymbolTable().variables.end()) {
+                        varSym = &varIt->second;
+                    }
+                }
+                
+                if (varSym) {
+                    // CLASS instance method
+                    if (varSym->typeDesc.isClassType) {
+                        const FasterBASIC::ClassSymbol* cls = semantic_.getSymbolTable().lookupClass(varSym->typeDesc.className);
+                        if (cls) {
+                            const auto* mi = cls->findMethod(methodExpr->methodName);
+                            if (mi) {
+                                return mi->returnType.baseType;
+                            }
+                        }
+                    }
                     
-                    // Look up method in registry
+                    const FasterBASIC::TypeDescriptor& objectTypeDesc = varSym->typeDesc;
+                    
+                    // Runtime object method (HASHMAP, etc.)
                     auto& registry = FasterBASIC::getRuntimeObjectRegistry();
                     if (registry.isObjectType(objectTypeDesc)) {
                         const FasterBASIC::ObjectTypeDescriptor* objDesc = registry.getObjectType(objectTypeDesc.objectTypeName);
@@ -3239,6 +4117,46 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
         case ASTNodeType::EXPR_MEMBER_ACCESS: {
             const auto* memberExpr = static_cast<const MemberAccessExpression*>(expr);
             
+            // === CLASS Instance Member Type Resolution ===
+            // Check if the base is ME or a CLASS variable — resolve field type from ClassSymbol
+            {
+                const FasterBASIC::ClassSymbol* classSym = nullptr;
+                
+                if (memberExpr->object->getType() == ASTNodeType::EXPR_ME) {
+                    // ME.Field — use current class context or search all classes
+                    if (currentClassContext_) {
+                        classSym = currentClassContext_;
+                    } else {
+                        const auto& symbolTable = semantic_.getSymbolTable();
+                        for (const auto& pair : symbolTable.classes) {
+                            if (pair.second.findField(memberExpr->memberName)) {
+                                classSym = &pair.second;
+                                break;
+                            }
+                        }
+                    }
+                } else if (memberExpr->object->getType() == ASTNodeType::EXPR_VARIABLE) {
+                    const auto* varExpr = static_cast<const VariableExpression*>(memberExpr->object.get());
+                    std::string currentFunc = symbolMapper_.getCurrentFunction();
+                    const auto* varSymbol = semantic_.lookupVariableScoped(varExpr->name, currentFunc);
+                    if (!varSymbol) {
+                        varSymbol = semantic_.getSymbolTable().lookupVariableLegacy(varExpr->name);
+                    }
+                    if (varSymbol && varSymbol->typeDesc.isClassType) {
+                        classSym = semantic_.getSymbolTable().lookupClass(varSymbol->typeDesc.className);
+                    }
+                }
+                
+                if (classSym) {
+                    const auto* fieldInfo = classSym->findField(memberExpr->memberName);
+                    if (fieldInfo) {
+                        return fieldInfo->typeDesc.baseType;
+                    }
+                    // Could be a method call disguised as member access — fall through
+                }
+            }
+            
+            // === Standard UDT Member Type Resolution ===
             // Determine the UDT type name of the base object
             std::string udtTypeName;
             
@@ -3342,6 +4260,22 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
             return BaseType::UNKNOWN;
         }
         
+        // CLASS & Object System expression types
+        case ASTNodeType::EXPR_NEW:
+            return BaseType::CLASS_INSTANCE;
+        
+        case ASTNodeType::EXPR_ME:
+            return BaseType::CLASS_INSTANCE;
+        
+        case ASTNodeType::EXPR_NOTHING:
+            return BaseType::CLASS_INSTANCE;
+        
+        case ASTNodeType::EXPR_IS_TYPE:
+            return BaseType::INTEGER;  // IS returns a boolean (0 or 1)
+        
+        case ASTNodeType::EXPR_SUPER_CALL:
+            return BaseType::UNKNOWN;  // SUPER() is a statement, not a value
+        
         default:
             return BaseType::UNKNOWN;
     }
@@ -3350,6 +4284,32 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
 BaseType ASTEmitter::getVariableType(const std::string& varName) {
     // Normalize the variable name first to match symbol table entries
     std::string normalizedName = normalizeVariableName(varName);
+    
+    // --- Method parameter fallback ---
+    // Inside CLASS methods/constructors, parameters are registered in
+    // methodParamTypes_ and are NOT in the global symbol table.
+    {
+        auto mpIt = methodParamTypes_.find(normalizedName);
+        if (mpIt != methodParamTypes_.end()) {
+            return mpIt->second;
+        }
+        // Also try the raw (un-normalized) name — registerMethodParam stores
+        // the name exactly as given by the parser.
+        auto mpIt2 = methodParamTypes_.find(varName);
+        if (mpIt2 != methodParamTypes_.end()) {
+            return mpIt2->second;
+        }
+    }
+    
+    // --- FOR EACH variable fallback ---
+    // FOR EACH iteration variables are intentionally kept out of the symbol
+    // table; their types are tracked in forEachVarTypes_.
+    {
+        auto feIt = forEachVarTypes_.find(normalizedName);
+        if (feIt != forEachVarTypes_.end()) {
+            return feIt->second;
+        }
+    }
     
     // Check if this is a parameter first - get type from function symbol
     if (symbolMapper_.inFunctionScope() && symbolMapper_.isParameter(normalizedName)) {
@@ -3407,7 +4367,7 @@ std::string ASTEmitter::getQBEComparisonOp(TokenType op) {
     }
 }
 
-// === FOR Loop Helpers ===
+// === FOR Loop Helpers (including FOR EACH / FOR...IN) ===
 
 void ASTEmitter::emitForInit(const ForStatement* stmt) {
     // Invalidate array element cache - FOR init modifies loop variable
@@ -3418,31 +4378,49 @@ void ASTEmitter::emitForInit(const ForStatement* stmt) {
     // 1. Evaluate and store start value to loop variable
     std::string startValue = emitExpressionAs(stmt->start.get(), BaseType::INTEGER);
     storeVariable(stmt->variable, startValue);
-    
-    // 2. Allocate and initialize limit variable (constant during loop)
+
+    // Check if slots were pre-allocated in the entry block
     std::string limitVar = "__for_limit_" + stmt->variable;
-    std::string limitAddr = builder_.newTemp();
-    builder_.emitRaw("    " + limitAddr + " =l alloc4 4");
-    std::string limitValue = emitExpressionAs(stmt->end.get(), BaseType::INTEGER);
-    builder_.emitRaw("    storew " + limitValue + ", " + limitAddr);
-    
-    // Store the address for later use (we'll use a map)
-    forLoopTempAddresses_[limitVar] = limitAddr;
-    
-    // 3. Allocate and initialize step variable (constant during loop, default to 1)
-    std::string stepVar = "__for_step_" + stmt->variable;
-    std::string stepAddr = builder_.newTemp();
-    builder_.emitRaw("    " + stepAddr + " =l alloc4 4");
-    std::string stepValue;
-    if (stmt->step) {
-        stepValue = emitExpressionAs(stmt->step.get(), BaseType::INTEGER);
+    std::string stepVar  = "__for_step_" + stmt->variable;
+    bool slotsPreAllocated = forLoopTempAddresses_.find(limitVar) != forLoopTempAddresses_.end();
+
+    if (slotsPreAllocated) {
+        // Use pre-allocated slots — only emit stores
+        std::string limitAddr = forLoopTempAddresses_[limitVar];
+        std::string limitValue = emitExpressionAs(stmt->end.get(), BaseType::INTEGER);
+        builder_.emitRaw("    storew " + limitValue + ", " + limitAddr);
+
+        std::string stepAddr = forLoopTempAddresses_[stepVar];
+        std::string stepValue;
+        if (stmt->step) {
+            stepValue = emitExpressionAs(stmt->step.get(), BaseType::INTEGER);
+        } else {
+            stepValue = builder_.newTemp();
+            builder_.emitRaw("    " + stepValue + " =w copy 1");
+        }
+        builder_.emitRaw("    storew " + stepValue + ", " + stepAddr);
     } else {
-        // Default step is 1
-        stepValue = builder_.newTemp();
-        builder_.emitRaw("    " + stepValue + " =w copy 1");
+        // Fallback: inline allocs (only safe if init block not in a loop)
+        // 2. Allocate and initialize limit variable (constant during loop)
+        std::string limitAddr = builder_.newTemp();
+        builder_.emitRaw("    " + limitAddr + " =l alloc4 4");
+        std::string limitValue = emitExpressionAs(stmt->end.get(), BaseType::INTEGER);
+        builder_.emitRaw("    storew " + limitValue + ", " + limitAddr);
+        forLoopTempAddresses_[limitVar] = limitAddr;
+
+        // 3. Allocate and initialize step variable (constant during loop, default to 1)
+        std::string stepAddr = builder_.newTemp();
+        builder_.emitRaw("    " + stepAddr + " =l alloc4 4");
+        std::string stepValue;
+        if (stmt->step) {
+            stepValue = emitExpressionAs(stmt->step.get(), BaseType::INTEGER);
+        } else {
+            stepValue = builder_.newTemp();
+            builder_.emitRaw("    " + stepValue + " =w copy 1");
+        }
+        builder_.emitRaw("    storew " + stepValue + ", " + stepAddr);
+        forLoopTempAddresses_[stepVar] = stepAddr;
     }
-    builder_.emitRaw("    storew " + stepValue + ", " + stepAddr);
-    forLoopTempAddresses_[stepVar] = stepAddr;
 }
 
 std::string ASTEmitter::emitForCondition(const ForStatement* stmt) {
@@ -3519,6 +4497,613 @@ void ASTEmitter::emitForIncrement(const ForStatement* stmt) {
     
     // Store back to variable
     storeVariable(stmt->variable, newValue);
+}
+
+// =============================================================================
+// FOR EACH / FOR...IN Loop Helpers
+// =============================================================================
+// FOR EACH elem IN arr  (or  FOR elem, idx IN arr)
+//
+// Lowered to an index-counted loop:
+//   __foreach_idx_<var> = LBOUND(arr, 1)
+//   __foreach_ub_<var>  = UBOUND(arr, 1)
+//   loop while __foreach_idx_<var> <= __foreach_ub_<var>:
+//       elem = arr(__foreach_idx_<var>)
+//       [idx  = __foreach_idx_<var>]   (if index variable present)
+//       <body>
+//       __foreach_idx_<var> += 1
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Pre-allocate shared scratch buffers in the entry block.
+// QBE requires ALL alloc instructions to be in the function's start block.
+// DIM statements and array accesses use temporary alloc'd buffers for
+// bounds/indices arrays; these must be hoisted to block 0.
+// ---------------------------------------------------------------------------
+
+void ASTEmitter::preAllocateSharedBuffers() {
+    if (!sharedBoundsBuffer_.empty())
+        return; // already allocated
+
+    builder_.emitComment("Pre-alloc shared scratch buffers (bounds & indices)");
+
+    // Bounds buffer: 8 dims × 2 (lower+upper) × 4 bytes = 64 bytes
+    sharedBoundsBuffer_ = builder_.newTemp();
+    builder_.emitRaw("    " + sharedBoundsBuffer_ + " =l alloc8 64");
+
+    // Indices buffer: 8 dims × 4 bytes = 32 bytes
+    sharedIndicesBuffer_ = builder_.newTemp();
+    builder_.emitRaw("    " + sharedIndicesBuffer_ + " =l alloc8 32");
+}
+
+// ---------------------------------------------------------------------------
+// Pre-allocate stack slots for FOR loop temporaries.
+// QBE requires ALL alloc instructions to be in the function's start block.
+// These methods emit only the alloc instructions (no stores/init); the
+// corresponding emitForInit / emitForEachInit methods then use the
+// pre-allocated addresses from forLoopTempAddresses_ and emit only stores.
+// ---------------------------------------------------------------------------
+
+void ASTEmitter::preAllocateForSlots(const ForStatement* stmt) {
+    std::string limitVar = "__for_limit_" + stmt->variable;
+    if (forLoopTempAddresses_.find(limitVar) != forLoopTempAddresses_.end())
+        return; // already allocated
+
+    std::string limitAddr = builder_.newTemp();
+    builder_.emitRaw("    " + limitAddr + " =l alloc4 4");
+    builder_.emitStore("w", "0", limitAddr);
+    forLoopTempAddresses_[limitVar] = limitAddr;
+
+    std::string stepVar = "__for_step_" + stmt->variable;
+    std::string stepAddr = builder_.newTemp();
+    builder_.emitRaw("    " + stepAddr + " =l alloc4 4");
+    builder_.emitStore("w", "0", stepAddr);
+    forLoopTempAddresses_[stepVar] = stepAddr;
+}
+
+void ASTEmitter::preAllocateForEachSlots(const ForInStatement* stmt) {
+    std::string idxVarKey = "__foreach_idx_" + stmt->variable;
+    if (forLoopTempAddresses_.find(idxVarKey) != forLoopTempAddresses_.end())
+        return; // already allocated
+
+    // --- Resolve the collection name from the expression ---
+    std::string collectionName;
+    if (stmt->array && stmt->array->getType() == ASTNodeType::EXPR_VARIABLE) {
+        const auto* varExpr = static_cast<const VariableExpression*>(stmt->array.get());
+        collectionName = varExpr->name;
+    } else {
+        return; // can't pre-allocate without knowing the collection
+    }
+
+    const auto& symbolTable = semantic_.getSymbolTable();
+
+    // --- Detect HASHMAP vs ARRAY ---
+    bool isHashmap = false;
+    {
+        std::string currentFunc = symbolMapper_.getCurrentFunction();
+        const auto* varSym = semantic_.lookupVariableScoped(collectionName, currentFunc);
+        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT &&
+            varSym->typeDesc.objectTypeName == "HASHMAP") {
+            isHashmap = true;
+        }
+    }
+
+    builder_.emitComment("Pre-alloc FOR EACH slots for: " + stmt->variable +
+                         (isHashmap ? " (hashmap)" : " (array)"));
+
+    if (isHashmap) {
+        // idx (0-based index, w)
+        std::string idxAddr = builder_.newTemp();
+        builder_.emitRaw("    " + idxAddr + " =l alloc4 4");
+        builder_.emitStore("w", "0", idxAddr);
+        forLoopTempAddresses_[idxVarKey] = idxAddr;
+
+        // upper bound / count (w)
+        std::string ubVar = "__foreach_ub_" + stmt->variable;
+        std::string ubAddr = builder_.newTemp();
+        builder_.emitRaw("    " + ubAddr + " =l alloc4 4");
+        builder_.emitStore("w", "0", ubAddr);
+        forLoopTempAddresses_[ubVar] = ubAddr;
+
+        // keys array pointer (l)
+        std::string keysVar = "__foreach_arr_" + stmt->variable;
+        std::string keysAddr = builder_.newTemp();
+        builder_.emitRaw("    " + keysAddr + " =l alloc8 8");
+        builder_.emitStore("l", "0", keysAddr);
+        forLoopTempAddresses_[keysVar] = keysAddr;
+
+        // map pointer (l)
+        std::string mapVar = "__foreach_map_" + stmt->variable;
+        std::string mapAddr = builder_.newTemp();
+        builder_.emitRaw("    " + mapAddr + " =l alloc8 8");
+        builder_.emitStore("l", "0", mapAddr);
+        forLoopTempAddresses_[mapVar] = mapAddr;
+
+        // key variable slot (STRING = l)
+        std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+        std::string slotAddr = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l alloc8 8");
+        builder_.emitStore("l", "0", slotAddr);
+        forLoopTempAddresses_[varSlotKey] = slotAddr;
+        globalVarAddresses_[stmt->variable] = slotAddr;
+
+        // Register type as STRING for hashmap keys
+        forEachVarTypes_[stmt->variable] = BaseType::STRING;
+
+        // value variable slot if present (STRING = l)
+        if (!stmt->indexVariable.empty()) {
+            std::string valSlotKey = "__foreach_slot_" + stmt->indexVariable;
+            std::string valAddr = builder_.newTemp();
+            builder_.emitRaw("    " + valAddr + " =l alloc8 8");
+            builder_.emitStore("l", "0", valAddr);
+            forLoopTempAddresses_[valSlotKey] = valAddr;
+            globalVarAddresses_[stmt->indexVariable] = valAddr;
+            forEachVarTypes_[stmt->indexVariable] = BaseType::STRING;
+        }
+    } else {
+        // --- ARRAY iteration ---
+        BaseType elemType = BaseType::DOUBLE;
+        auto ait = symbolTable.arrays.find(collectionName);
+        if (ait != symbolTable.arrays.end()) {
+            elemType = ait->second.elementTypeDesc.baseType;
+        }
+
+        // idx (w)
+        std::string idxAddr = builder_.newTemp();
+        builder_.emitRaw("    " + idxAddr + " =l alloc4 4");
+        builder_.emitStore("w", "0", idxAddr);
+        forLoopTempAddresses_[idxVarKey] = idxAddr;
+
+        // upper bound (w)
+        std::string ubVar = "__foreach_ub_" + stmt->variable;
+        std::string ubAddr = builder_.newTemp();
+        builder_.emitRaw("    " + ubAddr + " =l alloc4 4");
+        builder_.emitStore("w", "0", ubAddr);
+        forLoopTempAddresses_[ubVar] = ubAddr;
+
+        // array descriptor pointer (l)
+        std::string arrVar = "__foreach_arr_" + stmt->variable;
+        std::string arrAddr = builder_.newTemp();
+        builder_.emitRaw("    " + arrAddr + " =l alloc8 8");
+        builder_.emitStore("l", "0", arrAddr);
+        forLoopTempAddresses_[arrVar] = arrAddr;
+
+        // element variable slot
+        std::string qbeType = typeManager_.getQBEType(elemType);
+        std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+        int slotSize = (qbeType == "l" || qbeType == "d") ? 8 : 4;
+        std::string allocOp = (slotSize == 8) ? "alloc8" : "alloc4";
+        std::string slotAddr = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l " + allocOp + " " + std::to_string(slotSize));
+        if (slotSize == 8) builder_.emitStore("l", "0", slotAddr);
+        else               builder_.emitStore("w", "0", slotAddr);
+        forLoopTempAddresses_[varSlotKey] = slotAddr;
+        globalVarAddresses_[stmt->variable] = slotAddr;
+
+        // Register element type
+        forEachVarTypes_[stmt->variable] = elemType;
+
+        // index variable slot if present (INTEGER = w)
+        if (!stmt->indexVariable.empty()) {
+            std::string idxSlotKey = "__foreach_slot_" + stmt->indexVariable;
+            std::string idxSlot = builder_.newTemp();
+            builder_.emitRaw("    " + idxSlot + " =l alloc4 4");
+            builder_.emitStore("w", "0", idxSlot);
+            forLoopTempAddresses_[idxSlotKey] = idxSlot;
+            globalVarAddresses_[stmt->indexVariable] = idxSlot;
+            forEachVarTypes_[stmt->indexVariable] = BaseType::INTEGER;
+        }
+    }
+}
+
+void ASTEmitter::emitForEachInit(const ForInStatement* stmt) {
+    clearArrayElementCache();
+    builder_.emitComment("FOR EACH " + stmt->variable +
+                         (stmt->indexVariable.empty() ? "" : ", " + stmt->indexVariable) +
+                         " IN <collection>");
+
+    // --- Resolve the collection name from the expression ---
+    std::string collectionName;
+    if (stmt->array && stmt->array->getType() == ASTNodeType::EXPR_VARIABLE) {
+        const auto* varExpr = static_cast<const VariableExpression*>(stmt->array.get());
+        collectionName = varExpr->name;
+    } else {
+        builder_.emitComment("ERROR: FOR EACH collection expression is not a simple variable");
+        return;
+    }
+
+    const auto& symbolTable = semantic_.getSymbolTable();
+
+    // --- Detect HASHMAP vs ARRAY ---
+    // Check if the collection is a HASHMAP (OBJECT type) by looking in the
+    // variable symbol table rather than the arrays table.
+    bool isHashmap = false;
+    {
+        std::string currentFunc = symbolMapper_.getCurrentFunction();
+        const auto* varSym = semantic_.lookupVariableScoped(collectionName, currentFunc);
+        if (varSym && varSym->typeDesc.baseType == BaseType::OBJECT &&
+            varSym->typeDesc.objectTypeName == "HASHMAP") {
+            isHashmap = true;
+        }
+    }
+
+    // Slots MUST already be pre-allocated in the entry block via
+    // preAllocateForEachSlots().  If they are missing we fall back to
+    // inline allocs (works only when the init block is not in a loop).
+    bool slotsPreAllocated = forLoopTempAddresses_.find(
+        "__foreach_idx_" + stmt->variable) != forLoopTempAddresses_.end();
+
+    if (isHashmap) {
+        // =================================================================
+        // HASHMAP iteration
+        // =================================================================
+        forEachIsHashmap_.insert(stmt->variable);
+
+        builder_.emitComment("FOR EACH over HASHMAP: " + collectionName);
+
+        // Both key and value variables are STRING for hashmaps
+        forEachVarTypes_[stmt->variable] = BaseType::STRING;
+        if (!stmt->indexVariable.empty()) {
+            forEachVarTypes_[stmt->indexVariable] = BaseType::STRING;
+        }
+
+        // --- Load hashmap pointer ---
+        std::string mapPtr = loadVariable(collectionName);
+
+        // --- Call hashmap_keys(map) to get NULL-terminated char** array ---
+        std::string keysArr = builder_.newTemp();
+        builder_.emitCall(keysArr, "l", "hashmap_keys", "l " + mapPtr);
+
+        // --- Call hashmap_size(map) to get entry count ---
+        std::string count = builder_.newTemp();
+        builder_.emitCall(count, "w", "hashmap_size", "l " + mapPtr);
+
+        if (slotsPreAllocated) {
+            // Use pre-allocated slots — only emit stores
+            std::string idxAddr = forLoopTempAddresses_["__foreach_idx_" + stmt->variable];
+            builder_.emitStore("w", "0", idxAddr);
+
+            std::string ubAddr = forLoopTempAddresses_["__foreach_ub_" + stmt->variable];
+            builder_.emitStore("w", count, ubAddr);
+
+            std::string keysAddrSlot = forLoopTempAddresses_["__foreach_arr_" + stmt->variable];
+            builder_.emitStore("l", keysArr, keysAddrSlot);
+
+            std::string mapAddrSlot = forLoopTempAddresses_["__foreach_map_" + stmt->variable];
+            builder_.emitStore("l", mapPtr, mapAddrSlot);
+
+            // Key/value slots already initialized to 0 in entry block
+        } else {
+            // Fallback: inline allocs (only safe if init block not in a loop)
+            std::string idxVar  = "__foreach_idx_" + stmt->variable;
+            std::string idxAddr = builder_.newTemp();
+            builder_.emitRaw("    " + idxAddr + " =l alloc4 4");
+            builder_.emitStore("w", "0", idxAddr);
+            forLoopTempAddresses_[idxVar] = idxAddr;
+
+            std::string ubVar  = "__foreach_ub_" + stmt->variable;
+            std::string ubAddr = builder_.newTemp();
+            builder_.emitRaw("    " + ubAddr + " =l alloc4 4");
+            builder_.emitStore("w", count, ubAddr);
+            forLoopTempAddresses_[ubVar] = ubAddr;
+
+            std::string keysVar = "__foreach_arr_" + stmt->variable;
+            std::string keysAddrSlot = builder_.newTemp();
+            builder_.emitRaw("    " + keysAddrSlot + " =l alloc8 8");
+            builder_.emitStore("l", keysArr, keysAddrSlot);
+            forLoopTempAddresses_[keysVar] = keysAddrSlot;
+
+            std::string mapVar = "__foreach_map_" + stmt->variable;
+            std::string mapAddrSlot = builder_.newTemp();
+            builder_.emitRaw("    " + mapAddrSlot + " =l alloc8 8");
+            builder_.emitStore("l", mapPtr, mapAddrSlot);
+            forLoopTempAddresses_[mapVar] = mapAddrSlot;
+
+            std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+            if (forLoopTempAddresses_.find(varSlotKey) == forLoopTempAddresses_.end()) {
+                std::string slotAddr = builder_.newTemp();
+                builder_.emitRaw("    " + slotAddr + " =l alloc8 8");
+                builder_.emitStore("l", "0", slotAddr);
+                forLoopTempAddresses_[varSlotKey] = slotAddr;
+                globalVarAddresses_[stmt->variable] = slotAddr;
+            }
+
+            if (!stmt->indexVariable.empty()) {
+                std::string valSlotKey = "__foreach_slot_" + stmt->indexVariable;
+                if (forLoopTempAddresses_.find(valSlotKey) == forLoopTempAddresses_.end()) {
+                    std::string valSlot = builder_.newTemp();
+                    builder_.emitRaw("    " + valSlot + " =l alloc8 8");
+                    builder_.emitStore("l", "0", valSlot);
+                    forLoopTempAddresses_[valSlotKey] = valSlot;
+                    globalVarAddresses_[stmt->indexVariable] = valSlot;
+                }
+            }
+        }
+
+    } else {
+        // =================================================================
+        // ARRAY iteration
+        // =================================================================
+
+        // --- Determine element type from array symbol and register it ---
+        BaseType elemType = BaseType::DOUBLE; // default
+        auto ait = symbolTable.arrays.find(collectionName);
+        if (ait != symbolTable.arrays.end()) {
+            elemType = ait->second.elementTypeDesc.baseType;
+        }
+        forEachVarTypes_[stmt->variable] = elemType;
+        if (!stmt->indexVariable.empty()) {
+            forEachVarTypes_[stmt->indexVariable] = BaseType::INTEGER;
+        }
+
+        // --- Load array descriptor pointer ---
+        std::string descName = symbolMapper_.getArrayDescriptorName(collectionName);
+        std::string currentFunc = symbolMapper_.getCurrentFunction();
+        bool isGlobal = true;
+        if (ait != symbolTable.arrays.end()) {
+            isGlobal = ait->second.functionScope.empty();
+        }
+        if (isGlobal && descName[0] != '$') descName = "$" + descName;
+        else if (!isGlobal && descName[0] != '%') descName = "%" + descName;
+
+        std::string arrPtr = builder_.newTemp();
+        builder_.emitLoad(arrPtr, "l", descName);
+
+        // --- Call array_lbound / array_ubound ---
+        std::string lb = builder_.newTemp();
+        builder_.emitCall(lb, "w", "array_lbound", "l " + arrPtr + ", w 1");
+
+        std::string ub = builder_.newTemp();
+        builder_.emitCall(ub, "w", "array_ubound", "l " + arrPtr + ", w 1");
+
+        if (slotsPreAllocated) {
+            // Use pre-allocated slots — only emit stores
+            std::string idxAddr = forLoopTempAddresses_["__foreach_idx_" + stmt->variable];
+            builder_.emitStore("w", lb, idxAddr);
+
+            std::string ubAddr = forLoopTempAddresses_["__foreach_ub_" + stmt->variable];
+            builder_.emitStore("w", ub, ubAddr);
+
+            std::string arrAddr = forLoopTempAddresses_["__foreach_arr_" + stmt->variable];
+            builder_.emitStore("l", arrPtr, arrAddr);
+
+            // Element/index slots already initialized to 0 in entry block
+        } else {
+            // Fallback: inline allocs (only safe if init block not in a loop)
+            std::string idxVar  = "__foreach_idx_" + stmt->variable;
+            std::string idxAddr = builder_.newTemp();
+            builder_.emitRaw("    " + idxAddr + " =l alloc4 4");
+            builder_.emitStore("w", lb, idxAddr);
+            forLoopTempAddresses_[idxVar] = idxAddr;
+
+            std::string ubVar  = "__foreach_ub_" + stmt->variable;
+            std::string ubAddr = builder_.newTemp();
+            builder_.emitRaw("    " + ubAddr + " =l alloc4 4");
+            builder_.emitStore("w", ub, ubAddr);
+            forLoopTempAddresses_[ubVar] = ubAddr;
+
+            std::string arrVar = "__foreach_arr_" + stmt->variable;
+            std::string arrAddr = builder_.newTemp();
+            builder_.emitRaw("    " + arrAddr + " =l alloc8 8");
+            builder_.emitStore("l", arrPtr, arrAddr);
+            forLoopTempAddresses_[arrVar] = arrAddr;
+
+            std::string qbeType = typeManager_.getQBEType(elemType);
+            std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+            if (forLoopTempAddresses_.find(varSlotKey) == forLoopTempAddresses_.end()) {
+                std::string slotAddr = builder_.newTemp();
+                int slotSize = (qbeType == "l" || qbeType == "d") ? 8 : 4;
+                std::string allocOp = (slotSize == 8) ? "alloc8" : "alloc4";
+                builder_.emitRaw("    " + slotAddr + " =l " + allocOp + " " + std::to_string(slotSize));
+                if (slotSize == 8) builder_.emitStore("l", "0", slotAddr);
+                else               builder_.emitStore("w", "0", slotAddr);
+                forLoopTempAddresses_[varSlotKey] = slotAddr;
+                globalVarAddresses_[stmt->variable] = slotAddr;
+            }
+
+            if (!stmt->indexVariable.empty()) {
+                std::string idxSlotKey = "__foreach_slot_" + stmt->indexVariable;
+                if (forLoopTempAddresses_.find(idxSlotKey) == forLoopTempAddresses_.end()) {
+                    std::string idxSlot = builder_.newTemp();
+                    builder_.emitRaw("    " + idxSlot + " =l alloc4 4");
+                    builder_.emitStore("w", "0", idxSlot);
+                    forLoopTempAddresses_[idxSlotKey] = idxSlot;
+                    globalVarAddresses_[stmt->indexVariable] = idxSlot;
+                }
+            }
+        }
+    }
+}
+
+std::string ASTEmitter::emitForEachCondition(const ForInStatement* stmt) {
+    std::string idxVar  = "__foreach_idx_" + stmt->variable;
+    std::string ubVar   = "__foreach_ub_"  + stmt->variable;
+
+    std::string idxAddr = forLoopTempAddresses_[idxVar];
+    std::string ubAddr  = forLoopTempAddresses_[ubVar];
+
+    std::string idx = builder_.newTemp();
+    builder_.emitRaw("    " + idx + " =w loadw " + idxAddr);
+
+    std::string ub = builder_.newTemp();
+    builder_.emitRaw("    " + ub + " =w loadw " + ubAddr);
+
+    if (forEachIsHashmap_.count(stmt->variable)) {
+        // Hashmap: 0-based index, condition is idx < count
+        std::string cond = builder_.newTemp();
+        builder_.emitRaw("    " + cond + " =w csltw " + idx + ", " + ub);
+        return cond;
+    } else {
+        // Array: lbound-based index, condition is idx <= ubound
+        std::string gt = builder_.newTemp();
+        builder_.emitRaw("    " + gt + " =w csgtw " + idx + ", " + ub);
+        std::string cond = builder_.newTemp();
+        builder_.emitRaw("    " + cond + " =w xor " + gt + ", 1");
+        return cond;
+    }
+}
+
+void ASTEmitter::emitForEachIncrement(const ForInStatement* stmt) {
+    clearArrayElementCache();
+    std::string idxVar  = "__foreach_idx_" + stmt->variable;
+    std::string idxAddr = forLoopTempAddresses_[idxVar];
+
+    std::string idx = builder_.newTemp();
+    builder_.emitRaw("    " + idx + " =w loadw " + idxAddr);
+
+    std::string next = builder_.newTemp();
+    builder_.emitRaw("    " + next + " =w add " + idx + ", 1");
+
+    builder_.emitStore("w", next, idxAddr);
+}
+
+void ASTEmitter::emitForEachBodyPreamble(const ForInStatement* stmt) {
+    clearArrayElementCache();
+
+    // --- Load current index ---
+    std::string idxVar  = "__foreach_idx_" + stmt->variable;
+    std::string idxAddr = forLoopTempAddresses_[idxVar];
+    std::string idx = builder_.newTemp();
+    builder_.emitRaw("    " + idx + " =w loadw " + idxAddr);
+
+    if (forEachIsHashmap_.count(stmt->variable)) {
+        // =================================================================
+        // HASHMAP body preamble
+        // =================================================================
+        builder_.emitComment("FOR EACH body (HASHMAP): load key into " + stmt->variable);
+
+        // --- Load keys array pointer ---
+        std::string keysVar = "__foreach_arr_" + stmt->variable;
+        std::string keysAddrSlot = forLoopTempAddresses_[keysVar];
+        std::string keysArr = builder_.newTemp();
+        builder_.emitRaw("    " + keysArr + " =l loadl " + keysAddrSlot);
+
+        // --- Compute keys[idx]: each pointer is 8 bytes ---
+        std::string idxL = builder_.newTemp();
+        builder_.emitRaw("    " + idxL + " =l extsw " + idx);
+        std::string offset = builder_.newTemp();
+        builder_.emitRaw("    " + offset + " =l mul " + idxL + ", 8");
+        std::string keyPtrAddr = builder_.newTemp();
+        builder_.emitRaw("    " + keyPtrAddr + " =l add " + keysArr + ", " + offset);
+        std::string keyCStr = builder_.newTemp();
+        builder_.emitRaw("    " + keyCStr + " =l loadl " + keyPtrAddr);
+
+        // --- Wrap raw C string as a string descriptor ---
+        std::string keyDesc = builder_.newTemp();
+        builder_.emitCall(keyDesc, "l", "string_new_utf8", "l " + keyCStr);
+
+        // --- Store key descriptor into key variable slot ---
+        std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+        std::string keySlotAddr = forLoopTempAddresses_[varSlotKey];
+        builder_.emitStore("l", keyDesc, keySlotAddr);
+
+        // --- If value variable present, call hashmap_lookup ---
+        if (!stmt->indexVariable.empty()) {
+            builder_.emitComment("FOR EACH body (HASHMAP): load value into " + stmt->indexVariable);
+
+            // Load hashmap pointer
+            std::string mapVar = "__foreach_map_" + stmt->variable;
+            std::string mapAddrSlot = forLoopTempAddresses_[mapVar];
+            std::string mapPtr = builder_.newTemp();
+            builder_.emitRaw("    " + mapPtr + " =l loadl " + mapAddrSlot);
+
+            // Call hashmap_lookup — returns the stored value pointer
+            // For HASHMAP, values are string descriptors (BasicString*)
+            std::string valuePtr = builder_.newTemp();
+            builder_.emitCall(valuePtr, "l", "hashmap_lookup",
+                             "l " + mapPtr + ", l " + keyCStr);
+
+            // Store value pointer into value variable slot
+            std::string valSlotKey = "__foreach_slot_" + stmt->indexVariable;
+            std::string valSlotAddr = forLoopTempAddresses_[valSlotKey];
+            builder_.emitStore("l", valuePtr, valSlotAddr);
+        }
+
+    } else {
+        // =================================================================
+        // ARRAY body preamble (existing logic)
+        // =================================================================
+        builder_.emitComment("FOR EACH body: load element into " + stmt->variable);
+
+        // --- Store index into user-visible index variable (slot allocated in init) ---
+        if (!stmt->indexVariable.empty()) {
+            std::string idxSlotKey = "__foreach_slot_" + stmt->indexVariable;
+            auto isit = forLoopTempAddresses_.find(idxSlotKey);
+            if (isit != forLoopTempAddresses_.end()) {
+                builder_.emitStore("w", idx, isit->second);
+            }
+        }
+
+        // --- Load array descriptor ---
+        std::string arrVar  = "__foreach_arr_" + stmt->variable;
+        std::string arrPtrAddr = forLoopTempAddresses_[arrVar];
+        std::string arrPtr = builder_.newTemp();
+        builder_.emitRaw("    " + arrPtr + " =l loadl " + arrPtrAddr);
+
+        // --- Build single-element indices array (reuse shared buffer) ---
+        std::string indicesPtr;
+        if (!sharedIndicesBuffer_.empty()) {
+            indicesPtr = sharedIndicesBuffer_;
+        } else {
+            indicesPtr = builder_.newTemp();
+            builder_.emitRaw("    " + indicesPtr + " =l alloc4 4");
+        }
+        builder_.emitStore("w", idx, indicesPtr);
+
+        // --- Call array_get_address ---
+        std::string elemAddr = builder_.newTemp();
+        builder_.emitCall(elemAddr, "l", "array_get_address",
+                         "l " + arrPtr + ", l " + indicesPtr);
+
+        // --- Determine element type from the type registered at init time ---
+        BaseType elemType = BaseType::DOUBLE; // default
+        auto feIt = forEachVarTypes_.find(stmt->variable);
+        if (feIt != forEachVarTypes_.end()) {
+            elemType = feIt->second;
+        }
+
+        // --- Load element value and store into loop variable slot ---
+        std::string qbeType = typeManager_.getQBEType(elemType);
+        std::string loadOp;
+        if (qbeType == "w")      loadOp = "loadw";
+        else if (qbeType == "l") loadOp = "loadl";
+        else if (qbeType == "s") loadOp = "loads";
+        else if (qbeType == "d") loadOp = "loadd";
+        else                     loadOp = "loadl"; // pointer-sized fallback
+
+        std::string elemVal = builder_.newTemp();
+        builder_.emitRaw("    " + elemVal + " =" + qbeType + " " + loadOp + " " + elemAddr);
+
+        // The loop variable slot was pre-allocated in emitForEachInit and
+        // registered in forLoopTempAddresses_ / globalVarAddresses_.
+        std::string varSlotKey = "__foreach_slot_" + stmt->variable;
+        std::string slotAddr = forLoopTempAddresses_[varSlotKey];
+
+        if (qbeType == "w")      builder_.emitStore("w", elemVal, slotAddr);
+        else if (qbeType == "l") builder_.emitStore("l", elemVal, slotAddr);
+        else if (qbeType == "s") builder_.emitRaw("    stores " + elemVal + ", " + slotAddr);
+        else if (qbeType == "d") builder_.emitRaw("    stored " + elemVal + ", " + slotAddr);
+        else                     builder_.emitStore("l", elemVal, slotAddr);
+    }
+}
+
+void ASTEmitter::emitForEachCleanup(const ForInStatement* stmt) {
+    // Only hashmap iteration needs cleanup (free the keys array)
+    if (!forEachIsHashmap_.count(stmt->variable)) {
+        return;
+    }
+    builder_.emitComment("FOR EACH cleanup: free hashmap keys array");
+
+    // Load the keys-array pointer from the pre-allocated slot and free it.
+    std::string keysVar = "__foreach_arr_" + stmt->variable;
+    auto it = forLoopTempAddresses_.find(keysVar);
+    if (it != forLoopTempAddresses_.end()) {
+        std::string keysAddrSlot = it->second;
+        std::string keysArr = builder_.newTemp();
+        builder_.emitLoad(keysArr, "l", keysAddrSlot);
+        // Call free() — returns void, so no result capture
+        builder_.emitRaw("    call $free(l " + keysArr + ")");
+    }
 }
 
 std::string ASTEmitter::emitIfCondition(const IfStatement* stmt) {
@@ -4909,6 +6494,309 @@ void ASTEmitter::emitSIMDLoop(const FasterBASIC::ForStatement* forStmt,
     if (!exitLabel.empty()) {
         builder_.emitJump(exitLabel);
     }
+}
+
+// =============================================================================
+// Direct control-flow emission for METHOD/CONSTRUCTOR/DESTRUCTOR bodies
+// =============================================================================
+// Method bodies are emitted sequentially via emitMethodBody() without the
+// CFG infrastructure.  Compound statements (IF, FOR, WHILE) therefore need
+// self-contained inline emission that generates all labels, branches, and
+// body code in one pass.
+
+void ASTEmitter::emitIfDirect(const FasterBASIC::IfStatement* stmt) {
+    if (!stmt) return;
+
+    int id = builder_.getNextLabelId();
+    std::string prefix = "mif_" + std::to_string(id);
+
+    // We build label names for: then, each elseif, else, end
+    std::string thenLabel  = prefix + "_then";
+    std::string elseLabel  = prefix + "_else";
+    std::string endLabel   = prefix + "_end";
+
+    // How many ELSEIF clauses?
+    size_t numElseIf = stmt->elseIfClauses.size();
+    bool hasElse = !stmt->elseStatements.empty();
+
+    // Determine the label to jump to when the IF condition is false
+    std::string falseTarget;
+    if (numElseIf > 0) {
+        falseTarget = prefix + "_elseif_0";
+    } else if (hasElse) {
+        falseTarget = elseLabel;
+    } else {
+        falseTarget = endLabel;
+    }
+
+    // --- Evaluate IF condition ---
+    builder_.emitComment("IF (direct, method body)");
+    std::string condVal = emitExpression(stmt->condition.get());
+    FasterBASIC::BaseType condType = getExpressionType(stmt->condition.get());
+
+    // Convert to word-sized integer for branch
+    std::string condW;
+    if (condType == FasterBASIC::BaseType::DOUBLE || condType == FasterBASIC::BaseType::SINGLE) {
+        condW = builder_.newTemp();
+        std::string zero = builder_.newTemp();
+        if (condType == FasterBASIC::BaseType::DOUBLE) {
+            builder_.emitRaw("    " + zero + " =d copy d_0.0\n");
+            builder_.emitRaw("    " + condW + " =w cned " + condVal + ", " + zero + "\n");
+        } else {
+            builder_.emitRaw("    " + zero + " =s copy s_0.0\n");
+            builder_.emitRaw("    " + condW + " =w cnes " + condVal + ", " + zero + "\n");
+        }
+    } else if (condType == FasterBASIC::BaseType::LONG || condType == FasterBASIC::BaseType::STRING) {
+        condW = builder_.newTemp();
+        builder_.emitRaw("    " + condW + " =w cnel " + condVal + ", 0\n");
+    } else {
+        condW = condVal; // already w
+    }
+
+    builder_.emitRaw("    jnz " + condW + ", @" + thenLabel + ", @" + falseTarget + "\n");
+
+    // Helper lambda: check if the last statement in a list is a RETURN or END
+    // (which emits `ret` and terminates the block — no jump needed after).
+    auto endsWithReturn = [](const std::vector<FasterBASIC::StatementPtr>& stmts) -> bool {
+        if (stmts.empty()) return false;
+        auto t = stmts.back()->getType();
+        return t == FasterBASIC::ASTNodeType::STMT_RETURN ||
+               t == FasterBASIC::ASTNodeType::STMT_END;
+    };
+
+    // --- THEN block ---
+    builder_.emitLabel(thenLabel);
+    for (const auto& s : stmt->thenStatements) {
+        if (s) emitStatement(s.get());
+    }
+    if (!endsWithReturn(stmt->thenStatements)) {
+        builder_.emitJump(endLabel);
+    }
+
+    // --- ELSEIF blocks ---
+    for (size_t i = 0; i < numElseIf; i++) {
+        std::string eifLabel = prefix + "_elseif_" + std::to_string(i);
+        std::string eifBodyLabel = prefix + "_elseif_body_" + std::to_string(i);
+
+        // Where to jump if this ELSEIF is false
+        std::string nextTarget;
+        if (i + 1 < numElseIf) {
+            nextTarget = prefix + "_elseif_" + std::to_string(i + 1);
+        } else if (hasElse) {
+            nextTarget = elseLabel;
+        } else {
+            nextTarget = endLabel;
+        }
+
+        builder_.emitLabel(eifLabel);
+        builder_.emitComment("ELSEIF");
+        std::string eifCond = emitExpression(stmt->elseIfClauses[i].condition.get());
+        FasterBASIC::BaseType eifType = getExpressionType(stmt->elseIfClauses[i].condition.get());
+
+        std::string eifW;
+        if (eifType == FasterBASIC::BaseType::DOUBLE || eifType == FasterBASIC::BaseType::SINGLE) {
+            eifW = builder_.newTemp();
+            std::string zero = builder_.newTemp();
+            if (eifType == FasterBASIC::BaseType::DOUBLE) {
+                builder_.emitRaw("    " + zero + " =d copy d_0.0\n");
+                builder_.emitRaw("    " + eifW + " =w cned " + eifCond + ", " + zero + "\n");
+            } else {
+                builder_.emitRaw("    " + zero + " =s copy s_0.0\n");
+                builder_.emitRaw("    " + eifW + " =w cnes " + eifCond + ", " + zero + "\n");
+            }
+        } else if (eifType == FasterBASIC::BaseType::LONG || eifType == FasterBASIC::BaseType::STRING) {
+            eifW = builder_.newTemp();
+            builder_.emitRaw("    " + eifW + " =w cnel " + eifCond + ", 0\n");
+        } else {
+            eifW = eifCond;
+        }
+
+        builder_.emitRaw("    jnz " + eifW + ", @" + eifBodyLabel + ", @" + nextTarget + "\n");
+
+        builder_.emitLabel(eifBodyLabel);
+        for (const auto& s : stmt->elseIfClauses[i].statements) {
+            if (s) emitStatement(s.get());
+        }
+        if (!endsWithReturn(stmt->elseIfClauses[i].statements)) {
+            builder_.emitJump(endLabel);
+        }
+    }
+
+    // --- ELSE block ---
+    if (hasElse) {
+        builder_.emitLabel(elseLabel);
+        builder_.emitComment("ELSE");
+        for (const auto& s : stmt->elseStatements) {
+            if (s) emitStatement(s.get());
+        }
+        if (!endsWithReturn(stmt->elseStatements)) {
+            builder_.emitJump(endLabel);
+        }
+    }
+
+    // --- END IF ---
+    builder_.emitLabel(endLabel);
+}
+
+void ASTEmitter::emitForDirect(const FasterBASIC::ForStatement* stmt) {
+    if (!stmt) return;
+
+    int id = builder_.getNextLabelId();
+    std::string prefix   = "mfor_" + std::to_string(id);
+    std::string condLabel = prefix + "_cond";
+    std::string bodyLabel = prefix + "_body";
+    std::string incrLabel = prefix + "_incr";
+    std::string endLabel  = prefix + "_end";
+
+    builder_.emitComment("FOR (direct, method body): " + stmt->variable);
+
+    // Allocate loop variable as a method-local if not already registered
+    std::string loopVarName = stmt->variable;
+    if (methodParamAddresses_.find(loopVarName) == methodParamAddresses_.end()) {
+        // Not registered yet — allocate a local slot
+        std::string varSlot = "%var_" + loopVarName;
+        builder_.emitRaw("    " + varSlot + " =l alloc8 8\n");
+        builder_.emitRaw("    storel 0, " + varSlot + "\n");
+        registerMethodParam(loopVarName, varSlot, FasterBASIC::BaseType::LONG);
+    }
+
+    // Initialise loop variable with start value
+    std::string startVal = emitExpression(stmt->start.get());
+    storeVariable(loopVarName, startVal);
+
+    // Evaluate end value and step, store in temp slots
+    std::string endVal = emitExpression(stmt->end.get());
+    std::string endSlot = "%mfor_end_" + std::to_string(id);
+    builder_.emitRaw("    " + endSlot + " =l alloc8 8\n");
+    builder_.emitRaw("    storel " + endVal + ", " + endSlot + "\n");
+
+    std::string stepVal;
+    std::string stepSlot = "%mfor_step_" + std::to_string(id);
+    builder_.emitRaw("    " + stepSlot + " =l alloc8 8\n");
+    if (stmt->step) {
+        stepVal = emitExpression(stmt->step.get());
+    } else {
+        stepVal = "1";
+    }
+    builder_.emitRaw("    storel " + stepVal + ", " + stepSlot + "\n");
+
+    // --- Condition check ---
+    builder_.emitJump(condLabel);
+    builder_.emitLabel(condLabel);
+
+    std::string curVal  = loadVariable(loopVarName);
+    std::string limVal  = builder_.newTemp();
+    builder_.emitRaw("    " + limVal + " =l loadl " + endSlot + "\n");
+    std::string stpVal  = builder_.newTemp();
+    builder_.emitRaw("    " + stpVal + " =l loadl " + stepSlot + "\n");
+
+    // If step > 0: continue while curVal <= limVal
+    // If step < 0: continue while curVal >= limVal
+    std::string stepNeg = builder_.newTemp();
+    builder_.emitRaw("    " + stepNeg + " =w csltl " + stpVal + ", 0\n");
+
+    std::string cmpGt = builder_.newTemp();
+    builder_.emitRaw("    " + cmpGt + " =w csgtl " + curVal + ", " + limVal + "\n");
+    std::string posCond = builder_.newTemp();
+    // For positive step: NOT (cur > lim)  →  cur <= lim
+    builder_.emitRaw("    " + posCond + " =w ceqw " + cmpGt + ", 0\n");
+
+    std::string cmpLt = builder_.newTemp();
+    builder_.emitRaw("    " + cmpLt + " =w csltl " + curVal + ", " + limVal + "\n");
+    std::string negCond = builder_.newTemp();
+    // For negative step: NOT (cur < lim)  →  cur >= lim
+    builder_.emitRaw("    " + negCond + " =w ceqw " + cmpLt + ", 0\n");
+
+    // Select condition based on step sign
+    // cond = stepNeg ? negCond : posCond
+    std::string selLabel1 = prefix + "_stepsel_neg";
+    std::string selLabel2 = prefix + "_stepsel_pos";
+    std::string selLabel3 = prefix + "_stepsel_done";
+    std::string condSlot  = "%mfor_cond_" + std::to_string(id);
+    builder_.emitRaw("    " + condSlot + " =l alloc4 4\n");
+    builder_.emitRaw("    jnz " + stepNeg + ", @" + selLabel1 + ", @" + selLabel2 + "\n");
+
+    builder_.emitLabel(selLabel1);
+    builder_.emitRaw("    storew " + negCond + ", " + condSlot + "\n");
+    builder_.emitJump(selLabel3);
+
+    builder_.emitLabel(selLabel2);
+    builder_.emitRaw("    storew " + posCond + ", " + condSlot + "\n");
+    builder_.emitJump(selLabel3);
+
+    builder_.emitLabel(selLabel3);
+    std::string finalCond = builder_.newTemp();
+    builder_.emitRaw("    " + finalCond + " =w loadw " + condSlot + "\n");
+
+    builder_.emitRaw("    jnz " + finalCond + ", @" + bodyLabel + ", @" + endLabel + "\n");
+
+    // --- Body ---
+    builder_.emitLabel(bodyLabel);
+    for (const auto& s : stmt->body) {
+        if (s) emitStatement(s.get());
+    }
+    builder_.emitJump(incrLabel);
+
+    // --- Increment ---
+    builder_.emitLabel(incrLabel);
+    std::string cur2 = loadVariable(loopVarName);
+    std::string stp2 = builder_.newTemp();
+    builder_.emitRaw("    " + stp2 + " =l loadl " + stepSlot + "\n");
+    std::string next = builder_.newTemp();
+    builder_.emitRaw("    " + next + " =l add " + cur2 + ", " + stp2 + "\n");
+    storeVariable(loopVarName, next);
+    builder_.emitJump(condLabel);
+
+    // --- End ---
+    builder_.emitLabel(endLabel);
+}
+
+void ASTEmitter::emitWhileDirect(const FasterBASIC::WhileStatement* stmt) {
+    if (!stmt) return;
+
+    int id = builder_.getNextLabelId();
+    std::string prefix    = "mwhile_" + std::to_string(id);
+    std::string condLabel = prefix + "_cond";
+    std::string bodyLabel = prefix + "_body";
+    std::string endLabel  = prefix + "_end";
+
+    builder_.emitComment("WHILE (direct, method body)");
+
+    // --- Condition ---
+    builder_.emitJump(condLabel);
+    builder_.emitLabel(condLabel);
+    std::string condVal = emitExpression(stmt->condition.get());
+    FasterBASIC::BaseType condType = getExpressionType(stmt->condition.get());
+
+    std::string condW;
+    if (condType == FasterBASIC::BaseType::DOUBLE || condType == FasterBASIC::BaseType::SINGLE) {
+        condW = builder_.newTemp();
+        std::string zero = builder_.newTemp();
+        if (condType == FasterBASIC::BaseType::DOUBLE) {
+            builder_.emitRaw("    " + zero + " =d copy d_0.0\n");
+            builder_.emitRaw("    " + condW + " =w cned " + condVal + ", " + zero + "\n");
+        } else {
+            builder_.emitRaw("    " + zero + " =s copy s_0.0\n");
+            builder_.emitRaw("    " + condW + " =w cnes " + condVal + ", " + zero + "\n");
+        }
+    } else if (condType == FasterBASIC::BaseType::LONG || condType == FasterBASIC::BaseType::STRING) {
+        condW = builder_.newTemp();
+        builder_.emitRaw("    " + condW + " =w cnel " + condVal + ", 0\n");
+    } else {
+        condW = condVal;
+    }
+
+    builder_.emitRaw("    jnz " + condW + ", @" + bodyLabel + ", @" + endLabel + "\n");
+
+    // --- Body ---
+    builder_.emitLabel(bodyLabel);
+    for (const auto& s : stmt->body) {
+        if (s) emitStatement(s.get());
+    }
+    builder_.emitJump(condLabel);
+
+    // --- End ---
+    builder_.emitLabel(endLabel);
 }
 
 } // namespace fbc

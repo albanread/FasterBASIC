@@ -631,6 +631,73 @@ StatementPtr Parser::parseStatement() {
             return parseWriteStreamStatement();
         case TokenType::LET:
             return parseLetStatement();
+        case TokenType::ME: {
+            // ME.Field = value  →  implicit LET on ME member
+            // ME.Method(...)    →  method call on ME
+            // Look ahead to decide: ME DOT IDENT EQUALS → assignment, ME DOT IDENT LPAREN → call
+            size_t savedIdx = m_currentIndex;
+            bool isDot = false;
+            if (m_currentIndex + 1 < m_tokens->size()) {
+                const auto& nextTok = (*m_tokens)[m_currentIndex + 1];
+                isDot = (nextTok.type == TokenType::DOT) || 
+                        (nextTok.type == TokenType::UNKNOWN && nextTok.value == ".");
+            }
+            if (isDot && m_currentIndex + 2 < m_tokens->size() &&
+                (*m_tokens)[m_currentIndex + 2].type == TokenType::IDENTIFIER) {
+                size_t afterName = m_currentIndex + 3;
+                bool isAssign = (afterName < m_tokens->size() && (*m_tokens)[afterName].type == TokenType::EQUAL);
+                if (isAssign) {
+                    // ME.Field = value → build a LET statement manually
+                    auto loc = current().location;
+                    advance(); // consume ME
+                    // consume DOT
+                    advance();
+                    // Build member chain
+                    std::vector<std::string> members;
+                    members.push_back(current().value);
+                    advance(); // consume field name
+                    // Handle nested: ME.A.B = value
+                    while (current().type == TokenType::DOT ||
+                           (current().type == TokenType::UNKNOWN && current().value == ".")) {
+                        advance(); // consume DOT
+                        if (current().type == TokenType::IDENTIFIER) {
+                            members.push_back(current().value);
+                            advance();
+                        } else {
+                            break;
+                        }
+                        // Check if next is EQUALS (end of chain) or another DOT
+                        if (current().type == TokenType::EQUAL) break;
+                    }
+                    consume(TokenType::EQUAL, "Expected '=' in ME member assignment");
+                    auto value = parseExpression();
+                    auto stmt = std::make_unique<LetStatement>("ME", TokenType::UNKNOWN);
+                    stmt->location = loc;
+                    for (const auto& m : members) {
+                        stmt->addMember(m);
+                    }
+                    stmt->value = std::move(value);
+                    return stmt;
+                } else {
+                    // ME.Method(...) or ME.Field (expression) → parse as method call statement
+                    auto expr = parseExpression();
+                    auto stmt = std::make_unique<CallStatement>("__method_call");
+                    stmt->setMethodCallExpression(std::move(expr));
+                    return stmt;
+                }
+            }
+            // If we couldn't match assignment or method call, report error
+            error("Unexpected use of ME outside of member access or method call");
+            advance();
+            return nullptr;
+        }
+        case TokenType::SUPER: {
+            // SUPER.Method(...) → parse as expression-statement (method call on parent)
+            auto expr = parseExpression();
+            auto stmt = std::make_unique<CallStatement>("__method_call");
+            stmt->setMethodCallExpression(std::move(expr));
+            return stmt;
+        }
         case TokenType::IDENTIFIER:
             // Check if this is an implicit LET statement (variable assignment)
             // Use isAssignment() to handle arrays like buffer(0) = 10
@@ -777,6 +844,10 @@ StatementPtr Parser::parseStatement() {
             return parseDecStatement();
         case TokenType::TYPE:
             return parseTypeDeclarationStatement();
+        case TokenType::CLASS:
+            return parseClassDeclaration();
+        case TokenType::DELETE:
+            return parseDeleteStatement();
         case TokenType::LOCAL:
             return parseLocalStatement();
         case TokenType::GLOBAL:
@@ -2426,6 +2497,56 @@ StatementPtr Parser::parseForStatement() {
         auto stmt = std::make_unique<ForInStatement>(varName);
         stmt->array = parseExpression();
 
+        // Skip to next line
+        if (current().type == TokenType::END_OF_LINE) {
+            advance();
+        }
+
+        // Parse loop body until NEXT (same as FOR EACH path)
+        while (!isAtEnd()) {
+            skipBlankLines();
+
+            if (isAtEnd()) break;
+
+            // Skip optional line number at start of line
+            skipOptionalLineNumber();
+
+            // Check for NEXT
+            if (current().type == TokenType::NEXT) {
+                advance(); // consume NEXT
+
+                // Optional variable name after NEXT
+                if (current().type == TokenType::IDENTIFIER) {
+                    advance(); // consume variable name
+                }
+                break;
+            }
+
+            // Parse statements on this line (may be separated by colons)
+            while (!isAtEnd() &&
+                   current().type != TokenType::END_OF_LINE &&
+                   current().type != TokenType::NEXT) {
+
+                auto bodyStmt = parseStatement();
+                if (bodyStmt) {
+                    stmt->addBodyStatement(std::move(bodyStmt));
+                }
+
+                // If there's a colon, continue parsing more statements on this line
+                if (current().type == TokenType::COLON) {
+                    advance(); // consume colon
+                } else {
+                    // No more statements on this line
+                    break;
+                }
+            }
+
+            // Skip EOL after statement(s)
+            if (current().type == TokenType::END_OF_LINE) {
+                advance();
+            }
+        }
+
         return stmt;
     } else if (current().type == TokenType::COMMA) {
         // FOR...IN with index: FOR var, index IN array
@@ -3017,6 +3138,14 @@ StatementPtr Parser::parseDimStatement() {
             }
         }
 
+        // Check for initializer: = expression (e.g., DIM x AS Foo = NEW Foo())
+        if (current().type == TokenType::EQUAL) {
+            advance(); // consume =
+            if (!stmt->arrays.empty()) {
+                stmt->arrays.back().initializer = parseExpression();
+            }
+        }
+
     } while (match(TokenType::COMMA));
 
     return stmt;
@@ -3287,6 +3416,474 @@ StatementPtr Parser::parseTypeDeclarationStatement() {
     }
     
     return stmt;
+}
+
+// =============================================================================
+// CLASS & Object System Parsing
+// =============================================================================
+
+StatementPtr Parser::parseClassDeclaration() {
+    auto loc = current().location;
+    advance(); // consume CLASS
+    
+    // Expect class name
+    if (current().type != TokenType::IDENTIFIER) {
+        error("Expected class name after CLASS");
+        return std::make_unique<RemStatement>("");
+    }
+    
+    std::string className = current().value;
+    advance(); // consume class name
+    
+    auto stmt = std::make_unique<ClassStatement>(className);
+    stmt->location = loc;
+    
+    // Optional EXTENDS clause
+    if (current().type == TokenType::EXTENDS) {
+        advance(); // consume EXTENDS
+        if (current().type != TokenType::IDENTIFIER) {
+            error("Expected parent class name after EXTENDS");
+            return std::make_unique<RemStatement>("");
+        }
+        stmt->parentClassName = current().value;
+        advance(); // consume parent class name
+    }
+    
+    // Expect end of line
+    if (current().type != TokenType::END_OF_LINE && current().type != TokenType::COLON) {
+        error("Expected end of line after CLASS header");
+    }
+    skipToEndOfLine();
+    
+    // Parse class body until END CLASS
+    while (current().type != TokenType::END_OF_FILE) {
+        // Skip blank lines and line numbers
+        if (current().type == TokenType::END_OF_LINE) {
+            advance();
+            continue;
+        }
+        skipOptionalLineNumber();
+        
+        // Check for END CLASS
+        if (current().type == TokenType::END) {
+            auto endLoc = current().location;
+            advance(); // consume END
+            if (current().type == TokenType::CLASS) {
+                advance(); // consume CLASS
+                break;
+            } else {
+                // Not END CLASS — could be END by itself (error in class body)
+                error("Expected CLASS after END (to close CLASS " + className + ")");
+                break;
+            }
+        }
+        
+        // Check for REM / comments
+        if (current().type == TokenType::REM) {
+            skipToEndOfLine();
+            continue;
+        }
+        
+        // Check for CONSTRUCTOR
+        if (current().type == TokenType::CONSTRUCTOR) {
+            if (stmt->constructor) {
+                error("CLASS '" + className + "' already has a CONSTRUCTOR");
+                skipToEndOfLine();
+                continue;
+            }
+            stmt->constructor = parseConstructorDeclaration();
+            continue;
+        }
+        
+        // Check for DESTRUCTOR
+        if (current().type == TokenType::DESTRUCTOR) {
+            if (stmt->destructor) {
+                error("CLASS '" + className + "' already has a DESTRUCTOR");
+                skipToEndOfLine();
+                continue;
+            }
+            stmt->destructor = parseDestructorDeclaration();
+            continue;
+        }
+        
+        // Check for METHOD
+        if (current().type == TokenType::METHOD) {
+            auto method = parseMethodDeclaration();
+            if (method) {
+                // Check for duplicate method names
+                for (const auto& existing : stmt->methods) {
+                    if (existing->methodName == method->methodName) {
+                        error("METHOD '" + method->methodName + "' is already defined in CLASS '" + className + "'");
+                        break;
+                    }
+                }
+                stmt->methods.push_back(std::move(method));
+            }
+            continue;
+        }
+        
+        // Must be a field declaration: FieldName AS Type
+        if (current().type == TokenType::IDENTIFIER) {
+            std::string fieldName = current().value;
+            advance(); // consume field name
+            
+            if (current().type != TokenType::AS) {
+                error("Expected AS after field name '" + fieldName + "' in CLASS declaration");
+                skipToEndOfLine();
+                continue;
+            }
+            advance(); // consume AS
+            
+            // Parse type
+            std::string fieldTypeName;
+            TokenType builtInType = TokenType::UNKNOWN;
+            bool isBuiltIn = false;
+            
+            if (isTypeKeyword(current().type)) {
+                isBuiltIn = true;
+                builtInType = current().type;
+                fieldTypeName = current().value;
+                advance();
+            } else if (current().type == TokenType::IDENTIFIER) {
+                isBuiltIn = false;
+                fieldTypeName = current().value;
+                advance();
+            } else {
+                error("Expected type name after AS in CLASS field declaration");
+                skipToEndOfLine();
+                continue;
+            }
+            
+            TypeDeclarationStatement::TypeField field(fieldName, fieldTypeName, builtInType, isBuiltIn);
+            stmt->fields.push_back(field);
+            
+            skipToEndOfLine();
+            continue;
+        }
+        
+        // Unexpected token inside CLASS
+        error("Unexpected statement inside CLASS '" + className + "': " + current().value);
+        skipToEndOfLine();
+    }
+    
+    return stmt;
+}
+
+std::unique_ptr<MethodStatement> Parser::parseMethodDeclaration() {
+    auto loc = current().location;
+    advance(); // consume METHOD
+    
+    if (current().type != TokenType::IDENTIFIER) {
+        error("Expected method name after METHOD");
+        skipToEndOfLine();
+        return nullptr;
+    }
+    
+    std::string methodName = current().value;
+    advance(); // consume method name
+    
+    auto method = std::make_unique<MethodStatement>(methodName);
+    method->location = loc;
+    
+    // Parse parameter list
+    consume(TokenType::LPAREN, "Expected '(' after method name");
+    
+    while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+        // Check for BYREF / BYVAL
+        bool isByRef = false;
+        if (current().type == TokenType::BYREF) {
+            isByRef = true;
+            advance();
+        } else if (current().type == TokenType::BYVAL) {
+            advance();
+        }
+        
+        if (current().type != TokenType::IDENTIFIER) {
+            error("Expected parameter name in METHOD declaration");
+            break;
+        }
+        
+        std::string paramName = current().value;
+        advance();
+        
+        TokenType paramType = TokenType::UNKNOWN;
+        std::string paramAsType;
+        
+        if (current().type == TokenType::AS) {
+            advance(); // consume AS
+            if (isTypeKeyword(current().type)) {
+                paramType = current().type;
+                paramAsType = current().value;
+                advance();
+            } else if (current().type == TokenType::IDENTIFIER) {
+                paramType = TokenType::IDENTIFIER;
+                paramAsType = current().value;
+                advance();
+            } else {
+                error("Expected type after AS in parameter declaration");
+            }
+        }
+        
+        method->parameters.push_back(paramName);
+        method->parameterTypes.push_back(paramType);
+        method->parameterAsTypes.push_back(paramAsType);
+        method->parameterIsByRef.push_back(isByRef);
+        
+        if (current().type == TokenType::COMMA) {
+            advance(); // consume comma
+        }
+    }
+    
+    consume(TokenType::RPAREN, "Expected ')' after method parameters");
+    
+    // Optional return type: AS ReturnType
+    if (current().type == TokenType::AS) {
+        advance(); // consume AS
+        method->hasReturnType = true;
+        if (isTypeKeyword(current().type)) {
+            method->returnTypeSuffix = current().type;
+            method->returnTypeAsName = current().value;
+            advance();
+        } else if (current().type == TokenType::IDENTIFIER) {
+            method->returnTypeSuffix = TokenType::IDENTIFIER;
+            method->returnTypeAsName = current().value;
+            advance();
+        } else {
+            error("Expected return type after AS in METHOD declaration");
+        }
+    }
+    
+    skipToEndOfLine();
+    
+    // Parse method body until END METHOD
+    while (current().type != TokenType::END_OF_FILE) {
+        if (current().type == TokenType::END_OF_LINE) {
+            advance();
+            continue;
+        }
+        skipOptionalLineNumber();
+        
+        // Check for END METHOD
+        if (current().type == TokenType::END) {
+            auto savedIndex = m_currentIndex;
+            advance(); // consume END
+            if (current().type == TokenType::METHOD) {
+                advance(); // consume METHOD
+                break;
+            } else {
+                // Not END METHOD — parse as a regular END statement
+                m_currentIndex = savedIndex;
+                method->body.push_back(parseStatement());
+                continue;
+            }
+        }
+        
+        method->body.push_back(parseStatement());
+    }
+    
+    return method;
+}
+
+std::unique_ptr<ConstructorStatement> Parser::parseConstructorDeclaration() {
+    auto loc = current().location;
+    advance(); // consume CONSTRUCTOR
+    
+    auto ctor = std::make_unique<ConstructorStatement>();
+    ctor->location = loc;
+    
+    // Parse parameter list
+    consume(TokenType::LPAREN, "Expected '(' after CONSTRUCTOR");
+    
+    while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+        bool isByRef = false;
+        if (current().type == TokenType::BYREF) {
+            isByRef = true;
+            advance();
+        } else if (current().type == TokenType::BYVAL) {
+            advance();
+        }
+        
+        if (current().type != TokenType::IDENTIFIER) {
+            error("Expected parameter name in CONSTRUCTOR declaration");
+            break;
+        }
+        
+        std::string paramName = current().value;
+        advance();
+        
+        TokenType paramType = TokenType::UNKNOWN;
+        std::string paramAsType;
+        
+        if (current().type == TokenType::AS) {
+            advance();
+            if (isTypeKeyword(current().type)) {
+                paramType = current().type;
+                paramAsType = current().value;
+                advance();
+            } else if (current().type == TokenType::IDENTIFIER) {
+                paramType = TokenType::IDENTIFIER;
+                paramAsType = current().value;
+                advance();
+            } else {
+                error("Expected type after AS in parameter declaration");
+            }
+        }
+        
+        ctor->parameters.push_back(paramName);
+        ctor->parameterTypes.push_back(paramType);
+        ctor->parameterAsTypes.push_back(paramAsType);
+        ctor->parameterIsByRef.push_back(isByRef);
+        
+        if (current().type == TokenType::COMMA) {
+            advance();
+        }
+    }
+    
+    consume(TokenType::RPAREN, "Expected ')' after CONSTRUCTOR parameters");
+    skipToEndOfLine();
+    
+    // Parse constructor body until END CONSTRUCTOR
+    // Check if first statement is SUPER(...)
+    bool firstStatement = true;
+    
+    while (current().type != TokenType::END_OF_FILE) {
+        if (current().type == TokenType::END_OF_LINE) {
+            advance();
+            continue;
+        }
+        skipOptionalLineNumber();
+        
+        // Check for END CONSTRUCTOR
+        if (current().type == TokenType::END) {
+            auto savedIndex = m_currentIndex;
+            advance(); // consume END
+            if (current().type == TokenType::CONSTRUCTOR) {
+                advance(); // consume CONSTRUCTOR
+                break;
+            } else {
+                m_currentIndex = savedIndex;
+                ctor->body.push_back(parseStatement());
+                firstStatement = false;
+                continue;
+            }
+        }
+        
+        // Check for SUPER() call (must be first statement)
+        if (current().type == TokenType::SUPER && firstStatement) {
+            advance(); // consume SUPER
+            consume(TokenType::LPAREN, "Expected '(' after SUPER");
+            
+            ctor->hasSuperCall = true;
+            
+            // Parse SUPER arguments
+            while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+                ctor->superArgs.push_back(parseExpression());
+                if (current().type == TokenType::COMMA) {
+                    advance();
+                }
+            }
+            
+            consume(TokenType::RPAREN, "Expected ')' after SUPER arguments");
+            skipToEndOfLine();
+            firstStatement = false;
+            continue;
+        }
+        
+        ctor->body.push_back(parseStatement());
+        firstStatement = false;
+    }
+    
+    return ctor;
+}
+
+std::unique_ptr<DestructorStatement> Parser::parseDestructorDeclaration() {
+    auto loc = current().location;
+    advance(); // consume DESTRUCTOR
+    
+    auto dtor = std::make_unique<DestructorStatement>();
+    dtor->location = loc;
+    
+    // Optional empty parens
+    if (current().type == TokenType::LPAREN) {
+        advance();
+        consume(TokenType::RPAREN, "Expected ')' after DESTRUCTOR(");
+    }
+    
+    skipToEndOfLine();
+    
+    // Parse destructor body until END DESTRUCTOR
+    while (current().type != TokenType::END_OF_FILE) {
+        if (current().type == TokenType::END_OF_LINE) {
+            advance();
+            continue;
+        }
+        skipOptionalLineNumber();
+        
+        // Check for END DESTRUCTOR
+        if (current().type == TokenType::END) {
+            auto savedIndex = m_currentIndex;
+            advance(); // consume END
+            if (current().type == TokenType::DESTRUCTOR) {
+                advance(); // consume DESTRUCTOR
+                break;
+            } else {
+                m_currentIndex = savedIndex;
+                dtor->body.push_back(parseStatement());
+                continue;
+            }
+        }
+        
+        dtor->body.push_back(parseStatement());
+    }
+    
+    return dtor;
+}
+
+StatementPtr Parser::parseDeleteStatement() {
+    auto loc = current().location;
+    advance(); // consume DELETE
+    
+    if (current().type != TokenType::IDENTIFIER) {
+        error("Expected variable name after DELETE");
+        return std::make_unique<RemStatement>("");
+    }
+    
+    std::string varName = current().value;
+    advance();
+    
+    auto stmt = std::make_unique<DeleteStatement>(varName);
+    stmt->location = loc;
+    return stmt;
+}
+
+ExpressionPtr Parser::parseNewExpression() {
+    auto loc = current().location;
+    advance(); // consume NEW
+    
+    if (current().type != TokenType::IDENTIFIER) {
+        error("Expected class name after NEW");
+        return std::make_unique<NumberExpression>(0);
+    }
+    
+    std::string className = current().value;
+    advance();
+    
+    auto expr = std::make_unique<NewExpression>(className);
+    expr->location = loc;
+    
+    // Parse argument list
+    consume(TokenType::LPAREN, "Expected '(' after class name in NEW expression");
+    
+    while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+        expr->arguments.push_back(parseExpression());
+        if (current().type == TokenType::COMMA) {
+            advance();
+        }
+    }
+    
+    consume(TokenType::RPAREN, "Expected ')' after NEW arguments");
+    
+    return expr;
 }
 
 StatementPtr Parser::parseLocalStatement() {
@@ -4759,6 +5356,27 @@ ExpressionPtr Parser::parseComparison() {
                    TokenType::GREATER_THAN, TokenType::GREATER_EQUAL})) {
             auto right = parseAdditive();
             expr = std::make_unique<BinaryExpression>(std::move(expr), op, std::move(right));
+        } else if (current().type == TokenType::IS) {
+            // IS ClassName  or  IS NOTHING  — type-check operator
+            advance(); // consume IS
+
+            if (current().type == TokenType::NOTHING) {
+                // obj IS NOTHING — null pointer check
+                auto loc = current().location;
+                advance(); // consume NOTHING
+                expr = std::make_unique<IsTypeExpression>(std::move(expr), "", true);
+                expr->location = loc;
+            } else if (current().type == TokenType::IDENTIFIER) {
+                // obj IS ClassName — runtime type check
+                std::string className = current().value;
+                auto loc = current().location;
+                advance(); // consume class name
+                expr = std::make_unique<IsTypeExpression>(std::move(expr), className, false);
+                expr->location = loc;
+            } else {
+                error("Expected class name or NOTHING after IS");
+                break;
+            }
         } else {
             break;
         }
@@ -4878,6 +5496,77 @@ ExpressionPtr Parser::parsePrimary() {
         auto expr = std::make_unique<StringExpression>(current().value, current().hasNonASCII);
         advance();
         return expr;
+    }
+
+    // NEW ClassName(args...) — object instantiation
+    if (current().type == TokenType::NEW) {
+        return parseNewExpression();
+    }
+
+    // ME — current object reference inside METHOD/CONSTRUCTOR
+    if (current().type == TokenType::ME) {
+        auto expr = std::make_unique<MeExpression>();
+        expr->location = current().location;
+        advance();
+        return expr;
+    }
+
+    // NOTHING — null object reference literal
+    if (current().type == TokenType::NOTHING) {
+        auto expr = std::make_unique<NothingExpression>();
+        expr->location = current().location;
+        advance();
+        return expr;
+    }
+
+    // SUPER — parent class reference (SUPER.Method() or SUPER() handled via postfix)
+    if (current().type == TokenType::SUPER) {
+        auto loc = current().location;
+        advance(); // consume SUPER
+
+        if (current().type == TokenType::DOT) {
+            // SUPER.MethodName(args...)
+            advance(); // consume DOT
+            if (current().type != TokenType::IDENTIFIER) {
+                error("Expected method name after SUPER.");
+                return std::make_unique<NumberExpression>(0);
+            }
+            std::string methodName = current().value;
+            advance(); // consume method name
+
+            auto expr = std::make_unique<SuperCallExpression>(methodName, false);
+            expr->location = loc;
+
+            // Parse argument list
+            consume(TokenType::LPAREN, "Expected '(' after SUPER." + methodName);
+            while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+                expr->arguments.push_back(parseExpression());
+                if (current().type == TokenType::COMMA) {
+                    advance();
+                }
+            }
+            consume(TokenType::RPAREN, "Expected ')' after SUPER." + methodName + " arguments");
+
+            return expr;
+        } else if (current().type == TokenType::LPAREN) {
+            // SUPER(args...) — parent constructor call (should only be in CONSTRUCTOR body)
+            auto expr = std::make_unique<SuperCallExpression>("", true);
+            expr->location = loc;
+
+            advance(); // consume LPAREN
+            while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+                expr->arguments.push_back(parseExpression());
+                if (current().type == TokenType::COMMA) {
+                    advance();
+                }
+            }
+            consume(TokenType::RPAREN, "Expected ')' after SUPER() arguments");
+
+            return expr;
+        } else {
+            error("Expected '.' or '(' after SUPER");
+            return std::make_unique<NumberExpression>(0);
+        }
     }
 
     // Registry function call (but check if it's a constant first!)

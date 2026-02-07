@@ -624,6 +624,8 @@ main(int ac, char *av[])
 			"memory_mgmt.c",
 			"basic_data.c",
 			"plugin_context_runtime.c",
+			"class_runtime.c",
+			"samm_core.c",
 			NULL
 		};
 		
@@ -776,14 +778,15 @@ main(int ac, char *av[])
 		}
 		
 		/* Build final link command */
+		/* Link with -lpthread for SAMM background cleanup worker thread */
 		if (plugin_libs[0] && qbe_modules_objs[0]) {
-			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s %s -o %s", temp_asm, obj_list, qbe_modules_objs, plugin_libs, output_file);
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s %s -lpthread -o %s", temp_asm, obj_list, qbe_modules_objs, plugin_libs, output_file);
 		} else if (plugin_libs[0]) {
-			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -o %s", temp_asm, obj_list, plugin_libs, output_file);
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -lpthread -o %s", temp_asm, obj_list, plugin_libs, output_file);
 		} else if (qbe_modules_objs[0]) {
-			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -o %s", temp_asm, obj_list, qbe_modules_objs, output_file);
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s %s -lpthread -o %s", temp_asm, obj_list, qbe_modules_objs, output_file);
 		} else {
-			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s -o %s", temp_asm, obj_list, output_file);
+			snprintf(cmd, sizeof(cmd), "cc -O2 %s %s -lpthread -o %s", temp_asm, obj_list, output_file);
 		}
 		
 		int ret = run_command(cmd);

@@ -142,6 +142,18 @@ enum class TokenType {
     TYPE,            // TYPE (user-defined type declaration)
     ENDTYPE,         // END TYPE (end user-defined type)
     
+    // Keywords - CLASS & Object System
+    CLASS,           // CLASS (class declaration)
+    EXTENDS,         // EXTENDS (single inheritance)
+    CONSTRUCTOR,     // CONSTRUCTOR (class constructor)
+    DESTRUCTOR,      // DESTRUCTOR (class destructor)
+    METHOD,          // METHOD (class method)
+    ME,              // ME (current object reference inside METHOD/CONSTRUCTOR)
+    SUPER,           // SUPER (parent class reference)
+    NEW,             // NEW (object instantiation)
+    DELETE,          // DELETE (object destruction)
+    NOTHING,         // NOTHING (null object reference)
+    
     // Keywords - File I/O
     OPEN,            // OPEN (open file)
     CLOSE,           // CLOSE (close file)
@@ -455,6 +467,18 @@ inline const char* tokenTypeToString(TokenType type) {
         case TokenType::READ: return "READ";
         case TokenType::RESTORE: return "RESTORE";
         case TokenType::CONSTANT: return "CONSTANT";
+        
+        // CLASS & Object System
+        case TokenType::CLASS: return "CLASS";
+        case TokenType::EXTENDS: return "EXTENDS";
+        case TokenType::CONSTRUCTOR: return "CONSTRUCTOR";
+        case TokenType::DESTRUCTOR: return "DESTRUCTOR";
+        case TokenType::METHOD: return "METHOD";
+        case TokenType::ME: return "ME";
+        case TokenType::SUPER: return "SUPER";
+        case TokenType::NEW: return "NEW";
+        case TokenType::DELETE: return "DELETE";
+        case TokenType::NOTHING: return "NOTHING";
         
         case TokenType::OPEN: return "OPEN";
         case TokenType::CLOSE: return "CLOSE";

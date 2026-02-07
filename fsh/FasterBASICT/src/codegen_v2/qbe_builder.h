@@ -5,6 +5,7 @@
 #include <sstream>
 #include <vector>
 #include <unordered_set>
+#include <set>
 #include <map>
 
 namespace fbc {
@@ -271,6 +272,13 @@ public:
     void emitStringPool();
     
     /**
+     * Emit any string constants registered after the initial emitStringPool() call.
+     * Call this at the very end of code generation to catch strings that were
+     * registered during emit (e.g. null-check error messages).
+     */
+    void emitLateStringPool();
+    
+    /**
      * Clear the string pool (for testing)
      */
     void clearStringPool();
@@ -319,6 +327,7 @@ private:
     
     // String constant pool
     std::map<std::string, std::string> stringPool_;  // value -> label
+    std::set<std::string> emittedStrings_;            // labels already emitted by emitStringPool()
     int stringCounter_;              // Counter for string labels
     
     // Helper: format a temporary name

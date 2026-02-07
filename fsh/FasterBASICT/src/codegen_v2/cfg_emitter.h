@@ -28,9 +28,34 @@ namespace fbc {
  */
 class CFGEmitter {
 public:
+    // === SAMM Preamble ===
+    
+    /**
+     * Type of SAMM preamble to emit at the start of block 0.
+     * Set before calling emitCFG() so the preamble is emitted inside the
+     * first labeled block (QBE requires all instructions to be inside a
+     * labeled block — emitting them before @block_0 is illegal).
+     */
+    enum class SAMMPreamble {
+        NONE,           // No SAMM preamble (default)
+        MAIN_INIT,      // Emit samm_init()      — for main program
+        SCOPE_ENTER     // Emit samm_enter_scope() — for FUNCTION / SUB
+    };
+
     CFGEmitter(QBEBuilder& builder, TypeManager& typeManager,
                SymbolMapper& symbolMapper, ASTEmitter& astEmitter);
     ~CFGEmitter() = default;
+
+    /**
+     * Set the SAMM preamble to emit at the start of block 0.
+     * Must be called BEFORE emitCFG(). Automatically reset to NONE
+     * after emitCFG() completes.
+     *
+     * @param type   Preamble type (MAIN_INIT or SCOPE_ENTER)
+     * @param label  Human-readable scope label for comments
+     *               (e.g. "FUNCTION", "SUB", "main")
+     */
+    void setSAMMPreamble(SAMMPreamble type, const std::string& label = "");
 
     // === CFG Emission ===
     
@@ -225,6 +250,10 @@ private:
     // Current loop condition (for FOR/WHILE headers)
     std::string currentLoopCondition_;
 
+    // SAMM preamble to emit at the start of block 0
+    SAMMPreamble sammPreamble_ = SAMMPreamble::NONE;
+    std::string  sammPreambleLabel_;
+
     // === NEON Phase 3: SIMD loop vectorization state ===
 
     // Set of block IDs whose normal content emission should be suppressed
@@ -243,6 +272,17 @@ private:
     static const std::vector<FasterBASIC::CFGEdge> emptyEdgeVec_;
 
     // === Helper Methods ===
+
+    /**
+     * Scan all blocks in the CFG for FOR and FOR EACH statements and
+     * pre-allocate their internal stack slots (limit, step, index, etc.)
+     * via ASTEmitter.  Must be called during entry-block (block 0)
+     * emission so that the resulting alloc instructions land in QBE's
+     * start block — a hard requirement of the QBE backend.
+     *
+     * @param cfg The control flow graph to scan
+     */
+    void preAllocateAllLoopSlots(const FasterBASIC::ControlFlowGraph* cfg);
 
     /**
      * Build the out-edge index for the given CFG.

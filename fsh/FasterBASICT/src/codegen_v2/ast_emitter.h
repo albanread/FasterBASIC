@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include "../fasterbasic_ast.h"
 #include "../fasterbasic_semantic.h"
 #include "qbe_builder.h"
@@ -80,6 +81,56 @@ public:
      * @return Temporary holding the result value
      */
     std::string emitExpression(const FasterBASIC::Expression* expr);
+    
+    /**
+     * Set the current CLASS context for METHOD/CONSTRUCTOR/DESTRUCTOR emission.
+     * This allows ME references to resolve to the correct class.
+     * Pass nullptr to clear the context.
+     * @param cls The ClassSymbol for the current class, or nullptr
+     */
+    void setCurrentClassContext(const FasterBASIC::ClassSymbol* cls) { currentClassContext_ = cls; }
+    
+    /**
+     * Get the current CLASS context (may be nullptr if not inside a method)
+     */
+    const FasterBASIC::ClassSymbol* getCurrentClassContext() const { return currentClassContext_; }
+    
+    /**
+     * Set the return type for the current METHOD being emitted.
+     * When non-VOID, emitReturnStatement will emit a direct `ret <value>`
+     * instead of looking up a FUNCTION return variable.
+     * Pass BaseType::VOID to clear (e.g. after method emission).
+     * @param type The METHOD's return BaseType
+     */
+    void setMethodReturnType(FasterBASIC::BaseType type) { methodReturnType_ = type; }
+    
+    /**
+     * Get the current METHOD return type (VOID if not inside a method).
+     */
+    FasterBASIC::BaseType getMethodReturnType() const { return methodReturnType_; }
+    
+    /**
+     * Emit a sequence of statements (used for METHOD/CONSTRUCTOR/DESTRUCTOR bodies).
+     * Iterates through the statement list and emits each one via emitStatement().
+     * @param body Vector of statements to emit
+     */
+    void emitMethodBody(const std::vector<FasterBASIC::StatementPtr>& body);
+    
+    /**
+     * Register a METHOD/CONSTRUCTOR parameter so that loadVariable/getVariableAddress
+     * can resolve it during method body emission.
+     * Parameters are stored in a separate map (methodParamAddresses_ / methodParamTypes_)
+     * and take priority over normal symbol table lookups.
+     * @param name   Raw parameter name (e.g. "n")
+     * @param addr   QBE address of the parameter's stack slot (e.g. "%var_n")
+     * @param type   BaseType of the parameter
+     */
+    void registerMethodParam(const std::string& name, const std::string& addr, FasterBASIC::BaseType type);
+    
+    /**
+     * Clear all registered method parameters (call after emitting a method body).
+     */
+    void clearMethodParams();
     
     /**
      * Emit code for an expression with expected type (auto-converts)
@@ -181,6 +232,66 @@ public:
      * @param stmt FOR statement
      */
     void emitForIncrement(const FasterBASIC::ForStatement* stmt);
+    
+    /**
+     * Emit FOR EACH / FOR...IN loop initialization
+     * Sets up internal index variable (= LBOUND), stores UBOUND limit.
+     * @param stmt ForInStatement
+     */
+    void emitForEachInit(const FasterBASIC::ForInStatement* stmt);
+
+    /**
+     * Pre-allocate stack slots for FOR EACH loop temporaries in the entry block.
+     * Must be called during entry block emission so that alloc instructions
+     * are in the start block (QBE requirement). The init method will then
+     * only emit stores into the pre-allocated slots.
+     * @param stmt ForInStatement
+     */
+    void preAllocateForEachSlots(const FasterBASIC::ForInStatement* stmt);
+
+    /**
+     * Pre-allocate stack slots for regular FOR loop temporaries (limit, step)
+     * in the entry block. Must be called during entry block emission.
+     * @param stmt ForStatement
+     */
+    void preAllocateForSlots(const FasterBASIC::ForStatement* stmt);
+
+    /**
+     * Pre-allocate shared scratch buffers (bounds array for DIM, indices
+     * array for array access) in the entry block.  Must be called once
+     * during entry block emission so that the resulting alloc instructions
+     * are in QBE's start block.
+     */
+    void preAllocateSharedBuffers();
+    
+    /**
+     * Emit FOR EACH / FOR...IN loop condition check
+     * @param stmt ForInStatement
+     * @return Temporary holding condition result (index <= ubound)
+     */
+    std::string emitForEachCondition(const FasterBASIC::ForInStatement* stmt);
+    
+    /**
+     * Emit FOR EACH / FOR...IN loop increment (index += 1)
+     * @param stmt ForInStatement
+     */
+    void emitForEachIncrement(const FasterBASIC::ForInStatement* stmt);
+    
+    /**
+     * Emit FOR EACH / FOR...IN body preamble
+     * Loads arr(index) into the element variable, and optionally sets
+     * the user-visible index variable.
+     * @param stmt ForInStatement
+     */
+    void emitForEachBodyPreamble(const FasterBASIC::ForInStatement* stmt);
+
+    /**
+     * Emit FOR EACH / FOR...IN exit cleanup
+     * For hashmap iteration, frees the keys array allocated during init.
+     * No-op for array iteration.
+     * @param stmt ForInStatement
+     */
+    void emitForEachCleanup(const FasterBASIC::ForInStatement* stmt);
     
     /**
      * Emit END statement
@@ -312,6 +423,29 @@ private:
     // FOR loop temporary variable addresses (limit, step, comparison flag)
     std::unordered_map<std::string, std::string> forLoopTempAddresses_;
     
+    // FOR EACH variable element types — maps raw variable name (e.g. "n")
+    // to the BaseType of the array element so that loadVariable /
+    // storeVariable / getVariableAddress can resolve FOR EACH iteration
+    // variables that are intentionally kept out of the symbol table.
+    std::unordered_map<std::string, FasterBASIC::BaseType> forEachVarTypes_;
+
+    // FOR EACH hashmap tracking — set of primary loop variable names
+    // whose FOR EACH loop iterates over a HASHMAP rather than an array.
+    // Used by emitForEachCondition / BodyPreamble / Increment to choose
+    // the correct lowering (keys-array iteration vs array element access).
+    std::unordered_set<std::string> forEachIsHashmap_;
+
+    // Shared bounds buffer for DIM/REDIM array statements.
+    // Pre-allocated in the entry block so that alloc instructions
+    // are never emitted in non-start blocks (QBE requirement).
+    // Sized for 8 dimensions × 2 bounds × 4 bytes = 64 bytes.
+    std::string sharedBoundsBuffer_;
+
+    // Shared indices buffer for array element access (array_get_address).
+    // Pre-allocated in the entry block.
+    // Sized for 8 dimensions × 4 bytes = 32 bytes.
+    std::string sharedIndicesBuffer_;
+
     // === Array element base address cache ===
     // Workaround for QBE ARM64 miscompilation: when the same array element is
     // accessed multiple times (e.g., Contacts(Idx).Name then Contacts(Idx).Phone),
@@ -322,6 +456,26 @@ private:
     //
     // Key: "arrayName:serializedIndexExpr", Value: QBE stack alloc name holding the address
     std::unordered_map<std::string, std::string> arrayElemBaseCache_;
+
+    // === CLASS context ===
+    // Tracks the current CLASS being emitted (for METHOD/CONSTRUCTOR/DESTRUCTOR bodies).
+    // Used to resolve ME.Field accesses and ME.Method() calls to the correct class.
+    const FasterBASIC::ClassSymbol* currentClassContext_ = nullptr;
+    
+    // === METHOD return type context ===
+    // When emitting a METHOD body that has a return value, this is set to the
+    // method's return BaseType so that emitReturnStatement can emit a direct
+    // `ret <value>` instead of the FUNCTION-style store-and-jump pattern.
+    // Set to VOID (default) when not inside a method body.
+    FasterBASIC::BaseType methodReturnType_ = FasterBASIC::BaseType::VOID;
+    
+    // === METHOD/CONSTRUCTOR parameter maps ===
+    // Registered before emitting a method body so that getVariableAddress / loadVariable
+    // can resolve parameters that are NOT in the semantic symbol table.
+    // Key: raw parameter name (e.g. "n"), Value: QBE stack slot address (e.g. "%var_n")
+    std::unordered_map<std::string, std::string> methodParamAddresses_;
+    // Key: raw parameter name, Value: BaseType of the parameter
+    std::unordered_map<std::string, FasterBASIC::BaseType> methodParamTypes_;
     
     // === Expression Emitters (by type) ===
     
@@ -452,6 +606,28 @@ public:
     void emitSIMDLoop(const FasterBASIC::ForStatement* forStmt,
                       const SIMDLoopInfo& info,
                       const std::string& exitLabel);
+
+    // === Direct control-flow emission for METHOD bodies ===
+    // Method bodies are emitted via emitMethodBody() without CFG infrastructure,
+    // so compound statements (IF/FOR/WHILE) need direct inline emission.
+    
+    /**
+     * Emit an IF/ELSEIF/ELSE block directly (without CFG).
+     * Used inside METHOD/CONSTRUCTOR/DESTRUCTOR bodies.
+     */
+    void emitIfDirect(const FasterBASIC::IfStatement* stmt);
+    
+    /**
+     * Emit a FOR..NEXT loop directly (without CFG).
+     * Used inside METHOD/CONSTRUCTOR/DESTRUCTOR bodies.
+     */
+    void emitForDirect(const FasterBASIC::ForStatement* stmt);
+    
+    /**
+     * Emit a WHILE..WEND loop directly (without CFG).
+     * Used inside METHOD/CONSTRUCTOR/DESTRUCTOR bodies.
+     */
+    void emitWhileDirect(const FasterBASIC::WhileStatement* stmt);
 
 private:
     // === NEON Phase 3 helpers ===

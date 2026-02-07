@@ -131,6 +131,18 @@ void Lexer::initializeKeywords() {
         s_keywords["TYPE"] = TokenType::TYPE;
         s_keywords["ENDTYPE"] = TokenType::ENDTYPE;
     
+        // CLASS & Object System
+        s_keywords["CLASS"] = TokenType::CLASS;
+        s_keywords["EXTENDS"] = TokenType::EXTENDS;
+        s_keywords["CONSTRUCTOR"] = TokenType::CONSTRUCTOR;
+        s_keywords["DESTRUCTOR"] = TokenType::DESTRUCTOR;
+        s_keywords["METHOD"] = TokenType::METHOD;
+        s_keywords["ME"] = TokenType::ME;
+        s_keywords["SUPER"] = TokenType::SUPER;
+        s_keywords["NEW"] = TokenType::NEW;
+        s_keywords["DELETE"] = TokenType::DELETE;
+        s_keywords["NOTHING"] = TokenType::NOTHING;
+    
         // File I/O
         s_keywords["OPEN"] = TokenType::OPEN;
         s_keywords["CLOSE"] = TokenType::CLOSE;

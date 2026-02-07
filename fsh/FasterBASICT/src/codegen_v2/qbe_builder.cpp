@@ -393,9 +393,31 @@ void QBEBuilder::emitStringPool() {
     for (const auto& [value, label] : stringPool_) {
         std::string escaped = escapeString(value);
         il_ << "data $" << label << " = { b \"" << escaped << "\", b 0 }\n";
+        emittedStrings_.insert(label);
     }
     
     emitBlankLine();
+}
+
+void QBEBuilder::emitLateStringPool() {
+    // Emit any strings that were registered after the initial emitStringPool() call.
+    // This catches strings registered during code generation (e.g. null-check error messages).
+    bool emittedAny = false;
+    for (const auto& [value, label] : stringPool_) {
+        if (emittedStrings_.find(label) == emittedStrings_.end()) {
+            if (!emittedAny) {
+                emitBlankLine();
+                emitComment("=== Late-Registered String Constants ===");
+                emittedAny = true;
+            }
+            std::string escaped = escapeString(value);
+            il_ << "data $" << label << " = { b \"" << escaped << "\", b 0 }\n";
+            emittedStrings_.insert(label);
+        }
+    }
+    if (emittedAny) {
+        emitBlankLine();
+    }
 }
 
 void QBEBuilder::clearStringPool() {

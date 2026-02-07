@@ -324,6 +324,16 @@ private:
         SubroutineContext* sub
     );
     
+    // FOR EACH...IN / FOR...IN (array iteration loop)
+    BasicBlock* buildForIn(
+        const ForInStatement& stmt,
+        BasicBlock* incoming,
+        LoopContext* outerLoop,
+        SelectContext* select,
+        TryContext* tryCtx,
+        SubroutineContext* sub
+    );
+    
     // REPEAT...UNTIL (post-test loop)
     BasicBlock* buildRepeat(
         const RepeatStatement& stmt,

@@ -447,4 +447,91 @@ BasicBlock* CFGBuilder::buildDo(
     }
 }
 
+// =============================================================================
+// FOR EACH / FOR...IN Loop Handler (Array iteration loop)
+// =============================================================================
+//
+// FOR EACH loop structure (mirrors FOR but iterates over array elements):
+// incoming -> init [idx = lbound(arr); compute ubound]
+//             init -> header [condition check: idx <= ubound]
+//             header -> body [true]
+//             header -> exit [false]
+//             body -> increment [idx = idx + 1]
+//             increment -> header [back-edge]
+//             return exit
+//
+// The body block preamble loads arr(idx) into the element variable.
+// If an index variable is specified, it is also set to idx.
+//
+BasicBlock* CFGBuilder::buildForIn(
+    const ForInStatement& stmt,
+    BasicBlock* incoming,
+    LoopContext* outerLoop,
+    SelectContext* select,
+    TryContext* tryCtx,
+    SubroutineContext* sub
+) {
+    if (m_debugMode) {
+        std::cout << "[CFG] Building FOR...IN loop" << std::endl;
+    }
+    
+    // 1. Create blocks (same structure as FOR)
+    BasicBlock* initBlock = createBlock("ForIn_Init");
+    BasicBlock* headerBlock = createBlock("ForIn_Header");
+    BasicBlock* bodyBlock = createBlock("ForIn_Body");
+    BasicBlock* incrementBlock = createBlock("ForIn_Increment");
+    BasicBlock* exitBlock = createBlock("ForIn_Exit");
+    
+    headerBlock->isLoopHeader = true;
+    exitBlock->isLoopExit = true;
+    
+    // 2. Wire incoming to init
+    if (!isTerminated(incoming)) {
+        addUnconditionalEdge(incoming->id, initBlock->id);
+    }
+    
+    // 3. Add the ForInStatement to init block (codegen reads it from here)
+    addStatementToBlock(initBlock, &stmt, getLineNumber(&stmt));
+    
+    // 4. Wire init to header
+    addUnconditionalEdge(initBlock->id, headerBlock->id);
+    
+    // 5. Header contains the loop condition check (idx <= ubound)
+    // Wire header to body (true) and exit (false)
+    addConditionalEdge(headerBlock->id, bodyBlock->id, "true");
+    addConditionalEdge(headerBlock->id, exitBlock->id, "false");
+    
+    // 6. Create loop context for EXIT FOR and nested loops
+    LoopContext loopCtx;
+    loopCtx.headerBlockId = headerBlock->id;
+    loopCtx.exitBlockId = exitBlock->id;
+    loopCtx.loopType = "FOR";
+    loopCtx.outerLoop = outerLoop;
+    
+    // 7. Recursively build loop body from AST
+    BasicBlock* bodyExit = buildStatementRange(
+        stmt.body,
+        bodyBlock,
+        &loopCtx,
+        select,
+        tryCtx,
+        sub
+    );
+    
+    // 8. Wire body exit to increment block (if not terminated)
+    if (!isTerminated(bodyExit)) {
+        addUnconditionalEdge(bodyExit->id, incrementBlock->id);
+    }
+    
+    // 9. Wire increment back to header (back-edge)
+    addUnconditionalEdge(incrementBlock->id, headerBlock->id);
+    
+    if (m_debugMode) {
+        std::cout << "[CFG] FOR...IN loop complete, exit block: " << exitBlock->id << std::endl;
+    }
+    
+    // 10. Return exit block for next statement
+    return exitBlock;
+}
+
 } // namespace FasterBASIC

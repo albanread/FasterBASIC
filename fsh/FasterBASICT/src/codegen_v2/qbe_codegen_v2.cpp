@@ -36,6 +36,9 @@ std::string QBECodeGeneratorV2::generateProgram(const Program* program,
         return builder_->getIL();
     }
     
+    // Store program pointer for CLASS emission
+    program_ = program;
+    
     // Reset state
     builder_->reset();
     symbolMapper_->reset();
@@ -61,6 +64,9 @@ std::string QBECodeGeneratorV2::generateProgram(const Program* program,
     // Emit global declarations
     emitGlobalVariables();
     emitGlobalArrays();
+    
+    // Emit CLASS vtables and class name strings (data sections, before functions)
+    emitClassDeclarations(program);
     
     builder_->emitBlankLine();
     builder_->emitComment("=== Main Program ===");
@@ -94,6 +100,10 @@ std::string QBECodeGeneratorV2::generateProgram(const Program* program,
             generateFunction(funcSymbol, cfg.get());
         }
     }
+    
+    // Emit any strings that were registered during code generation
+    // (e.g. null-check error messages, class method/field names)
+    builder_->emitLateStringPool();
     
     return builder_->getIL();
 }
@@ -138,7 +148,11 @@ std::string QBECodeGeneratorV2::generateFunction(const FunctionSymbol* funcSymbo
     // Register SHARED variables from this function
     registerSharedVariables(cfg, symbolMapper_.get());
     
-    // Emit CFG
+    // SAMM: Tell the CFG emitter to emit samm_enter_scope() inside block 0
+    // (after the @block_0 label). QBE requires all instructions to be
+    // inside a labeled block. samm_exit_scope() is emitted by
+    // emitExitBlockTerminator() before each exit `ret`.
+    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "FUNCTION");
     cfgEmitter_->emitCFG(cfg, funcSymbol->name);
     
     // End function
@@ -187,7 +201,11 @@ std::string QBECodeGeneratorV2::generateSub(const FunctionSymbol* subSymbol,
     // Register SHARED variables from this SUB
     registerSharedVariables(cfg, symbolMapper_.get());
     
-    // Emit CFG
+    // SAMM: Tell the CFG emitter to emit samm_enter_scope() inside block 0
+    // (after the @block_0 label). QBE requires all instructions to be
+    // inside a labeled block. samm_exit_scope() is emitted by
+    // emitExitBlockTerminator() before each exit `ret`.
+    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::SCOPE_ENTER, "SUB");
     cfgEmitter_->emitCFG(cfg, subSymbol->name);
     
     // End function
@@ -279,7 +297,12 @@ void QBECodeGeneratorV2::generateMainFunction(const ControlFlowGraph* cfg) {
     // Enter global scope with RAII guard
     FunctionScopeGuard scopeGuard(*symbolMapper_, "main");
     
-    // Emit CFG (local variable allocations will be inserted at entry block)
+    // SAMM: Tell the CFG emitter to emit samm_init() inside block 0
+    // (after the @block_0 label). QBE requires all instructions to be
+    // inside a labeled block, so we cannot emit calls before the first label.
+    // samm_shutdown() is emitted by emitExitBlockTerminator() and
+    // emitEndStatement() before each exit point.
+    cfgEmitter_->setSAMMPreamble(CFGEmitter::SAMMPreamble::MAIN_INIT, "main");
     cfgEmitter_->emitCFG(cfg, "main");
     
     // End main function (scope guard exits function scope automatically)
@@ -637,6 +660,71 @@ void QBECodeGeneratorV2::collectStringsFromStatement(const Statement* stmt) {
             break;
         }
         
+        case ASTNodeType::STMT_CLASS: {
+            const auto* classStmt = static_cast<const ClassStatement*>(stmt);
+            // Collect strings from constructor body and arguments
+            if (classStmt->constructor) {
+                for (const auto& s : classStmt->constructor->body) {
+                    if (s) collectStringsFromStatement(s.get());
+                }
+                // Collect from SUPER() arguments
+                for (const auto& arg : classStmt->constructor->superArgs) {
+                    if (arg) collectStringsFromExpression(arg.get());
+                }
+            }
+            // Collect strings from destructor body
+            if (classStmt->destructor) {
+                for (const auto& s : classStmt->destructor->body) {
+                    if (s) collectStringsFromStatement(s.get());
+                }
+            }
+            // Collect strings from method bodies
+            for (const auto& method : classStmt->methods) {
+                if (method) {
+                    for (const auto& s : method->body) {
+                        if (s) collectStringsFromStatement(s.get());
+                    }
+                }
+            }
+            break;
+        }
+        
+        case ASTNodeType::STMT_DIM: {
+            const auto* dimStmt = static_cast<const DimStatement*>(stmt);
+            for (const auto& arr : dimStmt->arrays) {
+                for (const auto& dim : arr.dimensions) {
+                    if (dim) collectStringsFromExpression(dim.get());
+                }
+                if (arr.initializer) {
+                    collectStringsFromExpression(arr.initializer.get());
+                }
+            }
+            break;
+        }
+        
+        case ASTNodeType::STMT_DELETE: {
+            // DELETE has no expressions to collect from
+            break;
+        }
+        
+        case ASTNodeType::STMT_LOCAL: {
+            const auto* localStmt = static_cast<const LocalStatement*>(stmt);
+            for (const auto& var : localStmt->variables) {
+                if (var.initialValue) {
+                    collectStringsFromExpression(var.initialValue.get());
+                }
+            }
+            break;
+        }
+        
+        case ASTNodeType::STMT_RETURN: {
+            const auto* retStmt = static_cast<const ReturnStatement*>(stmt);
+            if (retStmt->returnValue) {
+                collectStringsFromExpression(retStmt->returnValue.get());
+            }
+            break;
+        }
+        
         // Add more statement types as needed
         default:
             break;
@@ -710,6 +798,28 @@ void QBECodeGeneratorV2::collectStringsFromExpression(const Expression* expr) {
             for (const auto& arg : methodCall->arguments) {
                 if (arg) collectStringsFromExpression(arg.get());
             }
+            break;
+        }
+        
+        case ASTNodeType::EXPR_NEW: {
+            const auto* newExpr = static_cast<const NewExpression*>(expr);
+            for (const auto& arg : newExpr->arguments) {
+                if (arg) collectStringsFromExpression(arg.get());
+            }
+            break;
+        }
+        
+        case ASTNodeType::EXPR_SUPER_CALL: {
+            const auto* superCall = static_cast<const SuperCallExpression*>(expr);
+            for (const auto& arg : superCall->arguments) {
+                if (arg) collectStringsFromExpression(arg.get());
+            }
+            break;
+        }
+        
+        case ASTNodeType::EXPR_IS_TYPE: {
+            const auto* isExpr = static_cast<const IsTypeExpression*>(expr);
+            if (isExpr->object) collectStringsFromExpression(isExpr->object.get());
             break;
         }
         
@@ -842,6 +952,391 @@ void QBECodeGeneratorV2::registerSharedVariables(const ControlFlowGraph* cfg,
             }
         }
     }
+}
+
+// ==========================================================================
+// CLASS System Emission
+// ==========================================================================
+
+std::string QBECodeGeneratorV2::getQBETypeForDescriptor(const TypeDescriptor& td) {
+    switch (td.baseType) {
+        case BaseType::INTEGER:
+        case BaseType::UINTEGER:
+        case BaseType::BYTE:
+        case BaseType::UBYTE:
+        case BaseType::SHORT:
+        case BaseType::USHORT:
+            return "w";
+        case BaseType::SINGLE:
+            return "s";
+        case BaseType::DOUBLE:
+            return "d";
+        default:
+            return "l";  // pointers, strings, long, class instances
+    }
+}
+
+std::string QBECodeGeneratorV2::getQBEParamType(const TypeDescriptor& td) {
+    return getQBETypeForDescriptor(td);
+}
+
+void QBECodeGeneratorV2::emitClassDeclarations(const Program* program) {
+    if (!program) return;
+    
+    const auto& symbolTable = semantic_.getSymbolTable();
+    if (symbolTable.classes.empty()) return;
+    
+    builder_->emitBlankLine();
+    builder_->emitComment("=== CLASS System: VTables & Methods ===");
+    builder_->emitBlankLine();
+    
+    // Collect all ClassStatement AST nodes from the program
+    // We need these for method bodies
+    std::vector<const ClassStatement*> classStmts;
+    for (const auto& line : program->lines) {
+        for (const auto& stmt : line->statements) {
+            if (stmt->getType() == ASTNodeType::STMT_CLASS) {
+                classStmts.push_back(static_cast<const ClassStatement*>(stmt.get()));
+            }
+        }
+    }
+    
+    // Phase 1: Emit class name string constants
+    for (const auto& [upperName, cls] : symbolTable.classes) {
+        emitClassNameString(cls);
+    }
+    
+    builder_->emitBlankLine();
+    
+    // Phase 2: Emit vtable data sections
+    for (const auto& [upperName, cls] : symbolTable.classes) {
+        emitClassVtable(cls);
+    }
+    
+    builder_->emitBlankLine();
+    
+    // Phase 3: Emit method/constructor/destructor functions
+    // We need to match ClassSymbols to ClassStatement AST nodes by name
+    for (const auto& classStmt : classStmts) {
+        std::string upperName = classStmt->className;
+        std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
+        
+        const ClassSymbol* cls = symbolTable.lookupClass(upperName);
+        if (!cls) continue;
+        
+        // Emit constructor
+        if (classStmt->constructor && cls->hasConstructor) {
+            emitClassConstructor(*classStmt, *classStmt->constructor, *cls);
+        }
+        
+        // Emit destructor
+        if (classStmt->destructor && cls->hasDestructor) {
+            emitClassDestructor(*classStmt, *classStmt->destructor, *cls);
+        }
+        
+        // Emit methods
+        for (const auto& method : classStmt->methods) {
+            if (method) {
+                emitClassMethod(*classStmt, *method, *cls);
+            }
+        }
+    }
+}
+
+void QBECodeGeneratorV2::emitClassNameString(const ClassSymbol& cls) {
+    // data $classname_Foo = { b "Foo", b 0 }
+    builder_->emitComment("Class name: " + cls.name);
+    std::string label = "$classname_" + cls.name;
+    
+    // Build the data content manually since emitStringConstant may escape differently
+    std::ostringstream oss;
+    oss << "data " << label << " = { b \"" << cls.name << "\", b 0 }\n";
+    builder_->emitRaw(oss.str());
+}
+
+void QBECodeGeneratorV2::emitClassVtable(const ClassSymbol& cls) {
+    // VTable layout:
+    //   [0]  class_id           (l, int64)
+    //   [8]  parent_vtable ptr  (l, 0 if root)
+    //   [16] class_name ptr     (l, ptr to $classname_X)
+    //   [24] destructor ptr     (l, 0 if none)
+    //   [32+] method pointers   (l each, in vtable slot order)
+    
+    builder_->emitComment("VTable for " + cls.name + " (class_id=" + std::to_string(cls.classId) + ", " + std::to_string(cls.methods.size()) + " methods)");
+    
+    std::ostringstream oss;
+    oss << "data $vtable_" << cls.name << " = {\n";
+    
+    // [0] class_id
+    oss << "    l " << cls.classId << ",    # class_id\n";
+    
+    // [8] parent_vtable pointer
+    if (cls.parentClass) {
+        oss << "    l $vtable_" << cls.parentClass->name << ",    # parent_vtable\n";
+    } else {
+        oss << "    l 0,    # parent_vtable (root class)\n";
+    }
+    
+    // [16] class_name pointer
+    oss << "    l $classname_" << cls.name << ",    # class_name\n";
+    
+    // [24] destructor pointer
+    if (cls.hasDestructor) {
+        oss << "    l $" << cls.destructorMangledName << ",    # destructor\n";
+    } else {
+        oss << "    l 0,    # destructor (none)\n";
+    }
+    
+    // [32+] method pointers in vtable slot order
+    // Methods are already stored in slot order in cls.methods
+    for (size_t i = 0; i < cls.methods.size(); i++) {
+        const auto& mi = cls.methods[i];
+        oss << "    l $" << mi.mangledName;
+        if (i + 1 < cls.methods.size()) oss << ",";
+        oss << "    # slot " << mi.vtableSlot << ": " << mi.name;
+        if (mi.isOverride) oss << " (override)";
+        if (mi.originClass != cls.name) oss << " [from " << mi.originClass << "]";
+        oss << "\n";
+    }
+    
+    oss << "}\n";
+    builder_->emitRaw(oss.str());
+}
+
+void QBECodeGeneratorV2::emitClassMethod(const ClassStatement& classStmt,
+                                          const MethodStatement& method,
+                                          const ClassSymbol& cls) {
+    // Find the method info from the ClassSymbol
+    const auto* methodInfo = cls.findMethod(method.methodName);
+    if (!methodInfo) {
+        builder_->emitComment("ERROR: method '" + method.methodName + "' not found in ClassSymbol '" + cls.name + "'");
+        return;
+    }
+    
+    builder_->emitBlankLine();
+    builder_->emitComment("METHOD " + cls.name + "." + method.methodName);
+    
+    // Determine return type
+    std::string returnType = "";
+    if (methodInfo->returnType.baseType != BaseType::VOID) {
+        returnType = getQBETypeForDescriptor(methodInfo->returnType);
+    }
+    
+    // Build parameter list: first param is always l %me
+    std::string params = "l %me";
+    for (size_t i = 0; i < method.parameters.size(); i++) {
+        std::string paramType = "l";
+        if (i < methodInfo->parameterTypes.size()) {
+            paramType = getQBEParamType(methodInfo->parameterTypes[i]);
+        }
+        std::string paramName = "%param_" + method.parameters[i];
+        params += ", " + paramType + " " + paramName;
+    }
+    
+    // Emit function header
+    builder_->emitFunctionStart(methodInfo->mangledName, returnType, params);
+    builder_->emitLabel("start");
+    
+    // SAMM: Enter METHOD scope — local allocations (DIM inside method)
+    // are tracked and cleaned up when the method returns.
+    builder_->emitComment("SAMM: Enter METHOD scope");
+    builder_->emitCall("", "", "samm_enter_scope", "");
+    
+    // Allocate local variables for parameters so they can be addressed
+    for (size_t i = 0; i < method.parameters.size(); i++) {
+        std::string paramType = "l";
+        BaseType paramBaseType = BaseType::LONG;
+        if (i < methodInfo->parameterTypes.size()) {
+            paramType = getQBEParamType(methodInfo->parameterTypes[i]);
+            paramBaseType = methodInfo->parameterTypes[i].baseType;
+        }
+        std::string varName = "%var_" + method.parameters[i];
+        int size = (paramType == "w" || paramType == "s") ? 4 : 8;
+        builder_->emitRaw("    " + varName + " =l alloc8 " + std::to_string(size) + "\n");
+        std::string storeOp = (paramType == "w") ? "storew" : 
+                              (paramType == "s") ? "stores" : 
+                              (paramType == "d") ? "stored" : "storel";
+        builder_->emitRaw("    " + storeOp + " %param_" + method.parameters[i] + ", " + varName + "\n");
+        
+        // Register parameter so loadVariable/getVariableAddress can resolve it
+        astEmitter_->registerMethodParam(method.parameters[i], varName, paramBaseType);
+    }
+    
+    // Set current class context for ME resolution
+    astEmitter_->setCurrentClassContext(&cls);
+    
+    // Set method return type so RETURN statements emit direct `ret`
+    astEmitter_->setMethodReturnType(methodInfo->returnType.baseType);
+    
+    // Emit method body statements
+    astEmitter_->emitMethodBody(method.body);
+    
+    // Clear class context, method return type, and method params
+    astEmitter_->setMethodReturnType(FasterBASIC::BaseType::VOID);
+    astEmitter_->setCurrentClassContext(nullptr);
+    astEmitter_->clearMethodParams();
+    
+    // Emit default return in a separate fallback label so that if the body
+    // already emitted a `ret`, QBE won't see two `ret` in the same block.
+    // Note: the old samm_exit_scope() call that was here between the body
+    // and the fallback label was dead code — the method body's last RETURN
+    // already emitted a `ret`, making anything after it unreachable.
+    int fallbackId = builder_->getNextLabelId();
+    builder_->emitLabel("method_fallback_" + std::to_string(fallbackId));
+    
+    // SAMM: Exit METHOD scope on the fallback (no explicit RETURN) path.
+    // Explicit RETURN paths emit their own samm_exit_scope() in
+    // ASTEmitter::emitReturnStatement().
+    builder_->emitComment("SAMM: Exit METHOD scope (fallback path)");
+    builder_->emitCall("", "", "samm_exit_scope", "");
+    
+    if (methodInfo->returnType.baseType == BaseType::VOID) {
+        builder_->emitReturn();
+    } else {
+        // Return default value for the type
+        std::string retType = getQBETypeForDescriptor(methodInfo->returnType);
+        if (retType == "w") {
+            builder_->emitReturn("0");
+        } else if (retType == "s") {
+            builder_->emitReturn("s_0.0");
+        } else if (retType == "d") {
+            builder_->emitReturn("d_0.0");
+        } else {
+            builder_->emitReturn("0");
+        }
+    }
+    
+    builder_->emitFunctionEnd();
+}
+
+void QBECodeGeneratorV2::emitClassConstructor(const ClassStatement& classStmt,
+                                               const ConstructorStatement& ctor,
+                                               const ClassSymbol& cls) {
+    builder_->emitBlankLine();
+    builder_->emitComment("CONSTRUCTOR " + cls.name);
+    
+    // Build parameter list: first param is always l %me
+    std::string params = "l %me";
+    for (size_t i = 0; i < ctor.parameters.size(); i++) {
+        std::string paramType = "l";
+        if (i < cls.constructorParamTypes.size()) {
+            paramType = getQBEParamType(cls.constructorParamTypes[i]);
+        }
+        std::string paramName = "%param_" + ctor.parameters[i];
+        params += ", " + paramType + " " + paramName;
+    }
+    
+    // Emit function header (constructor returns void)
+    builder_->emitFunctionStart(cls.constructorMangledName, "", params);
+    builder_->emitLabel("start");
+    
+    // SAMM: Enter CONSTRUCTOR scope — local allocations within the
+    // constructor body are tracked and cleaned up when it returns.
+    builder_->emitComment("SAMM: Enter CONSTRUCTOR scope");
+    builder_->emitCall("", "", "samm_enter_scope", "");
+    
+    // Allocate local variables for parameters
+    for (size_t i = 0; i < ctor.parameters.size(); i++) {
+        std::string paramType = "l";
+        BaseType paramBaseType = BaseType::LONG;
+        if (i < cls.constructorParamTypes.size()) {
+            paramType = getQBEParamType(cls.constructorParamTypes[i]);
+            paramBaseType = cls.constructorParamTypes[i].baseType;
+        }
+        std::string varName = "%var_" + ctor.parameters[i];
+        int size = (paramType == "w" || paramType == "s") ? 4 : 8;
+        builder_->emitRaw("    " + varName + " =l alloc8 " + std::to_string(size) + "\n");
+        std::string storeOp = (paramType == "w") ? "storew" : 
+                              (paramType == "s") ? "stores" : 
+                              (paramType == "d") ? "stored" : "storel";
+        builder_->emitRaw("    " + storeOp + " %param_" + ctor.parameters[i] + ", " + varName + "\n");
+        
+        // Register parameter so loadVariable/getVariableAddress can resolve it
+        astEmitter_->registerMethodParam(ctor.parameters[i], varName, paramBaseType);
+    }
+    
+    // If there's an explicit SUPER() call, emit it first
+    if (ctor.hasSuperCall && cls.parentClass && cls.parentClass->hasConstructor) {
+        builder_->emitComment("SUPER() call to parent constructor");
+        std::string superArgs = "l %me";
+        for (size_t i = 0; i < ctor.superArgs.size(); i++) {
+            std::string argTemp = astEmitter_->emitExpression(ctor.superArgs[i].get());
+            std::string argType = "l";
+            if (i < cls.parentClass->constructorParamTypes.size()) {
+                argType = getQBEParamType(cls.parentClass->constructorParamTypes[i]);
+            }
+            superArgs += ", " + argType + " " + argTemp;
+        }
+        builder_->emitRaw("    call $" + cls.parentClass->constructorMangledName + "(" + superArgs + ")\n");
+    } else if (!ctor.hasSuperCall && cls.parentClass && cls.parentClass->hasConstructor
+               && cls.parentClass->constructorParamTypes.empty()) {
+        // Implicit SUPER() call: parent has a zero-arg constructor and child
+        // did not write an explicit SUPER(...) — chain automatically.
+        builder_->emitComment("Implicit SUPER() call to parent zero-arg constructor");
+        builder_->emitRaw("    call $" + cls.parentClass->constructorMangledName + "(l %me)\n");
+    }
+    
+    // Set current class context for ME resolution
+    astEmitter_->setCurrentClassContext(&cls);
+    
+    // Emit constructor body statements
+    astEmitter_->emitMethodBody(ctor.body);
+    
+    // Clear class context and method params
+    astEmitter_->setCurrentClassContext(nullptr);
+    astEmitter_->clearMethodParams();
+    
+    // SAMM: Exit CONSTRUCTOR scope before return.
+    builder_->emitComment("SAMM: Exit CONSTRUCTOR scope");
+    builder_->emitCall("", "", "samm_exit_scope", "");
+    
+    // Constructor always returns void
+    builder_->emitReturn();
+    builder_->emitFunctionEnd();
+}
+
+void QBECodeGeneratorV2::emitClassDestructor(const ClassStatement& classStmt,
+                                              const DestructorStatement& dtor,
+                                              const ClassSymbol& cls) {
+    builder_->emitBlankLine();
+    builder_->emitComment("DESTRUCTOR " + cls.name);
+    
+    // Destructor signature: takes only l %me, returns void
+    builder_->emitFunctionStart(cls.destructorMangledName, "", "l %me");
+    builder_->emitLabel("start");
+    
+    // SAMM: Enter DESTRUCTOR scope so that any temporary allocations made
+    // during destructor body execution (e.g. string concatenations, helper
+    // objects) are tracked and automatically cleaned up when the destructor
+    // returns.  This is especially important when destructors are invoked
+    // on the SAMM background cleanup worker thread, which has no ambient
+    // scope of its own.
+    builder_->emitComment("SAMM: Enter DESTRUCTOR scope");
+    builder_->emitCall("", "", "samm_enter_scope", "");
+    
+    // Set current class context for ME resolution
+    astEmitter_->setCurrentClassContext(&cls);
+    
+    // Emit destructor body statements
+    astEmitter_->emitMethodBody(dtor.body);
+    
+    // Clear class context and method params
+    astEmitter_->setCurrentClassContext(nullptr);
+    astEmitter_->clearMethodParams();
+    
+    // Chain to parent destructor if parent has one
+    if (cls.parentClass && cls.parentClass->hasDestructor) {
+        builder_->emitComment("Chain to parent destructor: " + cls.parentClass->name);
+        builder_->emitRaw("    call $" + cls.parentClass->destructorMangledName + "(l %me)\n");
+    }
+    
+    // SAMM: Exit DESTRUCTOR scope — any temporaries allocated during
+    // the destructor body are queued for cleanup.
+    builder_->emitComment("SAMM: Exit DESTRUCTOR scope");
+    builder_->emitCall("", "", "samm_exit_scope", "");
+    
+    builder_->emitReturn();
+    builder_->emitFunctionEnd();
 }
 
 } // namespace fbc

@@ -534,21 +534,27 @@ int main(int argc, char** argv) {
             }
             std::string clangCmd;
             if (useArchive) {
-                clangCmd = "clang " + asmFile + " " + runtimeLib + " -o " + outputFile;
+                clangCmd = "clang " + asmFile + " " + runtimeLib + " -lpthread -o " + outputFile;
             } else {
                 // Compile runtime source files directly
                 std::string runtimeFiles = 
                     runtimeSrc + "/array_ops.c " +
+                    runtimeSrc + "/array_descriptor_runtime.c " +
                     runtimeSrc + "/basic_data.c " +
                     runtimeSrc + "/basic_runtime.c " +
+                    runtimeSrc + "/class_runtime.c " +
                     runtimeSrc + "/conversion_ops.c " +
                     runtimeSrc + "/io_ops.c " +
                     runtimeSrc + "/io_ops_format.c " +
                     runtimeSrc + "/math_ops.c " +
                     runtimeSrc + "/memory_mgmt.c " +
+                    runtimeSrc + "/plugin_context_runtime.c " +
+                    runtimeSrc + "/samm_core.c " +
                     runtimeSrc + "/string_ops.c " +
+                    runtimeSrc + "/string_pool.c " +
                     runtimeSrc + "/string_utf32.c";
-                clangCmd = "clang " + asmFile + " " + runtimeFiles + " -I" + runtimeSrc + " -o " + outputFile;
+                // Link with -lpthread for SAMM background cleanup worker thread
+                clangCmd = "clang " + asmFile + " " + runtimeFiles + " -I" + runtimeSrc + " -lpthread -o " + outputFile;
             }
             int clangResult = executeCommand(clangCmd, verbose);
             if (clangResult != 0) {
