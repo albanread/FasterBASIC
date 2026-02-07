@@ -5,11 +5,7 @@
       "camelCase": false,
       "scope": "source.fasterbasic",
       "path": ".",
-      "file-types": [
-        "bas",
-        "bi",
-        "bm"
-      ],
+      "file-types": ["bas", "bi", "bm"],
       "highlights": "../../languages/fasterbasic/highlights.scm",
       "injection-regex": "^fasterbasic$"
     }
@@ -24,7 +20,7 @@
       }
     ],
     "links": {
-      "repository": "https://github.com/nicholasgasior/compact_repo"
+      "repository": "https://github.com/albanread/FasterBASIC"
     }
   },
   "bindings": {
