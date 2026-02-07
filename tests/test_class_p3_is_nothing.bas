@@ -71,10 +71,10 @@ DIM isNothing1 AS INTEGER
 isNothing1 = obj IS NOTHING
 PRINT "obj IS NOTHING: "; isNothing1
 
-DIM empty AS Shape
+DIM emptyObj AS Shape
 DIM isNothing2 AS INTEGER
-isNothing2 = empty IS NOTHING
-PRINT "empty IS NOTHING: "; isNothing2
+isNothing2 = emptyObj IS NOTHING
+PRINT "emptyObj IS NOTHING: "; isNothing2
 PRINT ""
 
 ' --- Test 5: NOTHING assignment ---
@@ -120,7 +120,7 @@ END
 '
 ' === IS NOTHING ===
 ' obj IS NOTHING: 0
-' empty IS NOTHING: 1
+' emptyObj IS NOTHING: 1
 '
 ' === NOTHING Assignment ===
 ' Before: Point

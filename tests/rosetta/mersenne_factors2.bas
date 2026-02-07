@@ -17,141 +17,149 @@ PRINT "Finding factors of 2^929 - 1 (M929)"
 PRINT ""
 
 ' Target exponent
-LET P& = 929
+DIM P AS LONG
+P = 929
 
 ' Main search loop
-LET k& = 1
-LET found% = 0
-LET maxk& = 1000000
+DIM k AS LONG
+DIM found AS INTEGER
+DIM maxk AS LONG
+k = 1
+found = 0
+maxk = 1000000
 
 PRINT "Searching for factors of the form q = 2kP + 1..."
 PRINT ""
 
-WHILE k& <= maxk& AND found% = 0
+WHILE k <= maxk AND found = 0
     ' Calculate potential factor q = 2kP + 1
-    LET q& = 2 * k& * P& + 1
+    DIM q AS LONG
+    q = 2 * k * P + 1
 
     ' Check if q is 1 or 7 (mod 8)
-    LET mod8& = q& MOD 8
-    LET okmod8% = 0
-    IF mod8& = 1 THEN
-        okmod8% = 1
+    DIM mod8 AS LONG
+    DIM okmod8 AS INTEGER
+    mod8 = q MOD 8
+    okmod8 = 0
+    IF mod8 = 1 THEN
+        okmod8 = 1
     END IF
-    IF mod8& = 7 THEN
-        okmod8% = 1
+    IF mod8 = 7 THEN
+        okmod8 = 1
     END IF
 
     ' If passes mod 8 test, check if prime and test as factor
-    IF okmod8% = 1 THEN
+    IF okmod8 = 1 THEN
         ' Check primality
-        IF IsPrime&(q&) = 1 THEN
+        IF IsPrime(q) = 1 THEN
             ' Test if it's a factor using modular exponentiation
-            IF ModularPower&(2, P&, q&) = 1 THEN
+            IF ModularPower(2, P, q) = 1 THEN
                 ' Found a factor!
                 PRINT ""
                 PRINT "======================================"
                 PRINT "FOUND FACTOR!"
                 PRINT "======================================"
-                PRINT "Factor: "; q&
-                PRINT "k = "; k&
-                PRINT "2^"; P&; " mod "; q&; " = 1"
+                PRINT "Factor: "; q
+                PRINT "k = "; k
+                PRINT "2^"; P; " mod "; q; " = 1"
                 PRINT ""
-                PRINT "Therefore "; q&; " is a factor of M"; P&
+                PRINT "Therefore "; q; " is a factor of M"; P
                 PRINT "======================================"
-                found% = 1
+                found = 1
             END IF
         END IF
     END IF
 
     ' Progress report
-    LET checkprog& = k& MOD 5000
-    IF checkprog& = 0 THEN
-        PRINT "Tested k = "; k&; " (q = "; q&; ")..."
+    DIM checkprog AS LONG
+    checkprog = k MOD 5000
+    IF checkprog = 0 THEN
+        PRINT "Tested k = "; k; " (q = "; q; ")..."
     END IF
 
-    LET k& = k& + 1
+    k = k + 1
 WEND
 
-IF found% = 0 THEN
+IF found = 0 THEN
     PRINT ""
-    PRINT "No factor found in range k = 1 to "; maxk&
+    PRINT "No factor found in range k = 1 to "; maxk
 END IF
 
 END
 
 ' ============================================================================
-' Function: IsPrime&
+' Function: IsPrime
 ' Check if n is prime
-' Parameters: n& - number to test
+' Parameters: n - number to test
 ' Returns: 1 if prime, 0 otherwise
 ' ============================================================================
-FUNCTION IsPrime&(n AS LONG) AS LONG
-    LOCAL tmod2&
-    LOCAL sqrtval#
-    LOCAL sqrtmax&
-    LOCAL divisor&
-    LOCAL divmod&
+FUNCTION IsPrime(n AS LONG) AS LONG
+    DIM tmod2 AS LONG
+    DIM sqrtval AS DOUBLE
+    DIM sqrtmax AS LONG
+    DIM divisor AS LONG
+    DIM divmod AS LONG
 
     IF n < 2 THEN
-        RETURN 0&
+        RETURN 0
     END IF
 
     IF n = 2 THEN
-        RETURN 1&
+        RETURN 1
     END IF
 
     IF n = 3 THEN
-        RETURN 1&
+        RETURN 1
     END IF
 
-    LET tmod2& = n MOD 2
-    IF tmod2& = 0 THEN
-        RETURN 0&
+    tmod2 = n MOD 2
+    IF tmod2 = 0 THEN
+        RETURN 0
     END IF
 
     ' Trial division up to square root
-    LET sqrtval# = SQR(n)
-    LET sqrtmax& = INT(sqrtval#) + 1
-    LET divisor& = 3
+    sqrtval = SQR(n)
+    sqrtmax = INT(sqrtval) + 1
+    divisor = 3
 
-    WHILE divisor& <= sqrtmax&
-        LET divmod& = n MOD divisor&
-        IF divmod& = 0 THEN
-            RETURN 0&
+    WHILE divisor <= sqrtmax
+        divmod = n MOD divisor
+        IF divmod = 0 THEN
+            RETURN 0
         END IF
-        LET divisor& = divisor& + 2
+        divisor = divisor + 2
     WEND
 
-    RETURN 1&
+    RETURN 1
 END FUNCTION
 
 ' ============================================================================
-' Function: ModularPower&
+' Function: ModularPower
 ' Compute base^exponent mod modulus using binary exponentiation
 ' Parameters:
-'   basenum& - base number
-'   exponent& - exponent
-'   m& - modulus for result
+'   basenum - base number
+'   exponent - exponent
+'   m - modulus for result
 ' Returns: basenum^exponent mod m
 ' ============================================================================
-FUNCTION ModularPower&(basenum AS LONG, exponent AS LONG, m AS LONG) AS LONG
-    LOCAL res&
-    LOCAL b&
-    LOCAL e&
-    LOCAL bit&
+FUNCTION ModularPower(basenum AS LONG, exponent AS LONG, m AS LONG) AS LONG
+    DIM res AS LONG
+    DIM b AS LONG
+    DIM e AS LONG
+    DIM bit AS LONG
 
-    LET res& = 1
-    LET b& = basenum MOD m
-    LET e& = exponent
+    res = 1
+    b = basenum MOD m
+    e = exponent
 
-    WHILE e& > 0
-        LET bit& = e& MOD 2
-        IF bit& = 1 THEN
-            LET res& = (res& * b&) MOD m
+    WHILE e > 0
+        bit = e MOD 2
+        IF bit = 1 THEN
+            res = (res * b) MOD m
         END IF
-        LET b& = (b& * b&) MOD m
-        LET e& = e& \ 2
+        b = (b * b) MOD m
+        e = e \ 2
     WEND
 
-    RETURN res&
+    RETURN res
 END FUNCTION

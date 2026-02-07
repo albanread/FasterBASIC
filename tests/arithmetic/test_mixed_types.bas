@@ -73,14 +73,20 @@
 730 IF Z# < 22.4 OR Z# > 22.6 THEN PRINT "ERROR: Complex mixed expression failed" : END
 740 PRINT "PASS: Complex expression = 22.5"
 750 PRINT ""
-760 REM Test 10: Division with type preservation
+760 REM Test 10: / always does float division, even with integer operands
 770 LET AA% = 7
 780 LET BB% = 2
 790 LET CC# = AA% / BB%
 800 PRINT "7% / 2% in DOUBLE# = "; CC#
 810 IF CC# < 3.4 OR CC# > 3.6 THEN PRINT "ERROR: INT/INT to DOUBLE failed" : END
 820 PRINT "PASS: INT/INT to DOUBLE = 3.5"
-830 PRINT ""
+822 PRINT ""
+824 REM Test 10b: \ does integer division
+826 LET DD2% = 7 \ 2
+828 PRINT "7 \ 2 = "; DD2%
+830 IF DD2% <> 3 THEN PRINT "ERROR: INT\INT integer division failed" : END
+832 PRINT "PASS: 7 \ 2 = 3"
+834 PRINT ""
 840 REM Test 11: Negative numbers
 850 LET DD% = -5
 860 LET EE# = 3.5

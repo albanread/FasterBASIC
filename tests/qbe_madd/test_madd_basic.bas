@@ -60,29 +60,29 @@ END FUNCTION
 ' Main test driver
 PRINT "Testing MADD/FMADD fusion..."
 
-LOCAL i1 AS INTEGER
-LOCAL i2 AS INTEGER
+DIM i1 AS INTEGER
+DIM i2 AS INTEGER
 i1 = test_madd_int(10, 3, 4)
 PRINT "test_madd_int(10, 3, 4) = "; i1
 IF i1 <> 22 THEN
     PRINT "FAILED: Expected 22"
 END IF
 
-LOCAL l1 AS LONG
+DIM l1 AS LONG
 l1 = test_madd_long(100, 5, 6)
 PRINT "test_madd_long(100, 5, 6) = "; l1
 IF l1 <> 130 THEN
     PRINT "FAILED: Expected 130"
 END IF
 
-LOCAL f1 AS SINGLE
+DIM f1 AS SINGLE
 f1 = test_fmadd_single(1.5, 2.0, 3.0)
 PRINT "test_fmadd_single(1.5, 2.0, 3.0) = "; f1
 IF ABS(f1 - 7.5) > 0.001 THEN
     PRINT "FAILED: Expected 7.5"
 END IF
 
-LOCAL d1 AS DOUBLE
+DIM d1 AS DOUBLE
 d1 = test_fmadd_double(10.5, 2.5, 4.0)
 PRINT "test_fmadd_double(10.5, 2.5, 4.0) = "; d1
 IF ABS(d1 - 20.5) > 0.0001 THEN
@@ -95,21 +95,21 @@ IF i2 <> 8 THEN
     PRINT "FAILED: Expected 8"
 END IF
 
-LOCAL d2 AS DOUBLE
+DIM d2 AS DOUBLE
 d2 = test_fmsub_double(20.0, 2.5, 4.0)
 PRINT "test_fmsub_double(20.0, 2.5, 4.0) = "; d2
 IF ABS(d2 - 10.0) > 0.0001 THEN
     PRINT "FAILED: Expected 10.0"
 END IF
 
-LOCAL d3 AS DOUBLE
+DIM d3 AS DOUBLE
 d3 = test_matrix_element(2.0, 3.0, 4.0, 5.0)
 PRINT "test_matrix_element(2.0, 3.0, 4.0, 5.0) = "; d3
 IF ABS(d3 - 23.0) > 0.0001 THEN
     PRINT "FAILED: Expected 23.0"
 END IF
 
-LOCAL d4 AS DOUBLE
+DIM d4 AS DOUBLE
 d4 = test_polynomial(2.0, 1.0, 2.0, 3.0, 4.0)
 PRINT "test_polynomial(2.0, 1.0, 2.0, 3.0, 4.0) = "; d4
 ' 1 + 2*2 + 3*4 + 4*8 = 1 + 4 + 12 + 32 = 49

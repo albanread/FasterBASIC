@@ -80,11 +80,11 @@
 
 1100 REM === Test 5: Empty hashmap nested in loop ===
 1110 PRINT "=== Test 5: Empty hashmap in loop ==="
-1120 DIM empty AS HASHMAP
+1120 DIM emptyMap AS HASHMAP
 1130 DIM emptyCount AS INTEGER
 1140 emptyCount = 0
 1150 FOR m = 1 TO 5
-1160   FOR EACH em IN empty
+1160   FOR EACH em IN emptyMap
 1170     emptyCount = emptyCount + 1
 1180   NEXT
 1190 NEXT m

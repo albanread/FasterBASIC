@@ -1383,14 +1383,14 @@ DIM myWords AS LIST OF STRING = MakeNums()   ' COMPILE ERROR: incompatible
 
 ### 9.4 Loop Scoping
 
-When SAMM detects list-producing statements inside a loop body (via `bodyContainsDim` or equivalent heuristic), it emits per-iteration `samm_enter_scope()` / `samm_exit_scope()` to prevent accumulation of temporary lists:
+BASIC variables have function scope, not block scope.  Loops do **not** create per-iteration SAMM scopes.  Any allocations made inside a loop body are cleaned up when the enclosing function/sub scope exits.  This matches traditional BASIC semantics and avoids bugs where early exits (RETURN, EXIT WHILE, etc.) skip the loop-end cleanup code.
 
 ```basic
 FOR i = 1 TO 1000
     DIM temp AS LIST OF INTEGER = LIST(i, i*2, i*3)
     temp.APPEND i * 4
     PRINT temp.LENGTH
-NEXT i   ' Per-iteration scope exits, temp is freed each iteration
+NEXT i   ' temp is cleaned up when the enclosing function scope exits
 ```
 
 ---

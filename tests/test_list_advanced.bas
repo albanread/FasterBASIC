@@ -119,11 +119,11 @@ PRINT ""
 ' === Test 9: REMOVE at position ===
 PRINT ""
 PRINT "=== Test 9: REMOVE ==="
-DIM rem AS LIST OF INTEGER = LIST(10, 20, 30, 40, 50)
-rem.REMOVE(3)
+DIM remList AS LIST OF INTEGER = LIST(10, 20, 30, 40, 50)
+remList.REMOVE(3)
 PRINT "After remove at pos 3:"
-PRINT "Length: "; rem.LENGTH()
-FOR EACH x IN rem
+PRINT "Length: "; remList.LENGTH()
+FOR EACH x IN remList
     PRINT x; " ";
 NEXT x
 PRINT ""

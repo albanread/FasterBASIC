@@ -9,8 +9,8 @@
 '   Test C — String returned from a FUNCTION (RETAIN to parent scope)
 '   Test D — String returned from a METHOD  (RETAIN to parent scope)
 '   Test E — Nested scopes with strings (inner scope cleans before outer)
-'   Test F — WHILE loop with string assignment (bodyContainsDim detects $)
-'   Test G — PRINT with string concat in loop (bodyContainsDim detects PRINT)
+'   Test F — WHILE loop with string assignment
+'   Test G — PRINT with string concat in loop
 
 ' =========================================================================
 ' Helper FUNCTION — returns a newly created string (tests SAMM RETAIN)
@@ -118,7 +118,7 @@ NEXT a%
 PRINT "  Last outer: "; outer
 
 ' --- Test F: WHILE loop with string assignment --------------------------
-' bodyContainsDim should detect the $ assignment and emit loop scopes.
+' String cleanup happens when the enclosing function/sub scope exits.
 PRINT ""
 PRINT "Test F: WHILE loop with string"
 DIM wStr AS STRING
@@ -132,7 +132,7 @@ WEND
 PRINT "  Last: "; wStr
 
 ' --- Test G: PRINT with string concat in loop ---------------------------
-' bodyContainsDim detects PRINT and emits loop scopes for temporaries.
+' String temporaries are cleaned up when the enclosing scope exits.
 PRINT ""
 PRINT "Test G: PRINT in loop"
 FOR p% = 1 TO 3
