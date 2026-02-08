@@ -321,6 +321,7 @@ bool SemanticAnalyzer::analyze(Program& program, const CompilerOptions& options)
     m_symbolTable.forceYieldEnabled = options.forceYieldEnabled;
     m_symbolTable.forceYieldBudget = options.forceYieldBudget;
     m_symbolTable.sammEnabled = options.sammEnabled;
+    m_symbolTable.neonEnabled = options.neonEnabled;
     m_cancellableLoops = options.cancellableLoops;
     
     // Clear control flow stacks
@@ -4861,10 +4862,15 @@ void SemanticAnalyzer::initializeBuiltinFunctions() {
     m_builtinFunctions["EXP"] = 1;
     m_builtinFunctions["POW"] = 2;    // Takes 2 arguments: base, exponent
     m_builtinFunctions["ATAN2"] = 2;  // Takes 2 arguments: y, x
-    m_builtinFunctions["MIN"] = 2;    // Takes 2 arguments: returns minimum
-    m_builtinFunctions["MAX"] = 2;    // Takes 2 arguments: returns maximum
+    m_builtinFunctions["MIN"] = -2;   // 1 arg (array reduction) or 2 args (scalar min)
+    m_builtinFunctions["MAX"] = -2;   // 1 arg (array reduction) or 2 args (scalar max)
     m_builtinFunctions["FIX"] = 1;    // Takes 1 argument: truncates to integer
     m_builtinFunctions["CINT"] = 1;   // Takes 1 argument: rounds to integer
+
+    // Array reduction functions (1 or 2 arguments)
+    m_builtinFunctions["SUM"] = 1;    // Takes 1 argument: sum of all array elements
+    m_builtinFunctions["AVG"] = 1;    // Takes 1 argument: average of all array elements
+    m_builtinFunctions["DOT"] = 2;    // Takes 2 arguments: dot product of two arrays
     
     // RND takes 0 or 1 argument
     m_builtinFunctions["RND"] = -1;  // -1 = variable arg count

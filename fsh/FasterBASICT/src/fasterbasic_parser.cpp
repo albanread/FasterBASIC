@@ -372,6 +372,14 @@ void Parser::collectOptionsFromTokens() {
                 } else {
                     error("Expected ON or OFF after OPTION SAMM");
                 }
+            } else if (match(TokenType::NEON)) {
+                if (match(TokenType::ON)) {
+                    m_options.neonEnabled = true;
+                } else if (match(TokenType::OFF)) {
+                    m_options.neonEnabled = false;
+                } else {
+                    error("Expected ON or OFF after OPTION NEON");
+                }
             } else {
                 error("Unknown OPTION type");
             }
@@ -6743,6 +6751,7 @@ bool Parser::isBuiltinFunction(const std::string& name) const {
     static const std::set<std::string> builtins = {
         "ABS", "SIN", "COS", "TAN", "ATAN", "ATN", "SQRT", "SQR", "INT", "SGN", "LOG", "EXP", "POW", "ATAN2", "RND",
         "MIN", "MAX", "FIX", "CINT",
+        "SUM", "AVG", "DOT",
         "LEN", "ASC", "CHR$", "CHR_STRING", "STR$", "STR_STRING", "VAL", "STRTYPE",
         "LEFT$", "RIGHT$", "MID$", "LEFT_STRING", "RIGHT_STRING", "MID_STRING",
         "INSTR", "SPACE$", "STRING$", "UCASE$", "LCASE$", "LTRIM$", "RTRIM$", "TRIM$",

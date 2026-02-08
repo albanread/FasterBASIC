@@ -6,6 +6,23 @@ A modern, compiled BASIC dialect that generates native machine code for macOS AR
 
 ## 🎉 Latest Features (February 2025)
 
+### Array Expressions & SIMD Math
+**NEW:** Complete array expression engine with NEON SIMD acceleration, reductions, and fused multiply-add!
+
+```basic
+DIM A(1000) AS SINGLE, B(1000) AS SINGLE, C(1000) AS SINGLE, D(1000) AS SINGLE
+
+C() = A() + B()              ' element-wise add (NEON vectorized)
+D() = A() + B() * C()        ' fused multiply-add (single FMLA instruction)
+
+total! = SUM(A())             ' reduction to scalar
+mx! = MAX(A())                ' maximum element
+dp! = DOT(A(), B())           ' dot product
+B() = ABS(A())                ' element-wise absolute value
+```
+
+Supports all numeric types including `BYTE` (16 elements/register) and `SHORT` (8 elements/register). See [Array Expressions](articles/array-expressions.md) for full documentation.
+
 ### Object-Oriented Programming
 **NEW:** Full CLASS system with inheritance, polymorphism, and virtual dispatch!
 
@@ -235,7 +252,17 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - ✅ NEON SIMD acceleration for ARM64
 - ✅ Automatic vectorization for UDT operations
 - ✅ SIMD test suite and verification
-- ✅ Optional SIMD disable (OPTION NO_NEON)
+- ✅ Optional SIMD disable (OPTION NEON OFF)
+
+**Array Expressions:**
+- ✅ Element-wise arithmetic: `C() = A() + B()`, `-`, `*`, `/`
+- ✅ Array copy, fill, negate, scalar broadcast
+- ✅ Fused multiply-add: `D() = A() + B() * C()` (ARM64 FMLA)
+- ✅ Reduction functions: SUM(), MAX(), MIN(), AVG(), DOT()
+- ✅ Unary array functions: ABS(), SQR()
+- ✅ BYTE (16 lanes) and SHORT (8 lanes) NEON support
+- ✅ Correct sub-word memory ops (storeb/loadsb, storeh/loadsh)
+- ✅ Scalar MAX(a,b) / MIN(a,b) overloads
 
 ### 🚧 In Progress
 

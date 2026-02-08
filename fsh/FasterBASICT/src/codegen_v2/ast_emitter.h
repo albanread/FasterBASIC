@@ -790,8 +790,49 @@ private:
                                    bool scalarOnLeft = false);
 
     /**
+     * Return the correct QBE memory load/store ops for an element type.
+     * For sub-word types (BYTE, SHORT) the register type is "w" but the
+     * memory operations must use the narrow width (storeb, storeh, etc.)
+     * to avoid corrupting adjacent elements.
+     */
+    void getMemoryLoadStoreOps(FasterBASIC::BaseType elemType,
+                               std::string& outQbeType,
+                               std::string& outLoadOp,
+                               std::string& outStoreOp);
+
+    /**
+     * Try to emit a compound array expression with FMA optimisation.
+     * Detects patterns like D() = A() + B() * C() and emits fused
+     * multiply-add when available.
+     * @return true if handled as a compound expression.
+     */
+    bool tryEmitCompoundArrayExpression(
+            const FasterBASIC::LetStatement* stmt,
+            const FasterBASIC::ArraySymbol& destArray,
+            const FasterBASIC::BinaryExpression* binExpr);
+
+    /**
+     * Try to emit an array reduction function call.
+     * Handles SUM(A()), MAX(A()), MIN(A()), AVG(A()), DOT(A(), B()).
+     * Returns the QBE temporary holding the scalar result, or "" if
+     * the call is not a recognised array reduction.
+     */
+    std::string tryEmitArrayReduction(const FasterBASIC::FunctionCallExpression* expr);
+
+    /**
+     * Try to emit an element-wise unary function applied to a whole array.
+     * Handles B() = ABS(A()), B() = SQR(A()).
+     * @return true if handled.
+     */
+    bool tryEmitArrayUnaryFunc(
+            const FasterBASIC::LetStatement* stmt,
+            const FasterBASIC::ArraySymbol& destArray,
+            const FasterBASIC::FunctionCallExpression* callExpr);
+
+    /**
      * Check whether the NEON array-expression path is enabled.
-     * Respects the ENABLE_NEON_LOOP environment variable kill-switch.
+     * Respects the ENABLE_NEON_LOOP environment variable kill-switch
+     * and the OPTION NEON OFF compiler directive.
      */
     bool isNEONArrayExprEnabled();
 

@@ -266,6 +266,7 @@ void Lexer::initializeKeywords() {
         s_keywords["BOUNDS_CHECK"] = TokenType::BOUNDS_CHECK;
         s_keywords["FORCE_YIELD"] = TokenType::FORCE_YIELD;
         s_keywords["SAMM"] = TokenType::SAMM;
+        s_keywords["NEON"] = TokenType::NEON;
         s_keywords["OFF"] = TokenType::OFF;
     });
 }

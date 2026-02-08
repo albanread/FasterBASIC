@@ -700,6 +700,8 @@ is_neon_arith_enabled(void)
  * Kl → ".2d"  (2×64-bit integer)
  * Ks → ".4s"  (4×32-bit float — same encoding)
  * Kd → ".2d"  (2×64-bit float)
+ *  4 → ".8h"  (8×16-bit integer, SHORT)
+ *  5 → ".16b" (16×8-bit integer, BYTE)
  */
 static char *
 neon_arrangement(int cls)
@@ -709,12 +711,15 @@ neon_arrangement(int cls)
 	case Ks: return "4s";
 	case Kl: return "2d";
 	case Kd: return "2d";
+	case 4:  return "8h";
+	case 5:  return "16b";
 	default: return "4s";
 	}
 }
 
 /* Determine if NEON arrangement uses float instructions.
  * Ks and Kd use fadd/fsub/fmul, Kw and Kl use add/sub/mul.
+ * Codes 4 (.8h) and 5 (.16b) are integer-only.
  */
 static int
 neon_is_float(int cls)
@@ -729,6 +734,8 @@ neon_is_float(int cls)
  *   1 = Kl (.2d integer)
  *   2 = Ks (.4s float)
  *   3 = Kd (.2d float)
+ *   4 =     .8h integer  (8×16-bit, SHORT)
+ *   5 =     .16b integer (16×8-bit, BYTE)
  * The parser creates RCon refs via getcon() for integer literals,
  * so we must check both RInt (inline) and RCon (constant table).
  * Falls back to the instruction's cls field if neither matches.
@@ -740,14 +747,14 @@ neon_arr_from_arg(Ins *i, E *e)
 
 	if (rtype(i->arg[0]) == RInt) {
 		v = rsval(i->arg[0]);
-		if (v >= 0 && v <= 3)
+		if (v >= 0 && v <= 5)
 			return v;
 	}
 	if (rtype(i->arg[0]) == RCon) {
 		Con *c = &e->fn->con[i->arg[0].val];
 		if (c->type == CBits) {
 			v = (int)c->bits.i;
-			if (v >= 0 && v <= 3)
+			if (v >= 0 && v <= 5)
 				return v;
 		}
 	}
@@ -757,13 +764,14 @@ neon_arr_from_arg(Ins *i, E *e)
 /* Get the scalar GPR suffix for neondup based on arrangement.
  * .4s / .4s-float → "w" (32-bit GPR)
  * .2d / .2d-float → "x" (64-bit GPR)
+ * .8h / .16b      → "w" (32-bit GPR, value is zero-extended into lanes)
  */
 static char *
 neon_dup_gpr_prefix(int arr)
 {
 	switch (arr) {
 	case Kl: case Kd: return "x";
-	default: return "w";
+	default: return "w";  /* Kw, Ks, 4 (.8h), 5 (.16b) all use w register */
 	}
 }
 
@@ -1400,8 +1408,16 @@ emitins(Ins *i, E *e)
 		if (!is_neon_copy_enabled()) {
 			die("neonstr2 emitted but NEON copy disabled");
 		}
-		assert(isreg(i->arg[0]));
 		fprintf(e->f, "\tstr\tq29, [%s]\n",
+			rname(i->arg[0].val, Kl));
+		break;
+
+	case Oneonldr3:
+		/* Load 128 bits from [arg0] into q30 (for FMA third operand) */
+		if (!is_neon_copy_enabled()) {
+			die("neonldr3 emitted but NEON copy disabled");
+		}
+		fprintf(e->f, "\tldr\tq30, [%s]\n",
 			rname(i->arg[0].val, Kl));
 		break;
 
@@ -1459,26 +1475,51 @@ emitins(Ins *i, E *e)
 		break;
 	}
 
-	case Oneonaddv:
+	case Oneonaddv: {
 		/* Horizontal sum: reduce v28 lanes to scalar in dest GPR.
-		 * For .4s: addv s28, v28.4s  then  fmov wDest, s28
-		 * For .2d: addp d28, v28.2d  then  fmov xDest, d28
+		 * For .4s:  addv s28, v28.4s  then  fmov wDest, s28
+		 * For .2d:  addp d28, v28.2d  then  fmov xDest, d28
+		 * For .8h:  addv h28, v28.8h  then  smov wDest, v28.h[0]
+		 * For .16b: addv b28, v28.16b then  smov wDest, v28.b[0]
+		 *
+		 * The arrangement is encoded in arg[0] (same as other ops).
+		 * cls Kw → .4s, cls Kl → .2d (legacy), or explicit 4/5.
 		 */
+		int ac;
 		if (!is_neon_arith_enabled()) {
 			die("neonaddv emitted but NEON arith disabled");
 		}
 		assert(isreg(i->to));
-		if (i->cls == Kw) {
-			fprintf(e->f, "\taddv\ts28, v28.4s\n");
-			fprintf(e->f, "\tfmov\t%s, s28\n",
+		ac = neon_arr_from_arg(i, e);
+		if (ac == 5) {
+			/* .16b: addv reduces 16 byte lanes → b28 */
+			fprintf(e->f, "\taddv\tb28, v28.16b\n");
+			fprintf(e->f, "\tsmov\t%s, v28.b[0]\n",
 				rname(i->to.val, Kw));
-		} else {
-			/* 2d: use addp for pairwise add */
+		} else if (ac == 4) {
+			/* .8h: addv reduces 8 halfword lanes → h28 */
+			fprintf(e->f, "\taddv\th28, v28.8h\n");
+			fprintf(e->f, "\tsmov\t%s, v28.h[0]\n",
+				rname(i->to.val, Kw));
+		} else if (ac == Kl || ac == Kd) {
+			/* .2d: use addp for pairwise add */
 			fprintf(e->f, "\taddp\td28, v28.2d\n");
 			fprintf(e->f, "\tfmov\t%s, d28\n",
 				rname(i->to.val, Kl));
+		} else if (ac == Kd || ac == Ks) {
+			/* .4s float: addv s28, v28.4s then fmov */
+			fprintf(e->f, "\tfaddp\tv28.4s, v28.4s, v28.4s\n");
+			fprintf(e->f, "\tfaddp\ts28, v28.2s\n");
+			fprintf(e->f, "\tfmov\t%s, s28\n",
+				rname(i->to.val, Kw));
+		} else {
+			/* .4s integer: addv s28, v28.4s then fmov */
+			fprintf(e->f, "\taddv\ts28, v28.4s\n");
+			fprintf(e->f, "\tfmov\t%s, s28\n",
+				rname(i->to.val, Kw));
 		}
 		break;
+	}
 
 	case Oneondiv: {
 		/* Vector division: v28.arr = v28.arr / v29.arr

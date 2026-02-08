@@ -131,6 +131,76 @@ DIM reversed(100) AS SINGLE
 reversed() = -velocity()
 ```
 
+### Fused Multiply-Add (FMA)
+
+The compiler detects compound `A() + B() * C()` patterns and emits fused multiply-add instructions on ARM64, which are both faster and more numerically accurate than separate multiply and add:
+
+```basic
+DIM A(100) AS SINGLE
+DIM B(100) AS SINGLE
+DIM C(100) AS SINGLE
+DIM D(100) AS SINGLE
+
+D() = A() + B() * C()   ' fused multiply-add (FMLA)
+D() = B() * C() + A()   ' commuted form — also uses FMLA
+```
+
+FMA works with `SINGLE`, `DOUBLE`, and `INTEGER` arrays. On ARM64 with NEON, the SINGLE path compiles to a single `fmla v28.4s, v29.4s, v30.4s` instruction per 4-element chunk.
+
+---
+
+## Reduction Functions
+
+Reduction functions collapse an entire array down to a single scalar value:
+
+```basic
+DIM A(99) AS SINGLE
+
+total! = SUM(A())       ' sum of all elements
+mx! = MAX(A())          ' maximum element
+mn! = MIN(A())          ' minimum element
+avg! = AVG(A())         ' arithmetic mean
+```
+
+```basic
+DIM A(99) AS SINGLE
+DIM B(99) AS SINGLE
+
+dp! = DOT(A(), B())     ' dot product: SUM(A(i) * B(i))
+```
+
+Reductions work with all numeric types — `BYTE`, `SHORT`, `INTEGER`, `LONG`, `SINGLE`, and `DOUBLE`. The return type matches the element type of the source array.
+
+### Scalar MAX / MIN
+
+`MAX` and `MIN` are overloaded. With one array argument they perform a reduction; with two scalar arguments they return the larger or smaller value:
+
+```basic
+mx! = MAX(A())       ' array reduction — maximum element of A
+mx% = MAX(10, 20)    ' scalar — returns 20
+
+mn! = MIN(A())       ' array reduction — minimum element of A
+mn% = MIN(10, 20)    ' scalar — returns 10
+```
+
+---
+
+## Unary Array Functions
+
+Element-wise application of math functions to every element of an array:
+
+```basic
+DIM A(100) AS SINGLE
+DIM B(100) AS SINGLE
+
+B() = ABS(A())    ' absolute value of every element
+B() = SQR(A())    ' square root of every element
+```
+
+`ABS` uses NEON `fabs` for floating-point arrays and a branch-based integer absolute value for integer arrays. `SQR` converts through `sqrt` (double precision) and truncates back for `SINGLE`.
+
+Both functions work with `SINGLE`, `DOUBLE`, and `INTEGER` arrays.
+
 ---
 
 ## Supported Array Types
@@ -148,6 +218,20 @@ Array expressions work with all numeric array types:
 | SIMD-eligible UDT | 128-bit | 1 | Good |
 
 Smaller types pack more elements into each NEON register, so `BYTE` and `SHORT` arrays see the biggest throughput gains.
+
+### BYTE and SHORT Arrays
+
+`BYTE` (8-bit) and `SHORT` (16-bit) arrays are fully supported with correct sub-word memory operations. The compiler uses `storeb`/`loadsb` for BYTE and `storeh`/`loadsh` for SHORT to avoid corrupting adjacent elements — a common pitfall when 32-bit store instructions are used on packed sub-word data.
+
+NEON vectorization uses `.16b` arrangement for BYTE (16 elements per register) and `.8h` arrangement for SHORT (8 elements per register):
+
+```basic
+DIM pixels(1023) AS BYTE
+DIM mask(1023) AS BYTE
+DIM result(1023) AS BYTE
+
+result() = pixels() + mask()   ' processes 16 bytes per NEON iteration
+```
 
 ### UDT Arrays
 
@@ -214,7 +298,7 @@ DIM fahrenheit(365) AS SINGLE
 fahrenheit() = celsius() * 1.8 + 32.0
 ```
 
-### Example 3: Physics Simulation
+### Example 3: Physics Simulation with FMA
 
 ```basic
 TYPE Vec4
@@ -230,9 +314,14 @@ DIM acc(10000) AS Vec4
 
 ' ... initialize particles ...
 
-' Physics update — three array expressions replace nested loops
-vel() = vel() + acc()
-pos() = pos() + vel()
+' Euler integration with fused multiply-add
+' vel += acc * dt,  pos += vel * dt
+DIM dt AS SINGLE
+dt = 0.016
+
+' These compile to FMLA NEON instructions
+vel() = vel() + acc() * dt
+pos() = pos() + vel() * dt
 
 ' Damping
 vel() = vel() * 0.99
@@ -241,22 +330,39 @@ vel() = vel() * 0.99
 ### Example 4: Image Processing
 
 ```basic
-' Brighten an image stored as integer pixel values
-DIM pixels(1920 * 1080) AS INTEGER
-DIM brightened(1920 * 1080) AS INTEGER
+' Brighten an image stored as byte pixel values
+DIM pixels(1920 * 1080) AS BYTE
+DIM brightened(1920 * 1080) AS BYTE
 
-brightened() = pixels() + 20
+brightened() = pixels() + 20   ' NEON processes 16 pixels per cycle
 
-' Blend two images (50/50 average)
-DIM imageA(1920 * 1080) AS INTEGER
-DIM imageB(1920 * 1080) AS INTEGER
-DIM blended(1920 * 1080) AS INTEGER
-
-' Each pixel is the average of the two source pixels
-blended() = imageA() / 2 + imageB() / 2
+' Compute statistics
+DIM image(1920 * 1080) AS SINGLE
+avgBrightness! = AVG(image())
+maxBrightness! = MAX(image())
+minBrightness! = MIN(image())
 ```
 
-### Example 5: Array Initialization Patterns
+### Example 5: Signal Processing
+
+```basic
+DIM signal(8191) AS SINGLE
+DIM kernel(8191) AS SINGLE
+
+' Dot product (correlation at zero lag)
+correlation! = DOT(signal(), kernel())
+
+' Root mean square
+DIM squared(8191) AS SINGLE
+squared() = signal() * signal()
+rms! = SQR(SUM(squared()) / 8192)
+
+' Absolute value for envelope detection
+DIM envelope(8191) AS SINGLE
+envelope() = ABS(signal())
+```
+
+### Example 6: Array Initialization Patterns
 
 ```basic
 DIM data(1000) AS DOUBLE
@@ -282,6 +388,7 @@ When the compiler encounters an array expression like `C() = A() + B()`, it:
 1. **Verifies compatibility** — all arrays must have the same element type and compatible dimensions
 2. **Checks SIMD eligibility** — determines whether the element type maps to NEON registers
 3. **Emits a vectorized loop** — generates a pointer-based loop that processes elements in bulk
+4. **Emits a scalar remainder loop** — handles leftover elements when the array length isn't a multiple of the SIMD lane count
 
 On ARM64, the generated loop uses NEON 128-bit registers. For `SINGLE` arrays, this processes 4 elements per iteration:
 
@@ -295,7 +402,17 @@ loop:
     b.lt  loop
 ```
 
-A scalar remainder loop handles any leftover elements when the array length isn't a multiple of the SIMD lane count.
+For FMA expressions like `D() = A() + B() * C()`, the compiler loads three vectors and emits:
+
+```
+    ldr   q28, [src_a], #16
+    ldr   q29, [src_b], #16
+    ldr   q30, [src_c], #16
+    fmla  v28.4s, v29.4s, v30.4s  ; v28 += v29 * v30
+    str   q28, [dest], #16
+```
+
+The fused multiply-add is a single instruction with no intermediate rounding.
 
 ### Comparison with FOR Loops
 
@@ -396,13 +513,14 @@ For small arrays (under ~16 elements), the overhead of setting up the SIMD loop 
 
 ### Disabling SIMD
 
-If you need to disable NEON acceleration (for debugging or compatibility testing), use:
+If you need to disable NEON acceleration (for debugging or compatibility testing), use either:
 
 ```basic
-OPTION NO_NEON
+OPTION NEON OFF     ' disable NEON for subsequent array expressions
+OPTION NEON ON      ' re-enable NEON
 ```
 
-Or set the environment variable:
+Or set the environment variable before compilation:
 
 ```bash
 ENABLE_NEON_LOOP=0 ./fbc_qbe program.bas
@@ -412,41 +530,9 @@ The compiler will generate scalar loops instead. The array expression syntax sti
 
 ---
 
-## Future Extensions
-
-### Reduction Functions
-
-Functions that reduce an array to a single scalar value:
-
-```basic
-total = SUM(A())        ' sum of all elements
-mx = MAX(A())           ' maximum element
-mn = MIN(A())           ' minimum element
-dp = DOT(A(), B())      ' dot product
-avg = AVG(A())          ' average value
-```
-
-### Unary Functions
-
-Element-wise application of math functions:
-
-```basic
-B() = ABS(A())          ' absolute value of every element
-B() = SQR(A())          ' square root of every element
-```
-
-### Compound Expressions
-
-Multiple operations in a single expression, potentially using fused multiply-add (FMLA) on ARM64:
-
-```basic
-D() = A() + B() * C()   ' fused multiply-add
-D() = A() * B() + C()   ' also eligible for FMLA
-```
-
----
-
 ## Quick Reference
+
+### Array Operations
 
 | Expression | Meaning |
 |---|---|
@@ -461,6 +547,57 @@ D() = A() * B() + C()   ' also eligible for FMLA
 | `A() = value` | Fill entire array with value |
 | `B() = -A()` | Negate every element |
 | `A() = A() + 1` | In-place increment |
+| `D() = A() + B() * C()` | Fused multiply-add |
+
+### Reduction Functions
+
+| Expression | Meaning |
+|---|---|
+| `x = SUM(A())` | Sum of all elements |
+| `x = MAX(A())` | Maximum element |
+| `x = MIN(A())` | Minimum element |
+| `x = AVG(A())` | Arithmetic mean |
+| `x = DOT(A(), B())` | Dot product |
+| `x = MAX(a, b)` | Scalar maximum of two values |
+| `x = MIN(a, b)` | Scalar minimum of two values |
+
+### Unary Array Functions
+
+| Expression | Meaning |
+|---|---|
+| `B() = ABS(A())` | Absolute value of every element |
+| `B() = SQR(A())` | Square root of every element |
+
+---
+
+## Implementation Status
+
+All features described in this article are **fully implemented and tested**:
+
+| Feature | Status | NEON Acceleration |
+|---|---|---|
+| Element-wise +, -, *, / | ✅ Complete | ✅ All numeric types |
+| Array copy | ✅ Complete | ✅ All types |
+| Scalar broadcast | ✅ Complete | ✅ All numeric types |
+| Array fill | ✅ Complete | ✅ All numeric types |
+| Negation | ✅ Complete | ✅ All numeric types |
+| BYTE arrays (`.16b`) | ✅ Complete | ✅ 16 elements/register |
+| SHORT arrays (`.8h`) | ✅ Complete | ✅ 8 elements/register |
+| UDT arrays (Vec4, Vec2D) | ✅ Complete | ✅ Per-UDT |
+| Fused multiply-add (FMA) | ✅ Complete | ✅ SINGLE/DOUBLE |
+| SUM() reduction | ✅ Complete | Scalar loop |
+| MAX() reduction | ✅ Complete | Scalar loop |
+| MIN() reduction | ✅ Complete | Scalar loop |
+| AVG() reduction | ✅ Complete | Scalar loop |
+| DOT() product | ✅ Complete | Scalar loop |
+| ABS() element-wise | ✅ Complete | ✅ Float types |
+| SQR() element-wise | ✅ Complete | Scalar loop |
+| OPTION NEON ON/OFF | ✅ Complete | — |
+| Scalar MAX(a, b) / MIN(a, b) | ✅ Complete | — |
+
+The test suite (`tests/array_expr/`) contains 7 test files covering all operations, edge cases, NEON opcodes, UDT types, and the features listed above.
+
+---
 
 ## Compatibility
 
@@ -485,9 +622,15 @@ Array expressions work on all platforms. SIMD acceleration is currently availabl
 
 4. **Use `SINGLE` for best throughput** — 32-bit floats pack 4 per NEON register versus 2 for `DOUBLE`. Use `SINGLE` unless you need the precision.
 
-5. **Array fill is fast** — `A() = 0` is significantly faster than a FOR loop for zeroing large arrays.
+5. **Use `BYTE` for massive throughput** — 8-bit elements pack 16 per NEON register. Ideal for image processing and byte-level data.
 
-6. **Check your types** — array expressions require matching element types. The compiler will report an error if types don't match.
+6. **Exploit FMA** — when you need `A + B * C`, write it as a single expression. The compiler will emit a fused multiply-add with no intermediate rounding.
+
+7. **Array fill is fast** — `A() = 0` is significantly faster than a FOR loop for zeroing large arrays.
+
+8. **Check your types** — array expressions require matching element types. The compiler will report an error if types don't match.
+
+9. **Use reductions** — `SUM(A())`, `MAX(A())`, and friends are cleaner and less error-prone than hand-written accumulator loops.
 
 ---
 

@@ -81,6 +81,12 @@ struct CompilerOptions {
     bool forceYieldEnabled = false;
     int forceYieldBudget = 10000;  // Default: yield every 10,000 instructions
     
+    // NEON SIMD: OPTION NEON ON/OFF
+    // When true, array expressions use NEON vectorized loops on ARM64
+    // When false, array expressions use scalar fallback loops
+    // Default is true (enabled); can also be controlled via ENABLE_NEON_LOOP env var
+    bool neonEnabled = true;
+    
     // Constructor with defaults
     CompilerOptions() = default;
     
@@ -97,6 +103,7 @@ struct CompilerOptions {
         sammEnabled = true;
         forceYieldEnabled = false;
         forceYieldBudget = 10000;
+        neonEnabled = true;
     }
 };
 

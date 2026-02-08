@@ -431,19 +431,11 @@ void CoreCommandRegistry::registerMathFunctions(CommandRegistry& registry) {
             .setReturnType(ReturnType::FLOAT);
     registry.registerFunction(std::move(atanh_fn));
     
-    // MIN - Minimum of two numbers
-    CommandDefinition min_fn("MIN", "Return minimum of two numbers", "math.min", "math");
-    min_fn.addParameter("a", ParameterType::FLOAT, "First number")
-          .addParameter("b", ParameterType::FLOAT, "Second number")
-          .setReturnType(ReturnType::FLOAT);
-    registry.registerFunction(std::move(min_fn));
-    
-    // MAX - Maximum of two numbers
-    CommandDefinition max_fn("MAX", "Return maximum of two numbers", "math.max", "math");
-    max_fn.addParameter("a", ParameterType::FLOAT, "First number")
-          .addParameter("b", ParameterType::FLOAT, "Second number")
-          .setReturnType(ReturnType::FLOAT);
-    registry.registerFunction(std::move(max_fn));
+    // MIN and MAX are handled as builtin functions (not registry functions)
+    // to support both 1-arg array reduction: MIN(arr()), MAX(arr())
+    // and 2-arg scalar overloads: MIN(a, b), MAX(a, b)
+    // See isBuiltinFunction() in fasterbasic_parser.cpp and
+    // initializeBuiltinFunctions() in fasterbasic_semantic.cpp
     
     // ATAN2 - Two-argument arctangent
     CommandDefinition atan2_fn("ATAN2", "Return atan2(y, x) in radians", "math.atan2", "math");

@@ -141,14 +141,22 @@ O(copy,    T(w,l,s,d, x,x,x,x), F(0,0,0,0,0,0,0,0,0,0)) X(0,0,1) V(0)
  *
  * neonldr/neonstr:   128-bit vector load/store via q28
  * neonldr2/neonstr2: 128-bit vector load/store via q29
+ * neonldr3:          128-bit vector load via q30 (for FMA third operand)
  * neonadd/neonsub/neonmul: vector arithmetic  v28 = v28 op v29
- *   cls encodes arrangement: Kw=.4s  Kl=.2d  Ks=.4s(float)  Kd=.2d(float)
+ *   Arrangement encoding in arg[0]:
+ *     0 = Kw  (.4s integer)    4 × 32-bit
+ *     1 = Kl  (.2d integer)    2 × 64-bit
+ *     2 = Ks  (.4s float)      4 × 32-bit
+ *     3 = Kd  (.2d float)      2 × 64-bit
+ *     4 =      .8h integer     8 × 16-bit (SHORT)
+ *     5 =      .16b integer   16 × 8-bit  (BYTE)
  * neonaddv: horizontal sum of v28 lanes → scalar GPR result
  */
 O(neonldr,  T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonstr,  T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonldr2, T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonstr2, T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
+O(neonldr3, T(m,m,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonadd, T(w,w,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonsub, T(w,w,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)
 O(neonmul, T(w,w,e,e, x,x,e,e), F(0,0,0,0,0,0,0,0,0,1)) X(0,0,0) V(0)

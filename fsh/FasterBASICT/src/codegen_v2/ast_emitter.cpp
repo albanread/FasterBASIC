@@ -1010,6 +1010,15 @@ std::string ASTEmitter::emitFunctionCall(const FunctionCallExpression* expr) {
     std::string upperName = funcName;
     std::transform(upperName.begin(), upperName.end(), upperName.begin(), ::toupper);
     
+    // Check for array reduction functions: SUM(A()), MAX(A()), MIN(A()), AVG(A()), DOT(A(),B())
+    // These must be checked before the scalar MAX/MIN builtins to allow whole-array overloads.
+    {
+        std::string reductionResult = tryEmitArrayReduction(expr);
+        if (!reductionResult.empty()) {
+            return reductionResult;
+        }
+    }
+    
     // Check for plugin functions first
     auto& cmdRegistry = FasterBASIC::ModularCommands::getGlobalCommandRegistry();
     const auto* pluginFunc = cmdRegistry.getFunction(upperName);
@@ -1403,6 +1412,84 @@ std::string ASTEmitter::emitFunctionCall(const FunctionCallExpression* expr) {
         // RND() - random number 0.0 to 1.0
         std::string result = builder_.newTemp();
         builder_.emitCall(result, "d", "basic_rnd", "");
+        return result;
+    }
+    
+    // MAX(a, b) - scalar maximum of two values
+    if (upperName == "MAX" && expr->arguments.size() == 2) {
+        std::string lhs = emitExpression(expr->arguments[0].get());
+        std::string rhs = emitExpression(expr->arguments[1].get());
+        BaseType lhsType = getExpressionType(expr->arguments[0].get());
+        BaseType rhsType = getExpressionType(expr->arguments[1].get());
+        
+        // Promote to common type
+        BaseType resultType = typeManager_.getPromotedType(lhsType, rhsType);
+        std::string qbeType = typeManager_.getQBEType(resultType);
+        if (lhsType != resultType) lhs = emitTypeConversion(lhs, lhsType, resultType);
+        if (rhsType != resultType) rhs = emitTypeConversion(rhs, rhsType, resultType);
+        
+        // Compare: lhs >= rhs
+        std::string cmpResult = builder_.newTemp();
+        if (typeManager_.isFloatingPoint(resultType)) {
+            std::string cmpOp = (resultType == BaseType::SINGLE) ? "cges" : "cged";
+            builder_.emitRaw("    " + cmpResult + " =w " + cmpOp + " " + lhs + ", " + rhs);
+        } else {
+            builder_.emitRaw("    " + cmpResult + " =w csgew " + lhs + ", " + rhs);
+        }
+        
+        // Branch-based conditional select (no 'select' instruction)
+        std::string thenLabel = "max_t_" + std::to_string(builder_.getTempCounter());
+        std::string elseLabel = "max_f_" + std::to_string(builder_.getTempCounter());
+        std::string endLabel  = "max_e_" + std::to_string(builder_.getTempCounter());
+        std::string slotAddr  = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l alloc8 8");
+        builder_.emitRaw("    store" + qbeType + " " + rhs + ", " + slotAddr);
+        builder_.emitRaw("    jnz " + cmpResult + ", @" + thenLabel + ", @" + endLabel);
+        builder_.emitLabel(thenLabel);
+        builder_.emitRaw("    store" + qbeType + " " + lhs + ", " + slotAddr);
+        builder_.emitRaw("    jmp @" + endLabel);
+        builder_.emitLabel(endLabel);
+        std::string result = builder_.newTemp();
+        builder_.emitRaw("    " + result + " =" + qbeType + " load" + qbeType + " " + slotAddr);
+        return result;
+    }
+    
+    // MIN(a, b) - scalar minimum of two values
+    if (upperName == "MIN" && expr->arguments.size() == 2) {
+        std::string lhs = emitExpression(expr->arguments[0].get());
+        std::string rhs = emitExpression(expr->arguments[1].get());
+        BaseType lhsType = getExpressionType(expr->arguments[0].get());
+        BaseType rhsType = getExpressionType(expr->arguments[1].get());
+        
+        // Promote to common type
+        BaseType resultType = typeManager_.getPromotedType(lhsType, rhsType);
+        std::string qbeType = typeManager_.getQBEType(resultType);
+        if (lhsType != resultType) lhs = emitTypeConversion(lhs, lhsType, resultType);
+        if (rhsType != resultType) rhs = emitTypeConversion(rhs, rhsType, resultType);
+        
+        // Compare: lhs <= rhs
+        std::string cmpResult = builder_.newTemp();
+        if (typeManager_.isFloatingPoint(resultType)) {
+            std::string cmpOp = (resultType == BaseType::SINGLE) ? "cles" : "cled";
+            builder_.emitRaw("    " + cmpResult + " =w " + cmpOp + " " + lhs + ", " + rhs);
+        } else {
+            builder_.emitRaw("    " + cmpResult + " =w cslew " + lhs + ", " + rhs);
+        }
+        
+        // Branch-based conditional select (no 'select' instruction)
+        std::string thenLabel = "min_t_" + std::to_string(builder_.getTempCounter());
+        std::string elseLabel = "min_f_" + std::to_string(builder_.getTempCounter());
+        std::string endLabel  = "min_e_" + std::to_string(builder_.getTempCounter());
+        std::string slotAddr  = builder_.newTemp();
+        builder_.emitRaw("    " + slotAddr + " =l alloc8 8");
+        builder_.emitRaw("    store" + qbeType + " " + rhs + ", " + slotAddr);
+        builder_.emitRaw("    jnz " + cmpResult + ", @" + thenLabel + ", @" + endLabel);
+        builder_.emitLabel(thenLabel);
+        builder_.emitRaw("    store" + qbeType + " " + lhs + ", " + slotAddr);
+        builder_.emitRaw("    jmp @" + endLabel);
+        builder_.emitLabel(endLabel);
+        std::string result = builder_.newTemp();
+        builder_.emitRaw("    " + result + " =" + qbeType + " load" + qbeType + " " + slotAddr);
         return result;
     }
     
@@ -4882,10 +4969,13 @@ std::string ASTEmitter::loadArrayElement(const std::string& arrayName,
     const auto& arraySymbol = it->second;
     
     BaseType elemType = arraySymbol.elementTypeDesc.baseType;
-    std::string qbeType = typeManager_.getQBEType(elemType);
+    
+    // Use sub-word load ops for BYTE/SHORT to avoid reading adjacent elements
+    std::string qbeType, loadOp, storeOp;
+    getMemoryLoadStoreOps(elemType, qbeType, loadOp, storeOp);
     
     std::string result = builder_.newTemp();
-    builder_.emitLoad(result, qbeType, elemAddr);
+    builder_.emitRaw("    " + result + " =" + qbeType + " " + loadOp + " " + elemAddr);
     
     return result;
 }
@@ -4949,9 +5039,12 @@ void ASTEmitter::storeArrayElement(const std::string& arrayName,
     const auto& arraySymbol = it->second;
     
     BaseType elemType = arraySymbol.elementTypeDesc.baseType;
-    std::string qbeType = typeManager_.getQBEType(elemType);
     
-    builder_.emitStore(qbeType, value, elemAddr);
+    // Use sub-word store ops for BYTE/SHORT to avoid corrupting adjacent elements
+    std::string qbeType, loadOp, storeOp;
+    getMemoryLoadStoreOps(elemType, qbeType, loadOp, storeOp);
+    
+    builder_.emitRaw("    " + storeOp + " " + value + ", " + elemAddr);
 }
 
 // === Type Inference ===
@@ -5090,6 +5183,24 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
             // ABS returns same type as argument
             if (upperName == "ABS" && callExpr->arguments.size() == 1) {
                 return getExpressionType(callExpr->arguments[0].get());
+            }
+            
+            // SUM, MAX, MIN, AVG, DOT — array reductions return the element type
+            // of the source array (inferred from the argument expression).
+            // For 1-arg forms (array reduction), return argument's element type.
+            // For 2-arg scalar MAX/MIN, return the promoted type.
+            if (upperName == "SUM" || upperName == "AVG" || upperName == "DOT") {
+                if (callExpr->arguments.size() >= 1) {
+                    return getExpressionType(callExpr->arguments[0].get());
+                }
+            }
+            if ((upperName == "MAX" || upperName == "MIN") && callExpr->arguments.size() == 1) {
+                return getExpressionType(callExpr->arguments[0].get());
+            }
+            if ((upperName == "MAX" || upperName == "MIN") && callExpr->arguments.size() == 2) {
+                BaseType t1 = getExpressionType(callExpr->arguments[0].get());
+                BaseType t2 = getExpressionType(callExpr->arguments[1].get());
+                return typeManager_.getPromotedType(t1, t2);
             }
             
             // Floating point math functions
@@ -6788,6 +6899,12 @@ void ASTEmitter::emitSliceAssignStatement(const SliceAssignStatement* stmt) {
 // Helper: Convert BaseType to runtime type suffix character
 char ASTEmitter::getTypeSuffixChar(BaseType type) {
     switch (type) {
+        case BaseType::BYTE:
+        case BaseType::UBYTE:
+            return 'b';  // BYTE (1-byte element)
+        case BaseType::SHORT:
+        case BaseType::USHORT:
+            return 'h';  // SHORT (2-byte element)
         case BaseType::INTEGER:
         case BaseType::UINTEGER:
             return '%';  // INTEGER
@@ -6966,6 +7083,8 @@ int ASTEmitter::simdArrangementCode(const FasterBASIC::TypeDeclarationStatement:
     //   1 = Kl  (.2d integer)
     //   2 = Ks  (.4s float)
     //   3 = Kd  (.2d float)
+    //   4 =      .8h integer  (8×16-bit, SHORT)
+    //   5 =      .16b integer (16×8-bit, BYTE)
     using SIMDType = FasterBASIC::TypeDeclarationStatement::SIMDType;
     switch (info.type) {
         case SIMDType::V4S:
@@ -6975,6 +7094,10 @@ int ASTEmitter::simdArrangementCode(const FasterBASIC::TypeDeclarationStatement:
         case SIMDType::V2D:
         case SIMDType::PAIR:
             return info.isFloatingPoint ? 3 : 1;  // .2d float or .2d int
+        case SIMDType::V8H:
+            return 4;  // .8h integer (8×16-bit)
+        case SIMDType::V16B:
+            return 5;  // .16b integer (16×8-bit)
         default:
             return info.isFloatingPoint ? 2 : 0;  // default to .4s
     }
@@ -8257,9 +8380,14 @@ void ASTEmitter::emitWhileDirect(const FasterBASIC::WhileStatement* stmt) {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// isNEONArrayExprEnabled — check the ENABLE_NEON_LOOP kill-switch
+// isNEONArrayExprEnabled — check OPTION NEON OFF and ENABLE_NEON_LOOP env var
 // ---------------------------------------------------------------------------
 bool ASTEmitter::isNEONArrayExprEnabled() {
+    // Check compiler directive first (OPTION NEON OFF)
+    if (!semantic_.getSymbolTable().neonEnabled) {
+        return false;
+    }
+    // Then check environment variable kill-switch
     static int checked = 0;
     static int enabled = 1;
     if (!checked) {
@@ -8317,6 +8445,46 @@ ASTEmitter::getSIMDInfoForArrayElement(const FasterBASIC::ArraySymbol& arr) {
     }
 
     switch (elemType) {
+        case BaseType::BYTE:
+            info.type = SIMDType::V16B;
+            info.laneCount = 16;
+            info.physicalLanes = 16;
+            info.laneBitWidth = 8;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::BYTE);
+            break;
+        case BaseType::UBYTE:
+            info.type = SIMDType::V16B;
+            info.laneCount = 16;
+            info.physicalLanes = 16;
+            info.laneBitWidth = 8;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::UBYTE);
+            break;
+        case BaseType::SHORT:
+            info.type = SIMDType::V8H;
+            info.laneCount = 8;
+            info.physicalLanes = 8;
+            info.laneBitWidth = 16;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::SHORT);
+            break;
+        case BaseType::USHORT:
+            info.type = SIMDType::V8H;
+            info.laneCount = 8;
+            info.physicalLanes = 8;
+            info.laneBitWidth = 16;
+            info.totalBytes = 16;
+            info.isFullQ = true;
+            info.isFloatingPoint = false;
+            info.laneBaseType = static_cast<int>(BaseType::USHORT);
+            break;
         case BaseType::INTEGER:
         case BaseType::UINTEGER:
             info.type = SIMDType::V4S;
@@ -8360,7 +8528,7 @@ ASTEmitter::getSIMDInfoForArrayElement(const FasterBASIC::ArraySymbol& arr) {
             info.laneBaseType = static_cast<int>(BaseType::LONG);
             break;
         default:
-            break;  // Not SIMD-eligible (STRING, BYTE, SHORT, etc.)
+            break;  // Not SIMD-eligible (STRING, etc.)
     }
     return info;
 }
@@ -8407,9 +8575,22 @@ bool ASTEmitter::tryEmitWholeArrayExpression(
         }
     }
 
+    // --- Case 1b: Unary array function — B() = ABS(A()), B() = SQR(A()) ---
+    if (value->getType() == ASTNodeType::EXPR_FUNCTION_CALL) {
+        auto* callExpr = static_cast<const FunctionCallExpression*>(value.get());
+        if (tryEmitArrayUnaryFunc(stmt, destArray, callExpr)) {
+            return true;
+        }
+    }
+
     // --- Case 2: Binary — C() = A() op B(), or B() = A() op scalar ---
+    //     Also try compound (FMA) patterns like D() = A() + B() * C()
     if (value->getType() == ASTNodeType::EXPR_BINARY) {
         auto* binExpr = static_cast<const BinaryExpression*>(value.get());
+        // Try compound expression (FMA) first
+        if (tryEmitCompoundArrayExpression(stmt, destArray, binExpr)) {
+            return true;
+        }
         return emitArrayBinaryOp(stmt, destArray, binExpr);
     }
 
@@ -9714,8 +9895,12 @@ void ASTEmitter::emitWholeArraySIMDLoop(
             elemType = arrIt->second.elementTypeDesc.baseType;
         }
         std::string qbeType = typeManager_.getQBEType(elemType);
-        std::string loadOp = "load" + qbeType;
-        std::string storeOp = "store" + qbeType;
+        // Use proper memory-width load/store (critical for BYTE/SHORT remainder)
+        std::string loadOp, storeOp;
+        {
+            std::string unusedQbe;
+            getMemoryLoadStoreOps(elemType, unusedQbe, loadOp, storeOp);
+        }
 
         if (info.operation == "copy") {
             std::string rSrcAddr = builder_.newTemp();
@@ -9751,6 +9936,953 @@ void ASTEmitter::emitWholeArraySIMDLoop(
 
     builder_.emitLabel(doneLabel);
     builder_.emitComment("=== End array expression loop ===");
+}
+
+// ---------------------------------------------------------------------------
+// getMemoryLoadStoreOps — return the correct QBE load/store ops for a type
+// For sub-word types (BYTE, SHORT) the register type is "w" but the
+// memory operations must use the narrow width to avoid corrupting
+// adjacent elements.
+// ---------------------------------------------------------------------------
+void ASTEmitter::getMemoryLoadStoreOps(
+        FasterBASIC::BaseType elemType,
+        std::string& outQbeType,
+        std::string& outLoadOp,
+        std::string& outStoreOp) {
+    using namespace FasterBASIC;
+    outQbeType = typeManager_.getQBEType(elemType);  // register width
+    switch (elemType) {
+        case BaseType::BYTE:
+            outLoadOp  = "loadsb";   // sign-extend byte → w
+            outStoreOp = "storeb";
+            break;
+        case BaseType::UBYTE:
+            outLoadOp  = "loadub";   // zero-extend byte → w
+            outStoreOp = "storeb";
+            break;
+        case BaseType::SHORT:
+            outLoadOp  = "loadsh";   // sign-extend half → w
+            outStoreOp = "storeh";
+            break;
+        case BaseType::USHORT:
+            outLoadOp  = "loaduh";   // zero-extend half → w
+            outStoreOp = "storeh";
+            break;
+        default:
+            // For INTEGER, LONG, SINGLE, DOUBLE etc. the width matches
+            outLoadOp  = "load" + outQbeType;
+            outStoreOp = "store" + outQbeType;
+            break;
+    }
+}
+
+// ===========================================================================
+// Compound Array Expressions (FMA) and Unary/Reduction Functions
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// tryEmitCompoundArrayExpression — detect D() = A() + B() * C() (FMA pattern)
+// ---------------------------------------------------------------------------
+bool ASTEmitter::tryEmitCompoundArrayExpression(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::BinaryExpression* binExpr) {
+    using namespace FasterBASIC;
+
+    // FMA pattern: D() = A() + B() * C()  or  D() = B() * C() + A()
+    // Only for addition (FMA = fused multiply-add)
+    if (binExpr->op != TokenType::PLUS) return false;
+
+    const BinaryExpression* mulExpr = nullptr;
+    const Expression* addendExpr = nullptr;
+
+    // Check: left is array, right is A() * B()
+    if (binExpr->right && binExpr->right->getType() == ASTNodeType::EXPR_BINARY) {
+        auto* rightBin = static_cast<const BinaryExpression*>(binExpr->right.get());
+        if (rightBin->op == TokenType::MULTIPLY &&
+            isWholeArrayRef(rightBin->left.get()) &&
+            isWholeArrayRef(rightBin->right.get()) &&
+            isWholeArrayRef(binExpr->left.get())) {
+            mulExpr = rightBin;
+            addendExpr = binExpr->left.get();
+        }
+    }
+    // Check: right is array, left is A() * B()
+    if (!mulExpr && binExpr->left && binExpr->left->getType() == ASTNodeType::EXPR_BINARY) {
+        auto* leftBin = static_cast<const BinaryExpression*>(binExpr->left.get());
+        if (leftBin->op == TokenType::MULTIPLY &&
+            isWholeArrayRef(leftBin->left.get()) &&
+            isWholeArrayRef(leftBin->right.get()) &&
+            isWholeArrayRef(binExpr->right.get())) {
+            mulExpr = leftBin;
+            addendExpr = binExpr->right.get();
+        }
+    }
+
+    if (!mulExpr || !addendExpr) return false;
+
+    // All three operands are whole-array refs
+    auto* addendArr = static_cast<const ArrayAccessExpression*>(addendExpr);
+    auto* mulLeftArr = static_cast<const ArrayAccessExpression*>(mulExpr->left.get());
+    auto* mulRightArr = static_cast<const ArrayAccessExpression*>(mulExpr->right.get());
+
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto addIt = symbolTable.arrays.find(addendArr->name);
+    auto mulLIt = symbolTable.arrays.find(mulLeftArr->name);
+    auto mulRIt = symbolTable.arrays.find(mulRightArr->name);
+    if (addIt == symbolTable.arrays.end() || mulLIt == symbolTable.arrays.end() ||
+        mulRIt == symbolTable.arrays.end())
+        return false;
+
+    // Verify element types match
+    BaseType destType = destArray.elementTypeDesc.baseType;
+    if (addIt->second.elementTypeDesc.baseType != destType ||
+        mulLIt->second.elementTypeDesc.baseType != destType ||
+        mulRIt->second.elementTypeDesc.baseType != destType)
+        return false;
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    builder_.emitComment("Array expression (FMA): " + stmt->variable
+        + "() = " + addendArr->name + "() + " + mulLeftArr->name
+        + "() * " + mulRightArr->name + "()");
+
+    // Try NEON path with fused multiply-add
+    if (simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled()) {
+        int arrCode = simdArrangementCode(simdInfo);
+
+        // Get array data pointers
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string addDescName = getArrayDescriptorPtr(addendArr->name);
+        std::string addArrPtr = builder_.newTemp();
+        builder_.emitLoad(addArrPtr, "l", addDescName);
+        std::string addDataPtr = builder_.newTemp();
+        builder_.emitCall(addDataPtr, "l", "array_get_data_ptr", "l " + addArrPtr);
+
+        std::string mulLDescName = getArrayDescriptorPtr(mulLeftArr->name);
+        std::string mulLArrPtr = builder_.newTemp();
+        builder_.emitLoad(mulLArrPtr, "l", mulLDescName);
+        std::string mulLDataPtr = builder_.newTemp();
+        builder_.emitCall(mulLDataPtr, "l", "array_get_data_ptr", "l " + mulLArrPtr);
+
+        std::string mulRDescName = getArrayDescriptorPtr(mulRightArr->name);
+        std::string mulRArrPtr = builder_.newTemp();
+        builder_.emitLoad(mulRArrPtr, "l", mulRDescName);
+        std::string mulRDataPtr = builder_.newTemp();
+        builder_.emitCall(mulRDataPtr, "l", "array_get_data_ptr", "l " + mulRArrPtr);
+
+        // Get bounds
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+        // Bounds-check sources
+        builder_.emitCall("", "", "array_check_range", "l " + addArrPtr + ", w " + lbW + ", w " + ubW);
+        builder_.emitCall("", "", "array_check_range", "l " + mulLArrPtr + ", w " + lbW + ", w " + ubW);
+        builder_.emitCall("", "", "array_check_range", "l " + mulRArrPtr + ", w " + lbW + ", w " + ubW);
+
+        // Compute total bytes
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, std::to_string(elemSize));
+
+        // NEON-aligned end offset
+        std::string neonEndOff = builder_.newTemp();
+        if (elemSize < 16) {
+            std::string neonMask = builder_.newTemp();
+            builder_.emitRaw("    " + neonMask + " =l copy -16");
+            builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+        } else {
+            builder_.emitRaw("    " + neonEndOff + " =l copy " + totalBytes);
+        }
+
+        // Cursor offset slot
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "fma_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "fma_body_" + std::to_string(loopId);
+        std::string remLabel = "fma_rem_" + std::to_string(loopId);
+        std::string remBodyLabel = "fma_rembody_" + std::to_string(loopId);
+        std::string doneLabel = "fma_done_" + std::to_string(loopId);
+
+        builder_.emitComment("=== FMA: NEON vectorized loop ===");
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+        builder_.emitBranch(done, (elemSize < 16 ? remLabel : doneLabel), bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        // Load addend → v28 (accumulator), mulL → v29, mulR → v30
+        std::string addAddr = builder_.newTemp();
+        builder_.emitBinary(addAddr, "l", "add", addDataPtr, off);
+        std::string mulLAddr = builder_.newTemp();
+        builder_.emitBinary(mulLAddr, "l", "add", mulLDataPtr, off);
+        std::string mulRAddr = builder_.newTemp();
+        builder_.emitBinary(mulRAddr, "l", "add", mulRDataPtr, off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+        builder_.emitRaw("    neonldr " + addAddr);   // v28 = addend
+        builder_.emitRaw("    neonldr2 " + mulLAddr);  // v29 = mulL
+        builder_.emitRaw("    neonldr3 " + mulRAddr);  // v30 = mulR
+        builder_.emitRaw("    neonfma " + std::to_string(arrCode));  // v28 += v29 * v30
+        builder_.emitRaw("    neonstr " + dstAddr);    // store result
+
+        // Advance offset by 16 bytes
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "16");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        // Remainder loop for elements that don't fill a full NEON register
+        if (elemSize < 16) {
+            builder_.emitLabel(remLabel);
+            builder_.emitComment("FMA scalar remainder loop");
+
+            std::string remOff = builder_.newTemp();
+            builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+            std::string remDone = builder_.newTemp();
+            builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+            builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+            builder_.emitLabel(remBodyLabel);
+            std::string rOff = builder_.newTemp();
+            builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+
+            std::string qbeType, loadOp, storeOp;
+            getMemoryLoadStoreOps(destType, qbeType, loadOp, storeOp);
+
+            std::string rAddAddr = builder_.newTemp();
+            builder_.emitBinary(rAddAddr, "l", "add", addDataPtr, rOff);
+            std::string rMulLAddr = builder_.newTemp();
+            builder_.emitBinary(rMulLAddr, "l", "add", mulLDataPtr, rOff);
+            std::string rMulRAddr = builder_.newTemp();
+            builder_.emitBinary(rMulRAddr, "l", "add", mulRDataPtr, rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, rOff);
+
+            std::string aVal = builder_.newTemp();
+            builder_.emitRaw("    " + aVal + " =" + qbeType + " " + loadOp + " " + rAddAddr);
+            std::string mLVal = builder_.newTemp();
+            builder_.emitRaw("    " + mLVal + " =" + qbeType + " " + loadOp + " " + rMulLAddr);
+            std::string mRVal = builder_.newTemp();
+            builder_.emitRaw("    " + mRVal + " =" + qbeType + " " + loadOp + " " + rMulRAddr);
+
+            // result = addend + mulL * mulR
+            std::string prod = builder_.newTemp();
+            builder_.emitBinary(prod, qbeType, "mul", mLVal, mRVal);
+            std::string res = builder_.newTemp();
+            builder_.emitBinary(res, qbeType, "add", aVal, prod);
+            builder_.emitRaw("    " + storeOp + " " + res + ", " + rDstAddr);
+
+            std::string rNext = builder_.newTemp();
+            builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+            builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+            builder_.emitJump(remLabel);
+        }
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End FMA array expression ===");
+        return true;
+    }
+
+    // Scalar FMA fallback
+    builder_.emitComment("=== FMA: scalar fallback loop ===");
+
+    std::string qbeType, loadOp, storeOp;
+    getMemoryLoadStoreOps(destType, qbeType, loadOp, storeOp);
+
+    std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+    std::string destArrPtr = builder_.newTemp();
+    builder_.emitLoad(destArrPtr, "l", destDescName);
+    std::string destDataPtr = builder_.newTemp();
+    builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+    std::string addDescName = getArrayDescriptorPtr(addendArr->name);
+    std::string addArrPtr = builder_.newTemp();
+    builder_.emitLoad(addArrPtr, "l", addDescName);
+    std::string addDataPtr = builder_.newTemp();
+    builder_.emitCall(addDataPtr, "l", "array_get_data_ptr", "l " + addArrPtr);
+
+    std::string mulLDescName = getArrayDescriptorPtr(mulLeftArr->name);
+    std::string mulLArrPtr = builder_.newTemp();
+    builder_.emitLoad(mulLArrPtr, "l", mulLDescName);
+    std::string mulLDataPtr = builder_.newTemp();
+    builder_.emitCall(mulLDataPtr, "l", "array_get_data_ptr", "l " + mulLArrPtr);
+
+    std::string mulRDescName = getArrayDescriptorPtr(mulRightArr->name);
+    std::string mulRArrPtr = builder_.newTemp();
+    builder_.emitLoad(mulRArrPtr, "l", mulRDescName);
+    std::string mulRDataPtr = builder_.newTemp();
+    builder_.emitCall(mulRDataPtr, "l", "array_get_data_ptr", "l " + mulRArrPtr);
+
+    std::string lbW = builder_.newTemp();
+    builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+    std::string ubW = builder_.newTemp();
+    builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+
+    builder_.emitCall("", "", "array_check_range", "l " + addArrPtr + ", w " + lbW + ", w " + ubW);
+    builder_.emitCall("", "", "array_check_range", "l " + mulLArrPtr + ", w " + lbW + ", w " + ubW);
+    builder_.emitCall("", "", "array_check_range", "l " + mulRArrPtr + ", w " + lbW + ", w " + ubW);
+
+    std::string lbL = builder_.newTemp();
+    builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+    std::string ubL = builder_.newTemp();
+    builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+    std::string countL = builder_.newTemp();
+    builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+    std::string count1L = builder_.newTemp();
+    builder_.emitBinary(count1L, "l", "add", countL, "1");
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1L, std::to_string(elemSize));
+
+    std::string curOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel 0, " + curOffSlot);
+
+    int loopId = builder_.getNextLabelId();
+    std::string hdrLabel = "fma_sc_hdr_" + std::to_string(loopId);
+    std::string bodyLabel = "fma_sc_body_" + std::to_string(loopId);
+    std::string doneLabel = "fma_sc_done_" + std::to_string(loopId);
+
+    builder_.emitJump(hdrLabel);
+    builder_.emitLabel(hdrLabel);
+
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+    std::string done = builder_.newTemp();
+    builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + totalBytes);
+    builder_.emitBranch(done, doneLabel, bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+    std::string rAddAddr = builder_.newTemp();
+    builder_.emitBinary(rAddAddr, "l", "add", addDataPtr, off);
+    std::string rMulLAddr = builder_.newTemp();
+    builder_.emitBinary(rMulLAddr, "l", "add", mulLDataPtr, off);
+    std::string rMulRAddr = builder_.newTemp();
+    builder_.emitBinary(rMulRAddr, "l", "add", mulRDataPtr, off);
+    std::string rDstAddr = builder_.newTemp();
+    builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, off);
+
+    std::string aVal = builder_.newTemp();
+    builder_.emitRaw("    " + aVal + " =" + qbeType + " " + loadOp + " " + rAddAddr);
+    std::string mLVal = builder_.newTemp();
+    builder_.emitRaw("    " + mLVal + " =" + qbeType + " " + loadOp + " " + rMulLAddr);
+    std::string mRVal = builder_.newTemp();
+    builder_.emitRaw("    " + mRVal + " =" + qbeType + " " + loadOp + " " + rMulRAddr);
+
+    std::string prod = builder_.newTemp();
+    builder_.emitBinary(prod, qbeType, "mul", mLVal, mRVal);
+    std::string res = builder_.newTemp();
+    builder_.emitBinary(res, qbeType, "add", aVal, prod);
+    builder_.emitRaw("    " + storeOp + " " + res + ", " + rDstAddr);
+
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+    builder_.emitJump(hdrLabel);
+
+    builder_.emitLabel(doneLabel);
+    builder_.emitComment("=== End FMA scalar fallback ===");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// tryEmitArrayUnaryFunc — B() = ABS(A()), B() = SQR(A())
+// ---------------------------------------------------------------------------
+bool ASTEmitter::tryEmitArrayUnaryFunc(
+        const FasterBASIC::LetStatement* stmt,
+        const FasterBASIC::ArraySymbol& destArray,
+        const FasterBASIC::FunctionCallExpression* callExpr) {
+    using namespace FasterBASIC;
+
+    std::string funcName = callExpr->name;
+    std::string upperFunc = funcName;
+    std::transform(upperFunc.begin(), upperFunc.end(), upperFunc.begin(), ::toupper);
+
+    // Only handle ABS and SQR with exactly one argument
+    bool isAbs = (upperFunc == "ABS");
+    bool isSqr = (upperFunc == "SQR" || upperFunc == "SQRT");
+    if (!isAbs && !isSqr) return false;
+    if (callExpr->arguments.size() != 1) return false;
+
+    // The argument must be a whole-array ref
+    const Expression* arg = callExpr->arguments[0].get();
+    if (!isWholeArrayRef(arg)) return false;
+
+    auto* srcRef = static_cast<const ArrayAccessExpression*>(arg);
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcIt = symbolTable.arrays.find(srcRef->name);
+    if (srcIt == symbolTable.arrays.end()) return false;
+
+    // Verify element types match
+    BaseType destType = destArray.elementTypeDesc.baseType;
+    if (srcIt->second.elementTypeDesc.baseType != destType) return false;
+
+    int elemSize = getElementSizeBytes(destArray);
+    if (elemSize <= 0) return false;
+
+    auto simdInfo = getSIMDInfoForArrayElement(destArray);
+
+    builder_.emitComment("Array expression (" + upperFunc + "): " + stmt->variable
+        + "() = " + upperFunc + "(" + srcRef->name + "())");
+
+    // --- NEON path for ABS ---
+    // neonabs supports all integer and float arrangements
+    // SQR has no NEON single-instruction equivalent (fsqrt is scalar only)
+    if (isAbs && simdInfo.isValid() && simdInfo.isFullQ && isNEONArrayExprEnabled()) {
+        int arrCode = simdArrangementCode(simdInfo);
+
+        std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+        std::string destArrPtr = builder_.newTemp();
+        builder_.emitLoad(destArrPtr, "l", destDescName);
+        std::string destDataPtr = builder_.newTemp();
+        builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+        std::string srcDescName = getArrayDescriptorPtr(srcRef->name);
+        std::string srcArrPtr = builder_.newTemp();
+        builder_.emitLoad(srcArrPtr, "l", srcDescName);
+        std::string srcDataPtr = builder_.newTemp();
+        builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+        std::string lbW = builder_.newTemp();
+        builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+        std::string ubW = builder_.newTemp();
+        builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+        builder_.emitCall("", "", "array_check_range", "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+        std::string lbL = builder_.newTemp();
+        builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+        std::string ubL = builder_.newTemp();
+        builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+        std::string countL = builder_.newTemp();
+        builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+        std::string count1L = builder_.newTemp();
+        builder_.emitBinary(count1L, "l", "add", countL, "1");
+        std::string totalBytes = builder_.newTemp();
+        builder_.emitBinary(totalBytes, "l", "mul", count1L, std::to_string(elemSize));
+
+        std::string neonEndOff = builder_.newTemp();
+        if (elemSize < 16) {
+            std::string neonMask = builder_.newTemp();
+            builder_.emitRaw("    " + neonMask + " =l copy -16");
+            builder_.emitBinary(neonEndOff, "l", "and", totalBytes, neonMask);
+        } else {
+            builder_.emitRaw("    " + neonEndOff + " =l copy " + totalBytes);
+        }
+
+        std::string curOffSlot = builder_.newTemp();
+        builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+        builder_.emitRaw("    storel 0, " + curOffSlot);
+
+        int loopId = builder_.getNextLabelId();
+        std::string hdrLabel = "absarr_hdr_" + std::to_string(loopId);
+        std::string bodyLabel = "absarr_body_" + std::to_string(loopId);
+        std::string remLabel = "absarr_rem_" + std::to_string(loopId);
+        std::string remBodyLabel = "absarr_rembody_" + std::to_string(loopId);
+        std::string doneLabel = "absarr_done_" + std::to_string(loopId);
+
+        builder_.emitComment("=== ABS array: NEON vectorized loop ===");
+        builder_.emitJump(hdrLabel);
+        builder_.emitLabel(hdrLabel);
+
+        std::string curOff = builder_.newTemp();
+        builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+        std::string done = builder_.newTemp();
+        builder_.emitRaw("    " + done + " =w cugel " + curOff + ", " + neonEndOff);
+        builder_.emitBranch(done, (elemSize < 16 ? remLabel : doneLabel), bodyLabel);
+
+        builder_.emitLabel(bodyLabel);
+        std::string off = builder_.newTemp();
+        builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+        std::string srcAddr = builder_.newTemp();
+        builder_.emitBinary(srcAddr, "l", "add", srcDataPtr, off);
+        std::string dstAddr = builder_.newTemp();
+        builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+        builder_.emitRaw("    neonldr " + srcAddr);
+        builder_.emitRaw("    neonabs " + std::to_string(arrCode));
+        builder_.emitRaw("    neonstr " + dstAddr);
+
+        std::string nextOff = builder_.newTemp();
+        builder_.emitBinary(nextOff, "l", "add", off, "16");
+        builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+        builder_.emitJump(hdrLabel);
+
+        // Remainder loop
+        if (elemSize < 16) {
+            builder_.emitLabel(remLabel);
+            builder_.emitComment("ABS scalar remainder loop");
+
+            std::string remOff = builder_.newTemp();
+            builder_.emitRaw("    " + remOff + " =l loadl " + curOffSlot);
+            std::string remDone = builder_.newTemp();
+            builder_.emitRaw("    " + remDone + " =w cugel " + remOff + ", " + totalBytes);
+            builder_.emitBranch(remDone, doneLabel, remBodyLabel);
+
+            builder_.emitLabel(remBodyLabel);
+            std::string rOff = builder_.newTemp();
+            builder_.emitRaw("    " + rOff + " =l loadl " + curOffSlot);
+
+            std::string qbeType, loadOp, storeOp;
+            getMemoryLoadStoreOps(destType, qbeType, loadOp, storeOp);
+
+            std::string rSrcAddr = builder_.newTemp();
+            builder_.emitBinary(rSrcAddr, "l", "add", srcDataPtr, rOff);
+            std::string rDstAddr = builder_.newTemp();
+            builder_.emitBinary(rDstAddr, "l", "add", destDataPtr, rOff);
+
+            std::string srcVal = builder_.newTemp();
+            builder_.emitRaw("    " + srcVal + " =" + qbeType + " " + loadOp + " " + rSrcAddr);
+
+            // Scalar ABS
+            std::string absVal;
+            if (typeManager_.isFloatingPoint(destType)) {
+                absVal = builder_.newTemp();
+                std::string rtFunc = (destType == BaseType::SINGLE) ? "fabsf" : "fabs";
+                builder_.emitCall(absVal, qbeType, rtFunc, qbeType + " " + srcVal);
+            } else {
+                // Integer ABS: val < 0 ? -val : val (branch-based, no 'select')
+                // Use destination address as scratch to avoid alloc inside loop
+                std::string negVal = builder_.newTemp();
+                builder_.emitBinary(negVal, qbeType, "sub", "0", srcVal);
+                std::string isNeg = builder_.newTemp();
+                builder_.emitRaw("    " + isNeg + " =w csltw " + srcVal + ", 0");
+                // Store default (srcVal) to dest, conditionally overwrite with negVal
+                builder_.emitRaw("    " + storeOp + " " + srcVal + ", " + rDstAddr);
+                int absLblId = builder_.getNextLabelId();
+                std::string absThen = "absrem_t_" + std::to_string(absLblId);
+                std::string absEnd  = "absrem_e_" + std::to_string(absLblId);
+                builder_.emitRaw("    jnz " + isNeg + ", @" + absThen + ", @" + absEnd);
+                builder_.emitLabel(absThen);
+                builder_.emitRaw("    " + storeOp + " " + negVal + ", " + rDstAddr);
+                builder_.emitRaw("    jmp @" + absEnd);
+                builder_.emitLabel(absEnd);
+                absVal = "0"; // dummy; already stored to rDstAddr
+            }
+            if (absVal != "0") builder_.emitRaw("    " + storeOp + " " + absVal + ", " + rDstAddr);
+
+            std::string rNext = builder_.newTemp();
+            builder_.emitBinary(rNext, "l", "add", rOff, std::to_string(elemSize));
+            builder_.emitRaw("    storel " + rNext + ", " + curOffSlot);
+            builder_.emitJump(remLabel);
+        }
+
+        builder_.emitLabel(doneLabel);
+        builder_.emitComment("=== End ABS array expression ===");
+        return true;
+    }
+
+    // --- Scalar fallback for ABS and SQR ---
+    builder_.emitComment("=== " + upperFunc + " array: scalar fallback loop ===");
+
+    std::string qbeType, loadOp, storeOp;
+    getMemoryLoadStoreOps(destType, qbeType, loadOp, storeOp);
+
+    std::string destDescName = getArrayDescriptorPtr(stmt->variable);
+    std::string destArrPtr = builder_.newTemp();
+    builder_.emitLoad(destArrPtr, "l", destDescName);
+    std::string destDataPtr = builder_.newTemp();
+    builder_.emitCall(destDataPtr, "l", "array_get_data_ptr", "l " + destArrPtr);
+
+    std::string srcDescName = getArrayDescriptorPtr(srcRef->name);
+    std::string srcArrPtr = builder_.newTemp();
+    builder_.emitLoad(srcArrPtr, "l", srcDescName);
+    std::string srcDataPtr = builder_.newTemp();
+    builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+    std::string lbW = builder_.newTemp();
+    builder_.emitCall(lbW, "w", "array_lbound", "l " + destArrPtr + ", w 1");
+    std::string ubW = builder_.newTemp();
+    builder_.emitCall(ubW, "w", "array_ubound", "l " + destArrPtr + ", w 1");
+    builder_.emitCall("", "", "array_check_range", "l " + srcArrPtr + ", w " + lbW + ", w " + ubW);
+
+    std::string lbL = builder_.newTemp();
+    builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+    std::string ubL = builder_.newTemp();
+    builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+    std::string countL = builder_.newTemp();
+    builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+    std::string count1L = builder_.newTemp();
+    builder_.emitBinary(count1L, "l", "add", countL, "1");
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1L, std::to_string(elemSize));
+
+    std::string curOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel 0, " + curOffSlot);
+
+    int loopId = builder_.getNextLabelId();
+    std::string hdrLabel = "unaryfn_hdr_" + std::to_string(loopId);
+    std::string bodyLabel = "unaryfn_body_" + std::to_string(loopId);
+    std::string doneLabel = "unaryfn_done_" + std::to_string(loopId);
+
+    builder_.emitJump(hdrLabel);
+    builder_.emitLabel(hdrLabel);
+
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+    std::string doneCheck = builder_.newTemp();
+    builder_.emitRaw("    " + doneCheck + " =w cugel " + curOff + ", " + totalBytes);
+    builder_.emitBranch(doneCheck, doneLabel, bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+    std::string srcAddr = builder_.newTemp();
+    builder_.emitBinary(srcAddr, "l", "add", srcDataPtr, off);
+    std::string dstAddr = builder_.newTemp();
+    builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);
+
+    std::string srcVal = builder_.newTemp();
+    builder_.emitRaw("    " + srcVal + " =" + qbeType + " " + loadOp + " " + srcAddr);
+
+    std::string resultVal;
+    if (isAbs) {
+        if (typeManager_.isFloatingPoint(destType)) {
+            resultVal = builder_.newTemp();
+            std::string rtFunc = (destType == BaseType::SINGLE) ? "fabsf" : "fabs";
+            builder_.emitCall(resultVal, qbeType, rtFunc, qbeType + " " + srcVal);
+        } else {
+            // Integer ABS: val < 0 ? -val : val (branch-based, no 'select')
+            // Use destination address as scratch to avoid alloc inside loop
+            std::string negVal = builder_.newTemp();
+            builder_.emitBinary(negVal, qbeType, "sub", "0", srcVal);
+            std::string isNeg = builder_.newTemp();
+            builder_.emitRaw("    " + isNeg + " =w csltw " + srcVal + ", 0");
+            // Store default (srcVal) to dest, conditionally overwrite with negVal
+            builder_.emitRaw("    " + storeOp + " " + srcVal + ", " + dstAddr);
+            int absLblId2 = builder_.getNextLabelId();
+            std::string absThen2 = "abs_t_" + std::to_string(absLblId2);
+            std::string absEnd2  = "abs_e_" + std::to_string(absLblId2);
+            builder_.emitRaw("    jnz " + isNeg + ", @" + absThen2 + ", @" + absEnd2);
+            builder_.emitLabel(absThen2);
+            builder_.emitRaw("    " + storeOp + " " + negVal + ", " + dstAddr);
+            builder_.emitRaw("    jmp @" + absEnd2);
+            builder_.emitLabel(absEnd2);
+            resultVal = builder_.newTemp();
+            builder_.emitRaw("    " + resultVal + " =" + qbeType + " " + loadOp + " " + dstAddr);
+        }
+    } else {
+        // SQR: convert to double, call sqrt, convert back
+        std::string dblVal;
+        if (destType == BaseType::DOUBLE) {
+            dblVal = srcVal;
+        } else if (destType == BaseType::SINGLE) {
+            dblVal = builder_.newTemp();
+            builder_.emitRaw("    " + dblVal + " =d exts " + srcVal);
+        } else {
+            // Integer → double
+            dblVal = builder_.newTemp();
+            builder_.emitRaw("    " + dblVal + " =d swtof " + srcVal);
+        }
+        std::string sqrtResult = builder_.newTemp();
+        builder_.emitCall(sqrtResult, "d", "basic_sqrt", "d " + dblVal);
+        if (destType == BaseType::DOUBLE) {
+            resultVal = sqrtResult;
+        } else if (destType == BaseType::SINGLE) {
+            resultVal = builder_.newTemp();
+            builder_.emitRaw("    " + resultVal + " =s truncd " + sqrtResult);
+        } else {
+            resultVal = builder_.newTemp();
+            builder_.emitRaw("    " + resultVal + " =w dtosi " + sqrtResult);
+        }
+    }
+
+    builder_.emitRaw("    " + storeOp + " " + resultVal + ", " + dstAddr);
+
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+    builder_.emitJump(hdrLabel);
+
+    builder_.emitLabel(doneLabel);
+    builder_.emitComment("=== End " + upperFunc + " array expression ===");
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// tryEmitArrayReduction — SUM(A()), MAX(A()), MIN(A()), AVG(A()), DOT(A(),B())
+// Called from emitFunctionCall when an array reduction is detected.
+// Returns the QBE temporary holding the scalar result, or "" if not handled.
+// ---------------------------------------------------------------------------
+std::string ASTEmitter::tryEmitArrayReduction(
+        const FasterBASIC::FunctionCallExpression* expr) {
+    using namespace FasterBASIC;
+
+    std::string funcName = expr->name;
+    std::string upperFunc = funcName;
+    std::transform(upperFunc.begin(), upperFunc.end(), upperFunc.begin(), ::toupper);
+
+    bool isSUM = (upperFunc == "SUM");
+    bool isMAX = (upperFunc == "MAX");
+    bool isMIN = (upperFunc == "MIN");
+    bool isAVG = (upperFunc == "AVG");
+    bool isDOT = (upperFunc == "DOT");
+
+    // SUM/MAX/MIN/AVG take 1 array arg, DOT takes 2
+    if (isSUM || isMAX || isMIN || isAVG) {
+        if (expr->arguments.size() != 1) return "";
+        if (!isWholeArrayRef(expr->arguments[0].get())) return "";
+    } else if (isDOT) {
+        if (expr->arguments.size() != 2) return "";
+        if (!isWholeArrayRef(expr->arguments[0].get()) ||
+            !isWholeArrayRef(expr->arguments[1].get())) return "";
+    } else {
+        return "";
+    }
+
+    auto* srcRef = static_cast<const ArrayAccessExpression*>(expr->arguments[0].get());
+    const auto& symbolTable = semantic_.getSymbolTable();
+    auto srcIt = symbolTable.arrays.find(srcRef->name);
+    if (srcIt == symbolTable.arrays.end()) return "";
+
+    BaseType elemType = srcIt->second.elementTypeDesc.baseType;
+    int elemSize = getElementSizeBytes(srcIt->second);
+    if (elemSize <= 0) return "";
+
+    // DOT: check second array matches
+    const ArrayAccessExpression* srcRef2 = nullptr;
+    if (isDOT) {
+        srcRef2 = static_cast<const ArrayAccessExpression*>(expr->arguments[1].get());
+        auto srcIt2 = symbolTable.arrays.find(srcRef2->name);
+        if (srcIt2 == symbolTable.arrays.end()) return "";
+        if (srcIt2->second.elementTypeDesc.baseType != elemType) return "";
+    }
+
+    std::string qbeType, loadOp, storeOp;
+    getMemoryLoadStoreOps(elemType, qbeType, loadOp, storeOp);
+
+    // Determine accumulator type — reductions always produce at least 'w' or 'd'
+    std::string accType = qbeType;
+    if (accType == "s") accType = "s";  // keep single for float
+    // For byte/short, accumulate in w (32-bit) to avoid overflow
+    // qbeType is already "w" for BYTE/SHORT
+
+    builder_.emitComment("Array reduction: " + upperFunc + "(" + srcRef->name + "()"
+        + (isDOT ? ", " + srcRef2->name + "()" : "") + ")");
+
+    // Get source array data pointer and bounds
+    std::string srcDescName = getArrayDescriptorPtr(srcRef->name);
+    std::string srcArrPtr = builder_.newTemp();
+    builder_.emitLoad(srcArrPtr, "l", srcDescName);
+    std::string srcDataPtr = builder_.newTemp();
+    builder_.emitCall(srcDataPtr, "l", "array_get_data_ptr", "l " + srcArrPtr);
+
+    std::string lbW = builder_.newTemp();
+    builder_.emitCall(lbW, "w", "array_lbound", "l " + srcArrPtr + ", w 1");
+    std::string ubW = builder_.newTemp();
+    builder_.emitCall(ubW, "w", "array_ubound", "l " + srcArrPtr + ", w 1");
+
+    // DOT: get second source pointer
+    std::string srcDataPtr2;
+    if (isDOT) {
+        std::string src2DescName = getArrayDescriptorPtr(srcRef2->name);
+        std::string src2ArrPtr = builder_.newTemp();
+        builder_.emitLoad(src2ArrPtr, "l", src2DescName);
+        srcDataPtr2 = builder_.newTemp();
+        builder_.emitCall(srcDataPtr2, "l", "array_get_data_ptr", "l " + src2ArrPtr);
+        builder_.emitCall("", "", "array_check_range", "l " + src2ArrPtr + ", w " + lbW + ", w " + ubW);
+    }
+
+    // Compute total bytes
+    std::string lbL = builder_.newTemp();
+    builder_.emitRaw("    " + lbL + " =l extsw " + lbW);
+    std::string ubL = builder_.newTemp();
+    builder_.emitRaw("    " + ubL + " =l extsw " + ubW);
+    std::string countL = builder_.newTemp();
+    builder_.emitBinary(countL, "l", "sub", ubL, lbL);
+    std::string count1L = builder_.newTemp();
+    builder_.emitBinary(count1L, "l", "add", countL, "1");
+    std::string totalBytes = builder_.newTemp();
+    builder_.emitBinary(totalBytes, "l", "mul", count1L, std::to_string(elemSize));
+
+    // Accumulator slot
+    std::string accSlot = builder_.newTemp();
+    builder_.emitRaw("    " + accSlot + " =l alloc8 8");
+
+    // Initialise accumulator
+    if (isSUM || isDOT || isAVG) {
+        // Start at zero
+        if (typeManager_.isFloatingPoint(elemType)) {
+            if (elemType == BaseType::SINGLE)
+                builder_.emitRaw("    stores s_0.0, " + accSlot);
+            else
+                builder_.emitRaw("    stored d_0.0, " + accSlot);
+        } else {
+            builder_.emitRaw("    storew 0, " + accSlot);
+        }
+    } else {
+        // MAX/MIN: start with first element
+        std::string firstAddr = builder_.newTemp();
+        builder_.emitRaw("    " + firstAddr + " =l copy " + srcDataPtr);
+        std::string firstVal = builder_.newTemp();
+        builder_.emitRaw("    " + firstVal + " =" + qbeType + " " + loadOp + " " + firstAddr);
+        builder_.emitRaw("    store" + qbeType + " " + firstVal + ", " + accSlot);
+    }
+
+    // Cursor offset slot
+    std::string curOffSlot = builder_.newTemp();
+    builder_.emitRaw("    " + curOffSlot + " =l alloc8 8");
+    builder_.emitRaw("    storel 0, " + curOffSlot);
+
+    int loopId = builder_.getNextLabelId();
+    std::string hdrLabel = "reduce_hdr_" + std::to_string(loopId);
+    std::string bodyLabel = "reduce_body_" + std::to_string(loopId);
+    std::string doneLabel = "reduce_done_" + std::to_string(loopId);
+
+    builder_.emitJump(hdrLabel);
+    builder_.emitLabel(hdrLabel);
+
+    std::string curOff = builder_.newTemp();
+    builder_.emitRaw("    " + curOff + " =l loadl " + curOffSlot);
+    std::string doneCheck = builder_.newTemp();
+    builder_.emitRaw("    " + doneCheck + " =w cugel " + curOff + ", " + totalBytes);
+    builder_.emitBranch(doneCheck, doneLabel, bodyLabel);
+
+    builder_.emitLabel(bodyLabel);
+    std::string off = builder_.newTemp();
+    builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
+
+    std::string elemAddr = builder_.newTemp();
+    builder_.emitBinary(elemAddr, "l", "add", srcDataPtr, off);
+    std::string elemVal = builder_.newTemp();
+    builder_.emitRaw("    " + elemVal + " =" + qbeType + " " + loadOp + " " + elemAddr);
+
+    // For DOT: load second array element and multiply
+    std::string opVal = elemVal;
+    if (isDOT) {
+        std::string elem2Addr = builder_.newTemp();
+        builder_.emitBinary(elem2Addr, "l", "add", srcDataPtr2, off);
+        std::string elem2Val = builder_.newTemp();
+        builder_.emitRaw("    " + elem2Val + " =" + qbeType + " " + loadOp + " " + elem2Addr);
+        opVal = builder_.newTemp();
+        builder_.emitBinary(opVal, qbeType, "mul", elemVal, elem2Val);
+    }
+
+    // Load current accumulator
+    std::string curAcc = builder_.newTemp();
+    builder_.emitRaw("    " + curAcc + " =" + qbeType + " load" + qbeType + " " + accSlot);
+
+    // Update accumulator based on operation
+    std::string newAcc;
+    if (isSUM || isDOT || isAVG) {
+        newAcc = builder_.newTemp();
+        builder_.emitBinary(newAcc, qbeType, "add", curAcc, opVal);
+    } else if (isMAX) {
+        // max(curAcc, elemVal): curAcc >= elemVal ? curAcc : elemVal
+        // Branch-based conditional (no 'select' instruction in this QBE)
+        std::string cmpResult = builder_.newTemp();
+        if (typeManager_.isFloatingPoint(elemType)) {
+            std::string cmpOp = (elemType == BaseType::SINGLE) ? "cges" : "cged";
+            builder_.emitRaw("    " + cmpResult + " =w " + cmpOp + " " + curAcc + ", " + opVal);
+        } else {
+            builder_.emitRaw("    " + cmpResult + " =w csgew " + curAcc + ", " + opVal);
+        }
+        // Store opVal (the "else" value) as default, conditionally overwrite with curAcc
+        int maxLblId = builder_.getNextLabelId();
+        std::string maxThen = "rmax_t_" + std::to_string(maxLblId);
+        std::string maxEnd  = "rmax_e_" + std::to_string(maxLblId);
+        builder_.emitRaw("    store" + qbeType + " " + opVal + ", " + accSlot);
+        builder_.emitRaw("    jnz " + cmpResult + ", @" + maxThen + ", @" + maxEnd);
+        builder_.emitLabel(maxThen);
+        builder_.emitRaw("    store" + qbeType + " " + curAcc + ", " + accSlot);
+        builder_.emitRaw("    jmp @" + maxEnd);
+        builder_.emitLabel(maxEnd);
+        newAcc = builder_.newTemp();
+        builder_.emitRaw("    " + newAcc + " =" + qbeType + " load" + qbeType + " " + accSlot);
+    } else if (isMIN) {
+        // min(curAcc, elemVal): curAcc <= elemVal ? curAcc : elemVal
+        // Branch-based conditional (no 'select' instruction in this QBE)
+        std::string cmpResult = builder_.newTemp();
+        if (typeManager_.isFloatingPoint(elemType)) {
+            std::string cmpOp = (elemType == BaseType::SINGLE) ? "cles" : "cled";
+            builder_.emitRaw("    " + cmpResult + " =w " + cmpOp + " " + curAcc + ", " + opVal);
+        } else {
+            builder_.emitRaw("    " + cmpResult + " =w cslew " + curAcc + ", " + opVal);
+        }
+        int minLblId = builder_.getNextLabelId();
+        std::string minThen = "rmin_t_" + std::to_string(minLblId);
+        std::string minEnd  = "rmin_e_" + std::to_string(minLblId);
+        builder_.emitRaw("    store" + qbeType + " " + opVal + ", " + accSlot);
+        builder_.emitRaw("    jnz " + cmpResult + ", @" + minThen + ", @" + minEnd);
+        builder_.emitLabel(minThen);
+        builder_.emitRaw("    store" + qbeType + " " + curAcc + ", " + accSlot);
+        builder_.emitRaw("    jmp @" + minEnd);
+        builder_.emitLabel(minEnd);
+        newAcc = builder_.newTemp();
+        builder_.emitRaw("    " + newAcc + " =" + qbeType + " load" + qbeType + " " + accSlot);
+    }
+
+    builder_.emitRaw("    store" + qbeType + " " + newAcc + ", " + accSlot);
+
+    // Advance offset
+    std::string nextOff = builder_.newTemp();
+    builder_.emitBinary(nextOff, "l", "add", off, std::to_string(elemSize));
+    builder_.emitRaw("    storel " + nextOff + ", " + curOffSlot);
+    builder_.emitJump(hdrLabel);
+
+    builder_.emitLabel(doneLabel);
+
+    // Load final accumulator value
+    std::string result = builder_.newTemp();
+    builder_.emitRaw("    " + result + " =" + qbeType + " load" + qbeType + " " + accSlot);
+
+    // AVG: divide by count
+    if (isAVG) {
+        std::string countVal;
+        if (typeManager_.isFloatingPoint(elemType)) {
+            countVal = builder_.newTemp();
+            if (elemType == BaseType::SINGLE)
+                builder_.emitRaw("    " + countVal + " =s swtof " + count1L);
+            else
+                builder_.emitRaw("    " + countVal + " =d sltof " + count1L);
+            std::string avgResult = builder_.newTemp();
+            builder_.emitBinary(avgResult, qbeType, "div", result, countVal);
+            result = avgResult;
+        } else {
+            // Integer average: result / count (truncating)
+            std::string countW = builder_.newTemp();
+            builder_.emitRaw("    " + countW + " =w copy " + count1L);
+            std::string avgResult = builder_.newTemp();
+            builder_.emitBinary(avgResult, "w", "div", result, countW);
+            result = avgResult;
+        }
+    }
+
+    builder_.emitComment("=== End " + upperFunc + " reduction ===");
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -9838,8 +10970,12 @@ void ASTEmitter::emitWholeArrayScalarLoop(
     std::string off = builder_.newTemp();
     builder_.emitRaw("    " + off + " =l loadl " + curOffSlot);
 
-    std::string loadOp = "load" + qbeType;
-    std::string storeOp = "store" + qbeType;
+    // Use proper memory-width load/store (critical for BYTE/SHORT correctness)
+    std::string loadOp, storeOp;
+    {
+        std::string unusedQbe;
+        getMemoryLoadStoreOps(elemType, unusedQbe, loadOp, storeOp);
+    }
 
     std::string dstAddr = builder_.newTemp();
     builder_.emitBinary(dstAddr, "l", "add", destDataPtr, off);

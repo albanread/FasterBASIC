@@ -26,7 +26,7 @@ char *tok[] = {
 	"vaarg", "vastart", "...", "env", "dbgloc",
 
 	/* ARM64 NEON vector operations */
-	"neonldr", "neonstr", "neonldr2", "neonstr2",
+	"neonldr", "neonstr", "neonldr2", "neonstr2", "neonldr3",
 	"neonadd", "neonsub", "neonmul", "neonaddv",
 	"neondiv", "neonneg", "neonabs", "neonfma",
 	"neonmin", "neonmax", "neondup",

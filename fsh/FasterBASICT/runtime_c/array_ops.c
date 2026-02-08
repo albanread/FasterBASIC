@@ -58,6 +58,12 @@ BasicArray* array_new(char type_suffix, int32_t dimensions, int32_t* bounds, int
     
     // Determine element size based on type suffix
     switch (type_suffix) {
+        case 'b': // BYTE (1-byte element)
+            array->element_size = 1;
+            break;
+        case 'h': // SHORT (2-byte element)
+            array->element_size = 2;
+            break;
         case '%': // INTEGER
             array->element_size = sizeof(int32_t);
             break;
