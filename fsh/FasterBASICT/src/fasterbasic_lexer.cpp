@@ -86,9 +86,15 @@ void Lexer::initializeKeywords() {
         s_keywords["DEF"] = TokenType::DEF;
         s_keywords["FN"] = TokenType::FN;
         s_keywords["IIF"] = TokenType::IIF;
-        s_keywords["MID"] = TokenType::MID;
-        s_keywords["LEFT"] = TokenType::LEFT;
-        s_keywords["RIGHT"] = TokenType::RIGHT;
+        // NOTE: MID, LEFT, RIGHT are NOT registered as keywords.
+        // Their $-suffixed forms (MID$, LEFT$, RIGHT$) are registered as
+        // dynamic commands (REGISTRY_FUNCTION) and handled via the function
+        // call path.  Registering the bare names as keywords would steal
+        // them from the user's variable namespace for no benefit — the
+        // parser never dispatches on TokenType::MID / LEFT / RIGHT.
+        // s_keywords["MID"] = TokenType::MID;
+        // s_keywords["LEFT"] = TokenType::LEFT;
+        // s_keywords["RIGHT"] = TokenType::RIGHT;
         s_keywords["ON"] = TokenType::ON;
         s_keywords["ONEVENT"] = TokenType::ONEVENT;
     
@@ -546,12 +552,55 @@ Token Lexer::scanIdentifierOrKeyword() {
     
     // Check for type suffix (%, !, #, $, @, ^)
     char suffix = currentChar();
+    bool hasSuffix = false;
     if (suffix == '%' || suffix == '!' || suffix == '#' || suffix == '$' || 
         suffix == '@' || suffix == '^') {
         text += advance();
+        hasSuffix = true;
     }
     
-    // Convert to uppercase for keyword matching
+    // =========================================================================
+    // Suffix-aware disambiguation
+    //
+    // Type suffixes (%, !, #, @, ^) mark variable types and should NEVER clash
+    // with keyword or function names.  No keyword/function uses these suffixes,
+    // so any identifier carrying one is unambiguously a variable/array name.
+    //
+    // The $ suffix is special: string functions traditionally include $ in
+    // their name (LEFT$, CHR$, MID$, ...).  We resolve the ambiguity with a
+    // simple lookahead: if identifier$ is followed by '(' (possibly after
+    // whitespace) we treat it as a function call; otherwise it is a variable.
+    // This lets users write  left$ = "hello"  without clashing with LEFT$().
+    // =========================================================================
+    
+    if (hasSuffix) {
+        if (suffix != '$') {
+            // Non-$ suffix (%, !, #, @, ^): always an identifier — no
+            // keyword or registered function uses these characters.
+            return Token(TokenType::IDENTIFIER, text, startLoc);
+        }
+        
+        // $ suffix: only match as keyword/function when followed by '('
+        // Convert to uppercase for matching
+        std::string upperText = text;
+        for (char& c : upperText) {
+            c = std::toupper(c);
+        }
+        
+        char nextNonWS = peekNextNonWhitespace();
+        if (nextNonWS == '(') {
+            // Looks like a function call — check keyword / dynamic-command tables
+            TokenType keywordType = getKeywordType(upperText);
+            if (keywordType != TokenType::UNKNOWN) {
+                return Token(keywordType, text, startLoc);
+            }
+        }
+        
+        // Not followed by '(' or not a known function → it's a variable
+        return Token(TokenType::IDENTIFIER, text, startLoc);
+    }
+    
+    // No suffix: standard keyword / function lookup
     std::string upperText = text;
     for (char& c : upperText) {
         c = std::toupper(c);

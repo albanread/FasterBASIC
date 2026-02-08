@@ -84,6 +84,7 @@ private:
     // Character inspection
     char currentChar() const;
     char peekChar(int offset = 1) const;
+    char peekNextNonWhitespace() const;  // Peek past spaces/tabs without consuming
     bool isAtEnd() const;
     
     // Character consumption
@@ -143,6 +144,14 @@ inline char Lexer::peekChar(int offset) const {
 
 inline bool Lexer::isAtEnd() const {
     return m_position >= m_source.length();
+}
+
+inline char Lexer::peekNextNonWhitespace() const {
+    size_t pos = m_position;
+    while (pos < m_source.length() && (m_source[pos] == ' ' || m_source[pos] == '\t')) {
+        pos++;
+    }
+    return (pos < m_source.length()) ? m_source[pos] : '\0';
 }
 
 inline char Lexer::advance() {

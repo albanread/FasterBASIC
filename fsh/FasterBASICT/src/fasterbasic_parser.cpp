@@ -1022,6 +1022,14 @@ StatementPtr Parser::parseStatement() {
             if (current().value == "MID$") {
                 return parseLetStatement();
             }
+            // Check if this is actually a variable/array assignment, e.g.
+            //   left$(3) = "hello"
+            // With suffix-aware lexing, $-suffixed names followed by '(' are
+            // still tokenized as REGISTRY_FUNCTION.  We disambiguate here by
+            // checking whether the full construct is an assignment.
+            if (isAssignment()) {
+                return parseLetStatement();
+            }
             // For other registry functions, treat as function call statement
             if (peek().type == TokenType::LPAREN) {
                 std::string funcName = current().value;
@@ -1198,7 +1206,8 @@ StatementPtr Parser::parseInputStatement() {
 
     // Parse variable list
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in INPUT statement");
             break;
         }
@@ -1267,7 +1276,8 @@ StatementPtr Parser::parseLetStatement() {
         return midStmt;
     }
 
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name in assignment");
         return nullptr;
     }
@@ -2665,7 +2675,8 @@ StatementPtr Parser::parseForStatement() {
     if (current().type == TokenType::EACH) {
         advance(); // consume EACH
 
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name after FOR EACH");
             return nullptr;
         }
@@ -2702,7 +2713,8 @@ StatementPtr Parser::parseForStatement() {
         if (current().type == TokenType::COMMA) {
             advance(); // consume comma
 
-            if (current().type != TokenType::IDENTIFIER) {
+            if (current().type != TokenType::IDENTIFIER &&
+                current().type != TokenType::REGISTRY_FUNCTION) {
                 error("Expected second variable name after comma in FOR EACH");
                 return nullptr;
             }
@@ -2784,7 +2796,8 @@ StatementPtr Parser::parseForStatement() {
     }
 
     // Traditional FOR loop - requires identifier
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name in FOR statement");
         return nullptr;
     }
@@ -3392,7 +3405,8 @@ StatementPtr Parser::parseDimStatement() {
 
     // Parse array or variable declarations
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable or array name in DIM statement");
             break;
         }
@@ -3508,7 +3522,8 @@ StatementPtr Parser::parseRedimStatement() {
 
     // Parse array declarations (similar to DIM)
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected array name in REDIM statement");
             break;
         }
@@ -3542,7 +3557,8 @@ StatementPtr Parser::parseEraseStatement() {
 
     // Parse array names
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected array name in ERASE statement");
             break;
         }
@@ -3560,7 +3576,8 @@ StatementPtr Parser::parseSwapStatement() {
     advance(); // consume SWAP
 
     // Parse first variable
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name after SWAP");
         return std::make_unique<RemStatement>("");
     }
@@ -3575,7 +3592,8 @@ StatementPtr Parser::parseSwapStatement() {
     }
 
     // Parse second variable
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected second variable name in SWAP");
         return std::make_unique<RemStatement>("");
     }
@@ -3590,7 +3608,8 @@ StatementPtr Parser::parseIncStatement() {
     advance(); // consume INC
 
     // Parse variable name
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name after INC");
         return std::make_unique<RemStatement>("");
     }
@@ -3631,7 +3650,8 @@ StatementPtr Parser::parseDecStatement() {
     advance(); // consume DEC
 
     // Parse variable name
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name after DEC");
         return std::make_unique<RemStatement>("");
     }
@@ -4241,7 +4261,8 @@ StatementPtr Parser::parseLocalStatement() {
 
     // Parse local variable declarations (similar to DIM but for locals)
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in LOCAL statement");
             break;
         }
@@ -4307,7 +4328,8 @@ StatementPtr Parser::parseGlobalStatement() {
 
     // Parse global variable declarations (similar to LOCAL)
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in GLOBAL statement");
             break;
         }
@@ -4373,7 +4395,8 @@ StatementPtr Parser::parseSharedStatement() {
 
     // Parse shared variable list (similar to LOCAL but for module-level access)
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in SHARED statement");
             break;
         }
@@ -4473,7 +4496,8 @@ StatementPtr Parser::parseReadStatement() {
 
     // Parse variable list
     do {
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in READ statement");
             break;
         }
@@ -4696,7 +4720,8 @@ StatementPtr Parser::parseInputStreamStatement() {
            current().type != TokenType::END_OF_LINE &&
            current().type != TokenType::COLON) {
 
-        if (current().type != TokenType::IDENTIFIER) {
+        if (current().type != TokenType::IDENTIFIER &&
+            current().type != TokenType::REGISTRY_FUNCTION) {
             error("Expected variable name in INPUT# statement");
             break;
         }
@@ -4771,7 +4796,8 @@ StatementPtr Parser::parseLineInputStreamStatement() {
     }
 
     // Parse variable name
-    if (current().type != TokenType::IDENTIFIER) {
+    if (current().type != TokenType::IDENTIFIER &&
+        current().type != TokenType::REGISTRY_FUNCTION) {
         error("Expected variable name in LINE INPUT# statement");
         return stmt;
     }
@@ -6403,6 +6429,7 @@ bool Parser::isStartOfExpression() const {
     return type == TokenType::NUMBER ||
            type == TokenType::STRING ||
            type == TokenType::IDENTIFIER ||
+           type == TokenType::REGISTRY_FUNCTION ||
            type == TokenType::LPAREN ||
            type == TokenType::MINUS ||
            type == TokenType::PLUS ||
