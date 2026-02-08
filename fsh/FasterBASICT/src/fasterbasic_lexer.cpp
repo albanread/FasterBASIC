@@ -171,6 +171,7 @@ void Lexer::initializeKeywords() {
         s_keywords["ME"] = TokenType::ME;
         s_keywords["SUPER"] = TokenType::SUPER;
         s_keywords["NEW"] = TokenType::NEW;
+        s_keywords["CREATE"] = TokenType::CREATE;
         s_keywords["DELETE"] = TokenType::DELETE;
         s_keywords["NOTHING"] = TokenType::NOTHING;
     

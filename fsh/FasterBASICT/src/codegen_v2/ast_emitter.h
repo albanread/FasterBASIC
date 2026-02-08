@@ -626,6 +626,29 @@ private:
                                  const std::string& targetAddr,
                                  const FasterBASIC::TypeSymbol& udtDef,
                                  const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap);
+
+    // === UDT Equality Comparison (= and <>) ===
+    // Emits field-by-field comparison of two UDT values with short-circuit
+    // evaluation.  For EQUAL (=): returns 1 if all fields match, 0 otherwise.
+    // For NOT_EQUAL (<>): returns 1 if any field differs, 0 otherwise.
+    // Handles string fields (via string_compare), nested UDTs (recursively),
+    // and all numeric types with appropriate QBE comparison ops.
+    // Returns the QBE temporary holding the comparison result (w: 0 or 1).
+    std::string emitUDTComparison(const std::string& leftAddr,
+                                  const std::string& rightAddr,
+                                  const FasterBASIC::TypeSymbol& udtDef,
+                                  const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap,
+                                  FasterBASIC::TokenType op);
+
+    // === PRINT whole UDT value ===
+    // Emits code to print a UDT value in debug-friendly format:
+    //   TypeName(field1, field2, ...)
+    // String fields are printed with surrounding quotes.
+    // Nested UDTs are printed recursively.
+    // Numeric fields use the appropriate print routine for their type.
+    void emitPrintUDTValue(const std::string& udtAddr,
+                           const FasterBASIC::TypeSymbol& udtDef,
+                           const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap);
     
     // === NEON Phase 2: Element-wise UDT arithmetic ===
     // Detects patterns like C = A + B where A, B, C are the same SIMD-eligible

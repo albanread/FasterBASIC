@@ -155,7 +155,8 @@ enum class TokenType {
     METHOD,          // METHOD (class method)
     ME,              // ME (current object reference inside METHOD/CONSTRUCTOR)
     SUPER,           // SUPER (parent class reference)
-    NEW,             // NEW (object instantiation)
+    NEW,             // NEW (object instantiation - heap allocated CLASS)
+    CREATE,          // CREATE (UDT value-type initialization - stack allocated TYPE)
     DELETE,          // DELETE (object destruction)
     NOTHING,         // NOTHING (null object reference)
     
@@ -525,6 +526,7 @@ inline const char* tokenTypeToString(TokenType type) {
         case TokenType::ME: return "ME";
         case TokenType::SUPER: return "SUPER";
         case TokenType::NEW: return "NEW";
+        case TokenType::CREATE: return "CREATE";
         case TokenType::DELETE: return "DELETE";
         case TokenType::NOTHING: return "NOTHING";
         

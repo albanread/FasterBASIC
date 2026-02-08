@@ -102,6 +102,27 @@ REDIM PRESERVE numbers%(30)
 OPTION BASE 0
 ```
 
+#### Array Expressions
+Whole-array operations apply to every element in a single statement. Supported on all numeric types (including SIMD-eligible UDTs).
+
+```basic
+' Element-wise arithmetic
+C() = A() + B()
+D() = A() * B()
+
+' Scalar broadcast
+C() = A() + 10.0
+
+' Array copy & fill
+B() = A()
+A() = 0
+
+' Reductions
+sum! = SUM(A())
+max! = MAX(A())
+```
+See [Array Expressions](ARRAY_EXPRESSIONS.md) for full documentation.
+
 #### HashMaps
 ```basic
 ' Declaration

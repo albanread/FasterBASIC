@@ -31,6 +31,31 @@
         "scopeName": "source.fasterbasic",
         "path": "./syntaxes/fasterbasic.tmLanguage.json"
       }
+    ],
+    "snippets": [
+      {
+        "language": "fasterbasic",
+        "path": "./snippets/fasterbasic.json"
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "fasterbasic",
+        "owner": "fasterbasic",
+        "fileLocation": ["absolute"],
+        "pattern": [
+          {
+            "regexp": "^(?:Parse|Semantic) errors in: (.*)$",
+            "file": 1
+          },
+          {
+            "regexp": "^\\s+Line\\s+(\\d+):\\s+(.*)$",
+            "line": 1,
+            "message": 2,
+            "loop": true
+          }
+        ]
+      }
     ]
   }
 }

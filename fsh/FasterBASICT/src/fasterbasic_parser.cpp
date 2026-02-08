@@ -4252,6 +4252,80 @@ ExpressionPtr Parser::parseNewExpression() {
     return expr;
 }
 
+ExpressionPtr Parser::parseCreateExpression() {
+    auto loc = current().location;
+    advance(); // consume CREATE
+    
+    if (current().type != TokenType::IDENTIFIER && !current().isKeyword()) {
+        error("Expected type name after CREATE");
+        return std::make_unique<NumberExpression>(0);
+    }
+    
+    std::string typeName = current().value;
+    advance();
+    
+    auto expr = std::make_unique<CreateExpression>(typeName);
+    expr->location = loc;
+    
+    // Parse argument list — positional or named-field syntax.
+    //
+    // Positional:  CREATE TPoint(10, 20)
+    // Named:       CREATE TPoint(X := 10, Y := 20)
+    //
+    // Named-field detection: if the first argument looks like  IDENTIFIER := ...
+    // (i.e. current is IDENTIFIER, peek(1) is COLON, peek(2) is EQUAL), then
+    // all arguments must use named syntax.  Mixing is an error.
+    consume(TokenType::LPAREN, "Expected '(' after type name in CREATE expression");
+
+    // Detect named vs positional on the very first argument
+    bool detectedNamed = false;
+    bool firstArg = true;
+
+    while (current().type != TokenType::RPAREN && current().type != TokenType::END_OF_FILE) {
+        // Check for  FieldName := Expression  pattern
+        bool argIsNamed = false;
+        if ((current().type == TokenType::IDENTIFIER || current().isKeyword()) &&
+            peek(1).type == TokenType::COLON &&
+            peek(2).type == TokenType::EQUAL) {
+            argIsNamed = true;
+        }
+
+        if (firstArg) {
+            detectedNamed = argIsNamed;
+            expr->isNamed = detectedNamed;
+            firstArg = false;
+        } else {
+            // Consistency check: don't allow mixing
+            if (argIsNamed && !detectedNamed) {
+                error("Cannot mix positional and named arguments in CREATE — use all named (FieldName := value) or all positional");
+            } else if (!argIsNamed && detectedNamed) {
+                error("Cannot mix positional and named arguments in CREATE — use all named (FieldName := value) or all positional");
+            }
+        }
+
+        if (argIsNamed) {
+            // Consume  FieldName := Expression
+            std::string fieldName = current().value;
+            advance(); // consume field name
+            advance(); // consume ':'
+            advance(); // consume '='
+            expr->fieldNames.push_back(fieldName);
+            expr->arguments.push_back(parseExpression());
+        } else {
+            // Positional argument
+            expr->arguments.push_back(parseExpression());
+        }
+
+        if (current().type == TokenType::COMMA) {
+            advance();
+        }
+    }
+    
+    consume(TokenType::RPAREN, "Expected ')' after CREATE arguments");
+    
+    return expr;
+}
+
 StatementPtr Parser::parseLocalStatement() {
     auto stmt = std::make_unique<LocalStatement>();
     advance(); // consume LOCAL
@@ -5915,9 +5989,14 @@ ExpressionPtr Parser::parsePrimary() {
         }
     }
 
-    // NEW ClassName(args...) — object instantiation
+    // NEW ClassName(args...) — object instantiation (heap-allocated CLASS)
     if (current().type == TokenType::NEW) {
         return parseNewExpression();
+    }
+
+    // CREATE TypeName(args...) — UDT value-type initialization (stack-allocated TYPE)
+    if (current().type == TokenType::CREATE) {
+        return parseCreateExpression();
     }
 
     // ME — current object reference inside METHOD/CONSTRUCTOR

@@ -49,6 +49,19 @@ CONSTANT PI = 3.14159
 CONSTANT MAX = 100
 ```
 
+## Array Expressions
+
+```basic
+C() = A() + B()    ' Element-wise Add
+C() = A() * B()    ' Element-wise Mult
+C() = A() + 1      ' Scalar Broadcast
+A() = 0            ' Fill
+B() = A()          ' Copy
+s = SUM(A())       ' Sum
+m = MAX(A())       ' Max
+d = DOT(A(), B())  ' Dot Product
+```
+
 ## Operators
 
 ```basic

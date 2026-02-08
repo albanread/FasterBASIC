@@ -1,0 +1,181 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // ── QBE C source files ─────────────────────────────────────────────
+    //
+    // These are compiled by Zig's built-in C compiler and linked directly
+    // into the fbc executable.  We compile everything except main.c
+    // (replaced by qbe_bridge.c) and the tools/ / minic/ directories.
+
+    const qbe_core_sources = &[_][]const u8{
+        "parse.c",
+        "ssa.c",
+        "cfg.c",
+        "emit.c",
+        "abi.c",
+        "alias.c",
+        "copy.c",
+        "fold.c",
+        "gcm.c",
+        "gvn.c",
+        "ifopt.c",
+        "live.c",
+        "load.c",
+        "mem.c",
+        "rega.c",
+        "simpl.c",
+        "spill.c",
+        "util.c",
+        // Our bridge replaces main.c
+        "qbe_bridge.c",
+    };
+
+    const qbe_amd64_sources = &[_][]const u8{
+        "amd64/emit.c",
+        "amd64/isel.c",
+        "amd64/sysv.c",
+        "amd64/targ.c",
+    };
+
+    const qbe_arm64_sources = &[_][]const u8{
+        "arm64/abi.c",
+        "arm64/emit.c",
+        "arm64/isel.c",
+        "arm64/targ.c",
+    };
+
+    const qbe_rv64_sources = &[_][]const u8{
+        "rv64/abi.c",
+        "rv64/emit.c",
+        "rv64/isel.c",
+        "rv64/targ.c",
+    };
+
+    const qbe_c_flags = &[_][]const u8{
+        "-std=c99",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-Wno-sign-compare",
+        "-Wno-missing-field-initializers",
+        "-Wno-unused-function",
+    };
+
+    // ── Main compiler executable ───────────────────────────────────────
+
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // Add QBE include path so qbe.zig's C imports and the C sources
+    // can find all.h, config.h, ops.h, qbe_bridge.h
+    exe_mod.addIncludePath(b.path("qbe"));
+
+    // Compile all QBE C sources into the module
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("qbe"),
+        .files = qbe_core_sources,
+        .flags = qbe_c_flags,
+    });
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("qbe"),
+        .files = qbe_amd64_sources,
+        .flags = qbe_c_flags,
+    });
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("qbe"),
+        .files = qbe_arm64_sources,
+        .flags = qbe_c_flags,
+    });
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("qbe"),
+        .files = qbe_rv64_sources,
+        .flags = qbe_c_flags,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "fbc",
+        .root_module = exe_mod,
+    });
+
+    b.installArtifact(exe);
+
+    // ── Run step ───────────────────────────────────────────────────────
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run the FasterBASIC compiler");
+    run_step.dependOn(&run_cmd.step);
+
+    // ── Unit tests ─────────────────────────────────────────────────────
+    //
+    // We build test binaries for each module.  Modules that import qbe.zig
+    // (directly or transitively through main.zig) need the QBE C sources
+    // linked in so the extern symbols resolve.
+
+    const test_step = b.step("test", "Run unit tests");
+
+    // Helper: create a test module with QBE C sources linked in
+    const TestModuleConfig = struct {
+        root_source_file: std.Build.LazyPath,
+        needs_qbe: bool,
+    };
+
+    const test_modules = [_]TestModuleConfig{
+        .{ .root_source_file = b.path("src/main.zig"), .needs_qbe = true },
+        .{ .root_source_file = b.path("src/lexer.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/parser.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/ast.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/semantic.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/codegen.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/cfg.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/qbe.zig"), .needs_qbe = true },
+    };
+
+    for (test_modules) |tm| {
+        const mod = b.createModule(.{
+            .root_source_file = tm.root_source_file,
+            .target = target,
+            .optimize = optimize,
+            .link_libc = if (tm.needs_qbe) true else false,
+        });
+
+        if (tm.needs_qbe) {
+            mod.addIncludePath(b.path("qbe"));
+            mod.addCSourceFiles(.{
+                .root = b.path("qbe"),
+                .files = qbe_core_sources,
+                .flags = qbe_c_flags,
+            });
+            mod.addCSourceFiles(.{
+                .root = b.path("qbe"),
+                .files = qbe_amd64_sources,
+                .flags = qbe_c_flags,
+            });
+            mod.addCSourceFiles(.{
+                .root = b.path("qbe"),
+                .files = qbe_arm64_sources,
+                .flags = qbe_c_flags,
+            });
+            mod.addCSourceFiles(.{
+                .root = b.path("qbe"),
+                .files = qbe_rv64_sources,
+                .flags = qbe_c_flags,
+            });
+        }
+
+        const unit_tests = b.addTest(.{
+            .root_module = mod,
+        });
+        const run_tests = b.addRunArtifact(unit_tests);
+        test_step.dependOn(&run_tests.step);
+    }
+}

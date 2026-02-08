@@ -68,7 +68,262 @@ std::string ASTEmitter::emitExpression(const Expression* expr) {
         // LIST constructor expression: LIST(expr, expr, ...)
         case ASTNodeType::EXPR_LIST_CONSTRUCTOR:
             return emitListConstructor(static_cast<const FasterBASIC::ListConstructorExpression*>(expr));
-            
+
+        // CREATE TypeName(args...) — UDT value-type initialization
+        case ASTNodeType::EXPR_CREATE: {
+            const auto* createExpr = static_cast<const CreateExpression*>(expr);
+            const auto& symbolTable = semantic_.getSymbolTable();
+
+            // Look up the TYPE definition — try original case first (types are
+            // stored with their declaration case), then uppercase fallback.
+            auto udtIt = symbolTable.types.find(createExpr->typeName);
+            if (udtIt == symbolTable.types.end()) {
+                // Uppercase fallback for case-insensitive match
+                std::string upperTypeName = createExpr->typeName;
+                std::transform(upperTypeName.begin(), upperTypeName.end(),
+                               upperTypeName.begin(), ::toupper);
+                udtIt = symbolTable.types.find(upperTypeName);
+            }
+            if (udtIt == symbolTable.types.end()) {
+                builder_.emitComment("ERROR: TYPE '" + createExpr->typeName + "' not defined for CREATE");
+                return "0";
+            }
+
+            const auto& udtDef = udtIt->second;
+
+            // ── Named-field CREATE: build name → argument index map ──
+            // For named CREATE, arguments may be in any order and may be a
+            // subset of the type's fields (unmentioned fields are zero-init'd).
+            // For positional CREATE, argument count must equal field count.
+            std::unordered_map<std::string, size_t> nameToArgIdx;
+            if (createExpr->isNamed) {
+                // Build map and validate field names
+                for (size_t a = 0; a < createExpr->fieldNames.size(); ++a) {
+                    const std::string& fn = createExpr->fieldNames[a];
+                    // Check for duplicate field name
+                    if (nameToArgIdx.count(fn)) {
+                        builder_.emitComment("ERROR: CREATE " + createExpr->typeName +
+                            " — duplicate field name '" + fn + "'");
+                        return "0";
+                    }
+                    // Check that field exists in the type
+                    bool found = false;
+                    for (const auto& f : udtDef.fields) {
+                        if (f.name == fn) { found = true; break; }
+                    }
+                    if (!found) {
+                        builder_.emitComment("ERROR: CREATE " + createExpr->typeName +
+                            " — unknown field '" + fn + "'");
+                        return "0";
+                    }
+                    nameToArgIdx[fn] = a;
+                }
+                builder_.emitComment("CREATE " + createExpr->typeName + "(" +
+                    std::to_string(createExpr->arguments.size()) + " named args)");
+            } else if (createExpr->arguments.empty()) {
+                // Zero-argument CREATE TypeName() — treat as all-defaults
+                // (same as named CREATE with no fields specified).
+                builder_.emitComment("CREATE " + createExpr->typeName +
+                    "() — zero-init all fields");
+            } else {
+                // Positional: validate argument count matches field count
+                if (createExpr->arguments.size() != udtDef.fields.size()) {
+                    builder_.emitComment("ERROR: CREATE " + createExpr->typeName +
+                        " expects " + std::to_string(udtDef.fields.size()) +
+                        " arguments but got " + std::to_string(createExpr->arguments.size()));
+                    return "0";
+                }
+                builder_.emitComment("CREATE " + createExpr->typeName + "(" +
+                    std::to_string(createExpr->arguments.size()) + " args)");
+            }
+
+            // Calculate total UDT size
+            int udtSize = typeManager_.getUDTSizeRecursive(udtDef, symbolTable.types);
+            if (udtSize <= 0) udtSize = 8;  // safety fallback
+
+            // Determine alignment from the largest field
+            int align = 8;  // default to 8-byte alignment
+
+            // Allocate stack temporary for the UDT value
+            auto baseAddr = builder_.newTemp();
+            builder_.emitRaw("    " + baseAddr + " =l alloc" +
+                std::to_string(align) + " " + std::to_string(udtSize) + "\n");
+
+            // Store each field at its offset.
+            // For positional CREATE: argument i maps to field i.
+            // For named CREATE: look up the argument by field name; if absent,
+            //                   store a zero/null default for that field.
+            int64_t offset = 0;
+            for (size_t i = 0; i < udtDef.fields.size(); ++i) {
+                const auto& field = udtDef.fields[i];
+
+                // Determine which argument supplies this field's value (if any)
+                int argIdx = -1;  // -1 means "use default zero"
+                if (createExpr->isNamed) {
+                    auto it = nameToArgIdx.find(field.name);
+                    if (it != nameToArgIdx.end()) {
+                        argIdx = static_cast<int>(it->second);
+                    }
+                } else if (i < createExpr->arguments.size()) {
+                    argIdx = static_cast<int>(i);
+                }
+                // else: argIdx stays -1 → zero-init (handles CREATE TPoint())
+
+                // Calculate field address
+                std::string fieldAddr;
+                if (offset == 0) {
+                    fieldAddr = baseAddr;
+                } else {
+                    fieldAddr = builder_.newTemp();
+                    builder_.emitRaw("    " + fieldAddr + " =l add " +
+                        baseAddr + ", " + std::to_string(offset) + "\n");
+                }
+
+                // Store based on field type
+                BaseType fieldType = field.typeDesc.baseType;
+
+                if (argIdx < 0) {
+                    // ── Default zero-initialisation for unmentioned named field ──
+                    builder_.emitComment("CREATE default-init field: " + field.name);
+                    if (fieldType == BaseType::USER_DEFINED) {
+                        // Zero the nested UDT region
+                        auto nestedIt = symbolTable.types.find(field.typeDesc.udtName);
+                        int nestedSize = 8;
+                        if (nestedIt != symbolTable.types.end()) {
+                            nestedSize = typeManager_.getUDTSizeRecursive(nestedIt->second, symbolTable.types);
+                        }
+                        // Zero-fill byte by byte via a small memset-style loop?
+                        // Simpler: store zero for each primitive-sized slot.
+                        for (int z = 0; z < nestedSize; z += 8) {
+                            std::string zAddr = builder_.newTemp();
+                            if (z > 0) {
+                                builder_.emitRaw("    " + zAddr + " =l add " + fieldAddr + ", " + std::to_string(z) + "\n");
+                            } else {
+                                builder_.emitRaw("    " + zAddr + " =l copy " + fieldAddr + "\n");
+                            }
+                            builder_.emitRaw("    storel 0, " + zAddr + "\n");
+                        }
+                        offset += nestedSize;
+                    } else if (fieldType == BaseType::STRING || fieldType == BaseType::UNICODE) {
+                        // Store null string pointer (empty string)
+                        std::string emptyLabel = builder_.registerString("");
+                        std::string emptyStr = runtime_.emitStringLiteral(emptyLabel);
+                        builder_.emitRaw("    call $string_retain(l " + emptyStr + ")\n");
+                        builder_.emitRaw("    storel " + emptyStr + ", " + fieldAddr + "\n");
+                        offset += 8;
+                    } else {
+                        // Numeric zero
+                        std::string qbeType = typeManager_.getQBEType(fieldType);
+                        std::string zeroVal;
+                        if (qbeType == "s") zeroVal = "s_0.0";
+                        else if (qbeType == "d") zeroVal = "d_0.0";
+                        else zeroVal = "0";
+
+                        std::string storeOp;
+                        int fieldSize;
+                        if (qbeType == "w") { storeOp = "storew"; fieldSize = 4; }
+                        else if (qbeType == "l") { storeOp = "storel"; fieldSize = 8; }
+                        else if (qbeType == "s") { storeOp = "stores"; fieldSize = 4; }
+                        else if (qbeType == "d") { storeOp = "stored"; fieldSize = 8; }
+                        else if (fieldType == BaseType::BYTE || fieldType == BaseType::UBYTE) { storeOp = "storeb"; fieldSize = 1; }
+                        else if (fieldType == BaseType::SHORT || fieldType == BaseType::USHORT) { storeOp = "storeh"; fieldSize = 2; }
+                        else { storeOp = "storel"; fieldSize = 8; }
+                        builder_.emitRaw("    " + storeOp + " " + zeroVal + ", " + fieldAddr + "\n");
+                        offset += fieldSize;
+                    }
+                    continue;
+                }
+
+                // ── Emit the argument expression ──
+                std::string argVal = emitExpression(createExpr->arguments[argIdx].get());
+
+                if (fieldType == BaseType::USER_DEFINED) {
+                    // Nested UDT: copy field-by-field from the source address
+                    auto nestedIt = symbolTable.types.find(field.typeDesc.udtName);
+                    if (nestedIt != symbolTable.types.end()) {
+                        builder_.emitComment("CREATE nested UDT field: " + field.name);
+                        emitUDTCopyFieldByField(argVal, fieldAddr, nestedIt->second, symbolTable.types);
+                        offset += typeManager_.getUDTSizeRecursive(nestedIt->second, symbolTable.types);
+                    } else {
+                        offset += 8;
+                    }
+                } else if (fieldType == BaseType::STRING || fieldType == BaseType::UNICODE) {
+                    // String field: retain the new string, store pointer
+                    builder_.emitComment("CREATE string field: " + field.name);
+                    builder_.emitRaw("    call $string_retain(l " + argVal + ")\n");
+                    builder_.emitRaw("    storel " + argVal + ", " + fieldAddr + "\n");
+                    offset += 8;
+                } else {
+                    // Primitive field: store with appropriate width
+                    // Apply type coercion when the argument expression type
+                    // doesn't match the field type (e.g. double literal → SINGLE field,
+                    // or integer literal → SINGLE/DOUBLE field).
+                    std::string qbeType = typeManager_.getQBEType(fieldType);
+                    std::string storeVal = argVal;
+                    std::string storeOp;
+                    int fieldSize;
+                    if (qbeType == "w") {
+                        storeOp = "storew";
+                        fieldSize = 4;
+                    } else if (qbeType == "l") {
+                        storeOp = "storel";
+                        fieldSize = 8;
+                    } else if (qbeType == "s") {
+                        // SINGLE field: expression may produce a double or int —
+                        // convert to single precision before storing.
+                        storeOp = "stores";
+                        fieldSize = 4;
+                        BaseType argType = getExpressionType(createExpr->arguments[argIdx].get());
+                        if (argType == BaseType::DOUBLE || argType == BaseType::UNKNOWN) {
+                            // double → single via truncd
+                            std::string singleVal = builder_.newTemp();
+                            builder_.emitRaw("    " + singleVal + " =s truncd " + argVal + "\n");
+                            storeVal = singleVal;
+                        } else if (typeManager_.isIntegral(argType)) {
+                            // int → single via swtof
+                            std::string singleVal = builder_.newTemp();
+                            builder_.emitRaw("    " + singleVal + " =s swtof " + argVal + "\n");
+                            storeVal = singleVal;
+                        }
+                    } else if (qbeType == "d") {
+                        // DOUBLE field: expression may produce an int —
+                        // convert to double before storing.
+                        storeOp = "stored";
+                        fieldSize = 8;
+                        BaseType argType = getExpressionType(createExpr->arguments[argIdx].get());
+                        if (typeManager_.isIntegral(argType)) {
+                            std::string dblVal = builder_.newTemp();
+                            builder_.emitRaw("    " + dblVal + " =d swtof " + argVal + "\n");
+                            storeVal = dblVal;
+                        } else if (argType == BaseType::SINGLE) {
+                            std::string dblVal = builder_.newTemp();
+                            builder_.emitRaw("    " + dblVal + " =d exts " + argVal + "\n");
+                            storeVal = dblVal;
+                        }
+                    } else {
+                        // Sub-word types
+                        if (fieldType == BaseType::BYTE || fieldType == BaseType::UBYTE) {
+                            storeOp = "storeb";
+                            fieldSize = 1;
+                        } else if (fieldType == BaseType::SHORT || fieldType == BaseType::USHORT) {
+                            storeOp = "storeh";
+                            fieldSize = 2;
+                        } else {
+                            storeOp = "storel";
+                            fieldSize = 8;
+                        }
+                    }
+                    builder_.emitRaw("    " + storeOp + " " + storeVal + ", " + fieldAddr + "\n");
+                    offset += fieldSize;
+                }
+            }
+
+            builder_.emitComment("End CREATE " + createExpr->typeName);
+
+            // Return the address of the initialized UDT temporary
+            return baseAddr;
+        }
+
         // CLASS & Object System expressions
         case ASTNodeType::EXPR_NEW: {
             const auto* newExpr = static_cast<const NewExpression*>(expr);
@@ -331,6 +586,30 @@ std::string ASTEmitter::emitBinaryExpression(const BinaryExpression* expr) {
     BaseType leftType = getExpressionType(expr->left.get());
     BaseType rightType = getExpressionType(expr->right.get());
     
+    // Check if this is a UDT equality/inequality comparison
+    if (leftType == BaseType::USER_DEFINED && rightType == BaseType::USER_DEFINED &&
+        (op == TokenType::EQUAL || op == TokenType::NOT_EQUAL)) {
+        // Both operands are UDTs — emit field-by-field comparison
+        std::string leftUDT = getUDTTypeNameForExpr(expr->left.get());
+        std::string rightUDT = getUDTTypeNameForExpr(expr->right.get());
+
+        if (!leftUDT.empty() && leftUDT == rightUDT) {
+            const auto& symbolTable = semantic_.getSymbolTable();
+            auto udtIt = symbolTable.types.find(leftUDT);
+            if (udtIt != symbolTable.types.end()) {
+                std::string leftAddr = getUDTAddressForExpr(expr->left.get());
+                std::string rightAddr = getUDTAddressForExpr(expr->right.get());
+                if (!leftAddr.empty() && !rightAddr.empty()) {
+                    return emitUDTComparison(leftAddr, rightAddr, udtIt->second,
+                                             symbolTable.types, op);
+                }
+            }
+        }
+        // Fall through to error / default handling if types don't match
+        builder_.emitComment("ERROR: UDT comparison type mismatch or unknown type");
+        return "0";
+    }
+
     // Check if this is a string operation
     if (typeManager_.isString(leftType) || typeManager_.isString(rightType)) {
         std::string left = emitExpressionAs(expr->left.get(), BaseType::STRING);
@@ -2771,9 +3050,6 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
             }
         }
         
-        // Emit the value expression with proper type
-        std::string value = emitExpressionAs(stmt->value.get(), fieldType);
-        
         // Add field offset to base pointer
         std::string fieldPtr = builder_.newTemp();
         if (offset > 0) {
@@ -2781,6 +3057,24 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
         } else {
             fieldPtr = basePtr;
         }
+        
+        // If the target field is itself a UDT (nested UDT), we must do a
+        // field-by-field copy instead of a scalar store.  CREATE / variable
+        // expressions return the *address* of the source UDT value.
+        if (fieldType == BaseType::USER_DEFINED) {
+            std::string nestedUDTName = udtDef.fields[fieldIndex].typeDesc.udtName;
+            auto nestedIt = symbolTable2.types.find(nestedUDTName);
+            if (nestedIt != symbolTable2.types.end()) {
+                // Emit the source expression (returns address of UDT value)
+                std::string sourceAddr = emitExpression(stmt->value.get());
+                builder_.emitComment("Nested UDT member copy: " + memberName + " (" + nestedUDTName + ")");
+                emitUDTCopyFieldByField(sourceAddr, fieldPtr, nestedIt->second, symbolTable2.types);
+                return;
+            }
+        }
+        
+        // Emit the value expression with proper type
+        std::string value = emitExpressionAs(stmt->value.get(), fieldType);
         
         // Store the value at the field address
         std::string qbeType = typeManager_.getQBEType(fieldType);
@@ -2864,6 +3158,10 @@ void ASTEmitter::emitLetStatement(const LetStatement* stmt) {
                     // Array element: People(i) (where People is array of UDTs)
                     const auto* arrExpr = static_cast<const ArrayAccessExpression*>(stmt->value.get());
                     sourceAddr = emitArrayElementAddress(arrExpr->name, arrExpr->indices);
+                } else if (stmt->value->getType() == ASTNodeType::EXPR_CREATE) {
+                    // CREATE TypeName(args...) returns the address of a
+                    // stack-allocated, fully-initialised UDT temporary.
+                    sourceAddr = emitExpression(stmt->value.get());
                 } else {
                     builder_.emitComment("ERROR: Unsupported UDT source expression type");
                     return;
@@ -3030,7 +3328,18 @@ void ASTEmitter::emitPrintStatement(const PrintStatement* stmt) {
             BaseType exprType = getExpressionType(item.expr.get());
             std::string value = emitExpression(item.expr.get());
             
-            if (typeManager_.isString(exprType)) {
+            if (exprType == BaseType::USER_DEFINED) {
+                // Whole-UDT PRINT: TypeName(field1, field2, ...)
+                std::string udtName = getUDTTypeNameForExpr(item.expr.get());
+                const auto& symbolTable = semantic_.getSymbolTable();
+                auto udtIt = symbolTable.types.find(udtName);
+                if (!udtName.empty() && udtIt != symbolTable.types.end()) {
+                    // value is the UDT address (emitExpression returns addr for UDTs)
+                    emitPrintUDTValue(value, udtIt->second, symbolTable.types);
+                } else {
+                    builder_.emitComment("PRINT UDT: unknown type '" + udtName + "'");
+                }
+            } else if (typeManager_.isString(exprType)) {
                 runtime_.emitPrintString(value);
             } else if (typeManager_.isFloatingPoint(exprType)) {
                 if (exprType == BaseType::SINGLE) {
@@ -3477,9 +3786,80 @@ void ASTEmitter::emitDimStatement(const DimStatement* stmt) {
                 continue;
             }
             
+            // Handle UDT initializer: DIM P AS Person = CREATE Person(...)
+            // UDT stack space is pre-allocated by CFG at function entry, so we
+            // only need to copy the initialiser value into the existing slot.
+            if (arrayDecl.initializer) {
+                // Check if the target variable is a UDT
+                const auto& symbolTable = semantic_.getSymbolTable();
+                std::string currentFunc = symbolMapper_.getCurrentFunction();
+                const auto* varSym = semantic_.lookupVariableScoped(arrayName, currentFunc);
+                if (varSym && varSym->typeDesc.baseType == FasterBASIC::BaseType::USER_DEFINED) {
+                    std::string udtName = varSym->typeName;
+                    if (udtName.empty()) udtName = varSym->typeDesc.udtName;
+                    auto udtIt = symbolTable.types.find(udtName);
+                    if (udtIt != symbolTable.types.end()) {
+                        builder_.emitComment("DIM " + arrayName + " AS " + udtName + " with initializer");
+                        std::string targetAddr = getVariableAddress(arrayName);
+                        std::string sourceAddr = emitExpression(arrayDecl.initializer.get());
+                        emitUDTCopyFieldByField(sourceAddr, targetAddr, udtIt->second, symbolTable.types);
+                        builder_.emitComment("End DIM UDT initializer");
+                        continue;
+                    }
+                }
+                
+                // Scalar DIM with initializer (e.g. DIM A AS INTEGER = 5)
+                // The variable slot is pre-allocated at function/main entry,
+                // but we still need to emit the store for the initial value.
+                {
+                    FasterBASIC::BaseType scalarType = FasterBASIC::BaseType::LONG;
+                    if (varSym) {
+                        scalarType = varSym->typeDesc.baseType;
+                    } else if (arrayDecl.hasAsType) {
+                        std::string upper = arrayDecl.asTypeName;
+                        for (auto& c : upper) c = toupper(c);
+                        if (upper == "INTEGER" || upper == "INT")
+                            scalarType = FasterBASIC::BaseType::INTEGER;
+                        else if (upper == "LONG")
+                            scalarType = FasterBASIC::BaseType::LONG;
+                        else if (upper == "SINGLE")
+                            scalarType = FasterBASIC::BaseType::SINGLE;
+                        else if (upper == "DOUBLE")
+                            scalarType = FasterBASIC::BaseType::DOUBLE;
+                        else if (upper == "STRING")
+                            scalarType = FasterBASIC::BaseType::STRING;
+                    }
+                    
+                    std::string varAddr = getVariableAddress(arrayName);
+                    std::string initVal = emitExpression(arrayDecl.initializer.get());
+                    
+                    builder_.emitComment("DIM " + arrayName + " scalar initializer");
+                    if (scalarType == FasterBASIC::BaseType::INTEGER ||
+                        scalarType == FasterBASIC::BaseType::UINTEGER) {
+                        builder_.emitRaw("    storew " + initVal + ", " + varAddr + "\n");
+                    } else if (scalarType == FasterBASIC::BaseType::SINGLE) {
+                        builder_.emitRaw("    stores " + initVal + ", " + varAddr + "\n");
+                    } else if (scalarType == FasterBASIC::BaseType::DOUBLE) {
+                        builder_.emitRaw("    stored " + initVal + ", " + varAddr + "\n");
+                    } else if (scalarType == FasterBASIC::BaseType::STRING ||
+                               scalarType == FasterBASIC::BaseType::UNICODE) {
+                        // Retain the new string, release old, store
+                        std::string oldPtr = builder_.newTemp();
+                        builder_.emitLoad(oldPtr, "l", varAddr);
+                        std::string retainedPtr = builder_.newTemp();
+                        builder_.emitCall(retainedPtr, "l", "string_retain", "l " + initVal);
+                        builder_.emitRaw("    storel " + retainedPtr + ", " + varAddr + "\n");
+                        builder_.emitCall("", "", "string_release", "l " + oldPtr);
+                    } else {
+                        builder_.emitRaw("    storel " + initVal + ", " + varAddr + "\n");
+                    }
+                    continue;
+                }
+            }
+            
             // NOTE: Local scalar variables are already allocated at function entry
             // in CFGEmitter::emitBlock for block 0. We don't need to allocate them again.
-            // DIM for scalars is essentially a no-op in terms of codegen (declaration only).
+            // DIM for scalars without initializers is a no-op (declaration only).
             
             continue;
         }
@@ -5541,6 +5921,9 @@ BaseType ASTEmitter::getExpressionType(const Expression* expr) {
         }
         
         // CLASS & Object System expression types
+        case ASTNodeType::EXPR_CREATE:
+            return BaseType::USER_DEFINED;
+        
         case ASTNodeType::EXPR_NEW:
             return BaseType::CLASS_INSTANCE;
         
@@ -7467,6 +7850,262 @@ void ASTEmitter::emitUDTCopyFieldByField(
             offset += typeManager_.getTypeSize(fieldType);
         }
     }
+}
+
+// =============================================================================
+// emitUDTComparison - Field-by-field UDT equality with short-circuit
+// =============================================================================
+// Compares two UDT values field by field.  For EQUAL (=): all fields must match
+// for the result to be 1 (true).  For NOT_EQUAL (<>): any differing field gives
+// result 1 (true).  Uses short-circuit evaluation — as soon as a mismatch is
+// found, remaining fields are skipped.
+//
+// String fields are compared via string_compare (returns 0 for equal).
+// Nested UDTs are compared recursively by inlining the nested comparison.
+// Numeric fields use the appropriate QBE comparison (ceqw, ceql, ceqs, ceqd).
+
+std::string ASTEmitter::emitUDTComparison(
+        const std::string& leftAddr,
+        const std::string& rightAddr,
+        const FasterBASIC::TypeSymbol& udtDef,
+        const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap,
+        FasterBASIC::TokenType op) {
+
+    using namespace FasterBASIC;
+
+    int uid = builder_.getNextLabelId();
+    builder_.emitComment("UDT comparison (" + udtDef.name + ") " +
+        (op == TokenType::EQUAL ? "=" : "<>") +
+        " — " + std::to_string(udtDef.fields.size()) + " fields");
+
+    // We'll use a result slot on the stack: 1 = equal, 0 = not equal.
+    // Short-circuit: jump to @udt_neq on first mismatch.
+    std::string resSlot = builder_.newTemp();
+    builder_.emitAlloc(resSlot, 4, 4);
+    builder_.emitStore("w", "1", resSlot);  // assume equal
+
+    std::string eqLabel  = "udt_eq_"  + std::to_string(uid);
+    std::string neqLabel = "udt_neq_" + std::to_string(uid);
+    std::string doneLabel = "udt_done_" + std::to_string(uid);
+
+    int64_t offset = 0;
+    for (size_t i = 0; i < udtDef.fields.size(); ++i) {
+        const auto& field = udtDef.fields[i];
+        BaseType fieldType = field.typeDesc.baseType;
+
+        std::string nextLabel = (i + 1 < udtDef.fields.size())
+            ? "udt_cf" + std::to_string(i + 1) + "_" + std::to_string(uid)
+            : eqLabel;
+
+        builder_.emitComment("Compare field: " + field.name +
+            " (offset " + std::to_string(offset) + ")");
+
+        // Calculate field addresses
+        std::string leftField = builder_.newTemp();
+        std::string rightField = builder_.newTemp();
+        if (offset > 0) {
+            builder_.emitBinary(leftField, "l", "add", leftAddr, std::to_string(offset));
+            builder_.emitBinary(rightField, "l", "add", rightAddr, std::to_string(offset));
+        } else {
+            builder_.emitRaw("    " + leftField + " =l copy " + leftAddr + "\n");
+            builder_.emitRaw("    " + rightField + " =l copy " + rightAddr + "\n");
+        }
+
+        if (fieldType == BaseType::STRING || fieldType == BaseType::UNICODE) {
+            // String comparison via string_compare (returns 0 if equal)
+            std::string leftPtr = builder_.newTemp();
+            std::string rightPtr = builder_.newTemp();
+            builder_.emitLoad(leftPtr, "l", leftField);
+            builder_.emitLoad(rightPtr, "l", rightField);
+            std::string cmpResult = runtime_.emitStringCompare(leftPtr, rightPtr);
+            std::string isEq = builder_.newTemp();
+            builder_.emitCompare(isEq, "w", "eq", cmpResult, "0");
+            builder_.emitBranch(isEq, nextLabel, neqLabel);
+            if (i + 1 < udtDef.fields.size()) {
+                builder_.emitLabel(nextLabel);
+            }
+            offset += 8;
+
+        } else if (fieldType == BaseType::USER_DEFINED) {
+            // Nested UDT: inline recursive comparison
+            auto nestedIt = udtMap.find(field.typeDesc.udtName);
+            if (nestedIt != udtMap.end()) {
+                // Recursively compare the nested UDT — this emits its own
+                // short-circuit blocks and returns a result temp (0 or 1).
+                std::string nestedResult = emitUDTComparison(
+                    leftField, rightField, nestedIt->second, udtMap, TokenType::EQUAL);
+                // If nested comparison says not-equal, short-circuit
+                builder_.emitBranch(nestedResult, nextLabel, neqLabel);
+                if (i + 1 < udtDef.fields.size()) {
+                    builder_.emitLabel(nextLabel);
+                }
+                offset += typeManager_.getUDTSizeRecursive(nestedIt->second, udtMap);
+            } else {
+                // Unknown nested type — skip
+                offset += 8;
+            }
+
+        } else {
+            // Numeric field comparison
+            std::string qbeType = typeManager_.getQBEType(fieldType);
+            std::string leftVal = builder_.newTemp();
+            std::string rightVal = builder_.newTemp();
+            builder_.emitLoad(leftVal, qbeType, leftField);
+            builder_.emitLoad(rightVal, qbeType, rightField);
+
+            // Choose the right QBE comparison op based on type
+            std::string cmpOp;
+            if (qbeType == "s" || qbeType == "d") {
+                cmpOp = "c" + std::string("eq") + qbeType;  // ceqs / ceqd
+            } else {
+                cmpOp = "ceq" + qbeType;                     // ceqw / ceql
+            }
+
+            std::string isEq = builder_.newTemp();
+            builder_.emitCompare(isEq, qbeType, "eq", leftVal, rightVal);
+            builder_.emitBranch(isEq, nextLabel, neqLabel);
+
+            if (i + 1 < udtDef.fields.size()) {
+                builder_.emitLabel(nextLabel);
+            }
+
+            // Advance offset
+            if (fieldType == BaseType::BYTE || fieldType == BaseType::UBYTE) {
+                offset += 1;
+            } else if (fieldType == BaseType::SHORT || fieldType == BaseType::USHORT) {
+                offset += 2;
+            } else {
+                offset += typeManager_.getTypeSize(fieldType);
+            }
+        }
+    }
+
+    // Equal block: all fields matched (resSlot still holds 1)
+    builder_.emitLabel(eqLabel);
+    builder_.emitJump(doneLabel);
+
+    // Not-equal block: store 0 and fall through to done
+    builder_.emitLabel(neqLabel);
+    builder_.emitStore("w", "0", resSlot);
+    builder_.emitJump(doneLabel);
+
+    // Done block: load result
+    builder_.emitLabel(doneLabel);
+    std::string result = builder_.newTemp();
+    builder_.emitLoad(result, "w", resSlot);
+
+    // For NOT_EQUAL, invert the result (1 → 0, 0 → 1)
+    if (op == TokenType::NOT_EQUAL) {
+        std::string inverted = builder_.newTemp();
+        builder_.emitBinary(inverted, "w", "sub", "1", result);
+        builder_.emitComment("End UDT comparison (" + udtDef.name + " <>)");
+        return inverted;
+    }
+
+    builder_.emitComment("End UDT comparison (" + udtDef.name + " =)");
+    return result;
+}
+
+// =============================================================================
+// emitPrintUDTValue - Debug-friendly PRINT for whole UDT values
+// =============================================================================
+// Prints a UDT value in the format:  TypeName(field1, field2, ...)
+// String fields are printed with surrounding double-quotes.
+// Nested UDTs are printed recursively.
+// Numeric fields use the normal print routines for their type.
+
+void ASTEmitter::emitPrintUDTValue(
+        const std::string& udtAddr,
+        const FasterBASIC::TypeSymbol& udtDef,
+        const std::unordered_map<std::string, FasterBASIC::TypeSymbol>& udtMap) {
+
+    builder_.emitComment("PRINT UDT " + udtDef.name);
+
+    // Print "TypeName("
+    std::string openStr = udtDef.name + "(";
+    std::string openLabel = builder_.registerString(openStr);
+    std::string openDesc = runtime_.emitStringLiteral(openLabel);
+    runtime_.emitPrintString(openDesc);
+
+    int64_t offset = 0;
+    for (size_t i = 0; i < udtDef.fields.size(); ++i) {
+        // Print ", " separator between fields
+        if (i > 0) {
+            std::string commaLabel = builder_.registerString(", ");
+            std::string commaDesc = runtime_.emitStringLiteral(commaLabel);
+            runtime_.emitPrintString(commaDesc);
+        }
+
+        const auto& field = udtDef.fields[i];
+        BaseType fieldType = field.typeDesc.baseType;
+
+        // Calculate field address
+        std::string fieldAddr;
+        if (offset == 0) {
+            fieldAddr = udtAddr;
+        } else {
+            fieldAddr = builder_.newTemp();
+            builder_.emitBinary(fieldAddr, "l", "add", udtAddr, std::to_string(offset));
+        }
+
+        if (fieldType == BaseType::STRING || fieldType == BaseType::UNICODE) {
+            // String field: print with surrounding quotes → "value"
+            std::string quoteLabel = builder_.registerString("\"");
+            std::string quoteDesc = runtime_.emitStringLiteral(quoteLabel);
+            runtime_.emitPrintString(quoteDesc);
+
+            std::string strPtr = builder_.newTemp();
+            builder_.emitLoad(strPtr, "l", fieldAddr);
+            runtime_.emitPrintString(strPtr);
+
+            std::string quoteDesc2 = runtime_.emitStringLiteral(quoteLabel);
+            runtime_.emitPrintString(quoteDesc2);
+            offset += 8;
+
+        } else if (fieldType == BaseType::USER_DEFINED) {
+            // Nested UDT: print recursively
+            auto nestedIt = udtMap.find(field.typeDesc.udtName);
+            if (nestedIt != udtMap.end()) {
+                emitPrintUDTValue(fieldAddr, nestedIt->second, udtMap);
+                offset += typeManager_.getUDTSizeRecursive(nestedIt->second, udtMap);
+            } else {
+                builder_.emitComment("PRINT: unknown nested UDT " + field.typeDesc.udtName);
+                offset += 8;
+            }
+
+        } else {
+            // Numeric field: load and print with appropriate printer
+            std::string qbeType = typeManager_.getQBEType(fieldType);
+            std::string val = builder_.newTemp();
+            builder_.emitLoad(val, qbeType, fieldAddr);
+
+            if (fieldType == BaseType::SINGLE) {
+                // SINGLE: extend to double for printing (basic_print_float
+                // expects single, but let's use the right call)
+                runtime_.emitPrintFloat(val);
+            } else if (typeManager_.isFloatingPoint(fieldType)) {
+                runtime_.emitPrintDouble(val);
+            } else {
+                runtime_.emitPrintInt(val, fieldType);
+            }
+
+            // Advance offset based on actual field size
+            if (fieldType == BaseType::BYTE || fieldType == BaseType::UBYTE) {
+                offset += 1;
+            } else if (fieldType == BaseType::SHORT || fieldType == BaseType::USHORT) {
+                offset += 2;
+            } else {
+                offset += typeManager_.getTypeSize(fieldType);
+            }
+        }
+    }
+
+    // Print closing ")"
+    std::string closeLabel = builder_.registerString(")");
+    std::string closeDesc = runtime_.emitStringLiteral(closeLabel);
+    runtime_.emitPrintString(closeDesc);
+
+    builder_.emitComment("End PRINT UDT " + udtDef.name);
 }
 
 // =============================================================================

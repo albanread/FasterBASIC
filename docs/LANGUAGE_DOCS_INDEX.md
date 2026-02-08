@@ -80,6 +80,19 @@ High-level architectural overview of the compiler and language.
 
 **Best for:** Understanding compiler internals, architecture overview
 
+### 5. **ARRAY_EXPRESSIONS.md**
+Comprehensive guide to whole-array operations, SIMD acceleration, and reduction functions.
+
+**Contents:**
+- Introduction to array expressions
+- Supported arithmetic and logic operations
+- Array broadcast, fill, and copy
+- Reduction functions (SUM, MAX, MIN, DOT)
+- SIMD optimization details
+- Performance guide
+
+**Best for:** Learning how to write high-performance array code
+
 ## How to Use This Documentation
 
 ### New to FasterBASIC?

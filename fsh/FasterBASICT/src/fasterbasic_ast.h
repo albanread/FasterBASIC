@@ -174,7 +174,8 @@ enum class ASTNodeType {
     EXPR_METHOD_CALL,
 
     // CLASS & Object System Expressions
-    EXPR_NEW,               // NEW ClassName(args)
+    EXPR_NEW,               // NEW ClassName(args) - heap allocated CLASS
+    EXPR_CREATE,            // CREATE TypeName(args) - stack allocated UDT value init
     EXPR_ME,                // ME (current object reference)
     EXPR_SUPER_CALL,        // SUPER.Method() or SUPER() in constructor
     EXPR_IS_TYPE,           // obj IS ClassName / obj IS NOTHING
@@ -3120,6 +3121,43 @@ public:
         oss << makeIndent(indent) << "NEW " << className << "(";
         for (size_t i = 0; i < arguments.size(); i++) {
             if (i > 0) oss << ", ";
+            oss << arguments[i]->toString(0);
+        }
+        oss << ")";
+        return oss.str();
+    }
+};
+
+// CREATE TypeName(args...) - UDT value-type initialization
+// Arguments are positionally mapped to TYPE fields in declaration order.
+// Unlike NEW (which heap-allocates a CLASS instance), CREATE produces a
+// stack-allocated value with all fields initialized.
+class CreateExpression : public Expression {
+public:
+    std::string typeName;
+    std::vector<ExpressionPtr> arguments;
+    SourceLocation location;
+
+    // Named-field support: when isNamed is true, fieldNames[i] holds the
+    // field name corresponding to arguments[i].  The codegen maps each
+    // argument to the named field's offset instead of using positional order.
+    // Fields not mentioned in a named CREATE are zero-initialised.
+    bool isNamed = false;
+    std::vector<std::string> fieldNames;
+
+    CreateExpression(const std::string& name)
+        : typeName(name), isNamed(false) {}
+
+    ASTNodeType getType() const override { return ASTNodeType::EXPR_CREATE; }
+
+    std::string toString(int indent = 0) const override {
+        std::ostringstream oss;
+        oss << makeIndent(indent) << "CREATE " << typeName << "(";
+        for (size_t i = 0; i < arguments.size(); i++) {
+            if (i > 0) oss << ", ";
+            if (isNamed && i < fieldNames.size()) {
+                oss << fieldNames[i] << " := ";
+            }
             oss << arguments[i]->toString(0);
         }
         oss << ")";

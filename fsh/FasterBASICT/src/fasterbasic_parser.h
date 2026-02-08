@@ -283,6 +283,7 @@ private:
     std::unique_ptr<ConstructorStatement> parseConstructorDeclaration();
     std::unique_ptr<DestructorStatement> parseDestructorDeclaration();
     ExpressionPtr parseNewExpression();
+    ExpressionPtr parseCreateExpression();
     
     // Graphics and sound statements
     StatementPtr parseClsStatement();

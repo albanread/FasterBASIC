@@ -1,5 +1,7 @@
 # FasterBASIC
 
+> **Note:** A next-generation version of this compiler is currently being developed in **Zig** to improve memory safety and strictness.
+
 [![Build Status](https://github.com/albanread/FasterBASIC/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FasterBASIC/actions)
 
 A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon).

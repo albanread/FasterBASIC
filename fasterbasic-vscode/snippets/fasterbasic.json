@@ -1,0 +1,105 @@
+{
+	"For Loop": {
+		"prefix": "for",
+		"body": [
+			"FOR ${1:i} = ${2:start} TO ${3:end}",
+			"\t$0",
+			"NEXT ${1:i}"
+		],
+		"description": "For Loop"
+	},
+	"For Step Loop": {
+		"prefix": "forstep",
+		"body": [
+			"FOR ${1:i} = ${2:start} TO ${3:end} STEP ${4:step}",
+			"\t$0",
+			"NEXT ${1:i}"
+		],
+		"description": "For Loop with Step"
+	},
+	"If Statement": {
+		"prefix": "if",
+		"body": [
+			"IF ${1:condition} THEN",
+			"\t$0",
+			"END IF"
+		],
+		"description": "If Block"
+	},
+	"If Else Statement": {
+		"prefix": "ifelse",
+		"body": [
+			"IF ${1:condition} THEN",
+			"\t$2",
+			"ELSE",
+			"\t$0",
+			"END IF"
+		],
+		"description": "If Else Block"
+	},
+	"Do Loop": {
+		"prefix": "do",
+		"body": [
+			"DO",
+			"\t$0",
+			"LOOP"
+		],
+		"description": "Do Loop"
+	},
+	"While Loop": {
+		"prefix": "while",
+		"body": [
+			"WHILE ${1:condition}",
+			"\t$0",
+			"WEND"
+		],
+		"description": "While Loop"
+	},
+	"Select Case": {
+		"prefix": "select",
+		"body": [
+			"SELECT CASE ${1:variable}",
+			"\tCASE ${2:value}",
+			"\t\t$0",
+			"\tCASE ELSE",
+			"\t\t",
+			"END SELECT"
+		],
+		"description": "Select Case"
+	},
+	"Function": {
+		"prefix": "function",
+		"body": [
+			"FUNCTION ${1:Name}(${2:params}) AS ${3:INTEGER}",
+			"\t$0",
+			"\tRETURN ${4:value}",
+			"END FUNCTION"
+		],
+		"description": "Function Definition"
+	},
+	"Subroutine": {
+		"prefix": "sub",
+		"body": [
+			"SUB ${1:Name}(${2:params})",
+			"\t$0",
+			"END SUB"
+		],
+		"description": "Subroutine Definition"
+	},
+	"Type Definition": {
+		"prefix": "type",
+		"body": [
+			"TYPE ${1:TypeName}",
+			"\t${2:Field} AS ${3:INTEGER}",
+			"END TYPE"
+		],
+		"description": "User Defined Type"
+	},
+  "Print": {
+    "prefix": "print",
+    "body": [
+      "PRINT ${1:expression}"
+    ],
+    "description": "Print statement"
+  }
+}
