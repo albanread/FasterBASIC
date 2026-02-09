@@ -1975,9 +1975,31 @@ pub const Parser = struct {
 
         while (!self.isAtEnd()) {
             self.skipBlankLines();
+            // Peek past an optional leading line number to check for
+            // END FUNCTION.  Numbered lines like "250 END FUNCTION"
+            // start with a number token, so the kw_endfunction check
+            // must look one token ahead when the current token is a
+            // line number.
             if (self.check(.kw_endfunction)) {
                 _ = self.advance();
                 break;
+            }
+            if (self.check(.number)) {
+                // <number> END FUNCTION  or  <number> ENDFUNCTION
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_endfunction) {
+                    _ = self.advance(); // skip line number
+                    _ = self.advance(); // skip END FUNCTION
+                    break;
+                }
+                // <number> END FUNCTION (two separate tokens)
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_end) {
+                    if (self.pos + 2 < self.tokens.len and self.tokens[self.pos + 2].tag == .kw_function) {
+                        _ = self.advance(); // skip line number
+                        _ = self.advance(); // skip END
+                        _ = self.advance(); // skip FUNCTION
+                        break;
+                    }
+                }
             }
             if (self.check(.kw_end)) {
                 // Check for "END FUNCTION".
@@ -2030,9 +2052,30 @@ pub const Parser = struct {
 
         while (!self.isAtEnd()) {
             self.skipBlankLines();
+            // Peek past an optional leading line number to check for
+            // END SUB.  Numbered lines like "250 END SUB" start with
+            // a number token, so the kw_endsub check must look one
+            // token ahead when the current token is a line number.
             if (self.check(.kw_endsub)) {
                 _ = self.advance();
                 break;
+            }
+            if (self.check(.number)) {
+                // <number> END SUB  or  <number> ENDSUB
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_endsub) {
+                    _ = self.advance(); // skip line number
+                    _ = self.advance(); // skip END SUB
+                    break;
+                }
+                // <number> END SUB (two separate tokens)
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_end) {
+                    if (self.pos + 2 < self.tokens.len and self.tokens[self.pos + 2].tag == .kw_sub) {
+                        _ = self.advance(); // skip line number
+                        _ = self.advance(); // skip END
+                        _ = self.advance(); // skip SUB
+                        break;
+                    }
+                }
             }
             if (self.check(.kw_end)) {
                 if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_sub) {

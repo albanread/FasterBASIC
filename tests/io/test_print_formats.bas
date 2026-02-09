@@ -12,7 +12,7 @@
 120 LET X% = 42
 130 LET Y# = 3.14
 140 LET Z$ = "Pi"
-150 PRINT Z$; " = "; Y%; " and answer = "; X%
+150 PRINT Z$; " = "; Y#; " and answer = "; X%
 160 PRINT "PASS: Mixed types"
 170 PRINT ""
 180 REM Test 4: PRINT with expressions

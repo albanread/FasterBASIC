@@ -32,7 +32,7 @@
 320 LET ZERO# = 0.0
 330 LET S# = SIN(ZERO#)
 340 LET C# = COS(ZERO#)
-350 PRINT "SIN(0) = "; S%; ", COS(0) = "; C#
+350 PRINT "SIN(0) = "; S#; ", COS(0) = "; C#
 360 IF S# < -0.1 OR S# > 0.1 THEN PRINT "ERROR: SIN failed" : END
 370 IF C# < 0.9 OR C# > 1.1 THEN PRINT "ERROR: COS failed" : END
 380 PRINT "PASS: Trigonometric functions"

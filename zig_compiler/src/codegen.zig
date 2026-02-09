@@ -3468,6 +3468,22 @@ const ForEachContext = struct {
     elem_base_type: semantic.BaseType,
 };
 
+/// Context for FOR EACH / FOR...IN loops over LIST collections.
+/// Uses the cursor-based list iterator API (list_iter_begin,
+/// list_iter_next, list_iter_value_int/float/ptr).
+const ForEachListContext = struct {
+    /// The iterator variable that receives list elements (e.g. "n").
+    iter_variable: []const u8,
+    /// Optional index variable (e.g. "idx" in `FOR item, idx IN list`).
+    index_variable: []const u8,
+    /// Stack address of the cursor pointer (l).
+    cursor_addr: []const u8,
+    /// Stack address of a hidden integer index for the index variable (w).
+    index_addr: []const u8,
+    /// The element base type of the list.
+    elem_base_type: semantic.BaseType,
+};
+
 /// Context for FOR EACH / FOR...IN loops over HASHMAP collections.
 /// Uses hashmap_keys() to get a NULL-terminated key array, then
 /// iterates by index, loading each key and optionally looking up
@@ -3529,6 +3545,9 @@ pub const BlockEmitter = struct {
     /// FOR EACH loop contexts, keyed by the loop header block index.
     foreach_contexts: std.AutoHashMap(u32, ForEachContext),
 
+    /// FOR EACH list loop contexts, keyed by the loop header block index.
+    foreach_list_contexts: std.AutoHashMap(u32, ForEachListContext),
+
     /// FOR EACH hashmap loop contexts, keyed by the loop header block index.
     foreach_hashmap_contexts: std.AutoHashMap(u32, ForEachHashmapContext),
 
@@ -3565,6 +3584,7 @@ pub const BlockEmitter = struct {
             .allocator = allocator,
             .for_contexts = std.AutoHashMap(u32, ForLoopContext).init(allocator),
             .foreach_contexts = std.AutoHashMap(u32, ForEachContext).init(allocator),
+            .foreach_list_contexts = std.AutoHashMap(u32, ForEachListContext).init(allocator),
             .foreach_hashmap_contexts = std.AutoHashMap(u32, ForEachHashmapContext).init(allocator),
             .case_contexts = std.AutoHashMap(u32, CaseContext).init(allocator),
             .for_pre_allocs = std.StringHashMap(ForPreAlloc).init(allocator),
@@ -3574,6 +3594,7 @@ pub const BlockEmitter = struct {
     pub fn deinit(self: *BlockEmitter) void {
         self.for_contexts.deinit();
         self.foreach_contexts.deinit();
+        self.foreach_list_contexts.deinit();
         self.foreach_hashmap_contexts.deinit();
         self.case_contexts.deinit();
         self.for_pre_allocs.deinit();
@@ -3583,6 +3604,7 @@ pub const BlockEmitter = struct {
     pub fn resetContexts(self: *BlockEmitter) void {
         self.for_contexts.clearRetainingCapacity();
         self.foreach_contexts.clearRetainingCapacity();
+        self.foreach_list_contexts.clearRetainingCapacity();
         self.foreach_hashmap_contexts.clearRetainingCapacity();
         self.case_contexts.clearRetainingCapacity();
         self.for_pre_allocs.clearRetainingCapacity();
@@ -3964,7 +3986,7 @@ pub const BlockEmitter = struct {
 
     /// Check if a loop_header block is associated with a FOR EACH loop.
     fn isForEachLoopHeader(self: *const BlockEmitter, header_idx: u32) bool {
-        return self.foreach_contexts.contains(header_idx) or self.foreach_hashmap_contexts.contains(header_idx);
+        return self.foreach_contexts.contains(header_idx) or self.foreach_list_contexts.contains(header_idx) or self.foreach_hashmap_contexts.contains(header_idx);
     }
 
     // ── FOR EACH loop helpers ───────────────────────────────────────────
@@ -3983,6 +4005,12 @@ pub const BlockEmitter = struct {
         // Detect if the collection is a hashmap.
         if (self.expr_emitter.isHashmapVariable(coll_name)) {
             try self.emitForEachHashmapInit(fi, block, coll_name);
+            return;
+        }
+
+        // Detect if the collection is a LIST.
+        if (self.expr_emitter.isListVariable(coll_name)) {
+            try self.emitForEachListInit(fi, block, coll_name);
             return;
         }
 
@@ -4047,6 +4075,91 @@ pub const BlockEmitter = struct {
             for (self.cfg.edges.items) |edge| {
                 if (edge.from == hidx and edge.kind == .branch_true) {
                     try self.foreach_contexts.put(edge.to, ctx);
+                }
+            }
+        }
+    }
+
+    /// Emit FOR EACH initialisation for LIST collections.
+    /// Uses the cursor-based list iterator API.
+    fn emitForEachListInit(self: *BlockEmitter, fi: *const ast.ForInStmt, block: *const cfg_mod.BasicBlock, coll_name: []const u8) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN {s} (LIST)", .{ fi.variable, coll_name }));
+
+        // Determine element type from symbol table.
+        const elem_base_type = self.expr_emitter.listElementType(coll_name);
+
+        // Load the list pointer from the global or local variable.
+        var list_ptr: []const u8 = undefined;
+        if (self.func_ctx) |fctx| {
+            var fup_buf: [128]u8 = undefined;
+            const fbase = SymbolMapper.stripSuffix(coll_name);
+            const flen = @min(fbase.len, fup_buf.len);
+            for (0..flen) |fi2| fup_buf[fi2] = std.ascii.toUpper(coll_name[fi2]);
+            const fupper = fup_buf[0..flen];
+            if (fctx.resolve(fupper)) |rv| {
+                list_ptr = try self.builder.newTemp();
+                try self.builder.emitLoad(list_ptr, "l", rv.addr);
+            } else {
+                const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
+                list_ptr = try self.builder.newTemp();
+                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            }
+        } else {
+            const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
+            list_ptr = try self.builder.newTemp();
+            try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+        }
+
+        // Call list_iter_begin(list) → returns cursor (ListAtom*)
+        const cursor_init = try self.builder.newTemp();
+        try self.builder.emitCall(cursor_init, "l", "list_iter_begin", try std.fmt.allocPrint(self.allocator, "l {s}", .{list_ptr}));
+
+        // Allocate stack slot for cursor pointer
+        const cursor_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(cursor_addr, 8, 8);
+        try self.builder.emitStore("l", cursor_init, cursor_addr);
+
+        // Allocate stack slot for hidden index (for optional index variable)
+        const index_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(index_addr, 4, 4);
+        try self.builder.emitStore("w", "0", index_addr);
+
+        // If there's an explicit index variable, resolve and init it too.
+        if (fi.index_variable.len > 0) {
+            const idx_resolved = try self.resolveVarAddr(fi.index_variable, null);
+            try self.builder.emitStore(idx_resolved.store_type, "0", idx_resolved.addr);
+        }
+
+        // Find the header block index (the successor of the current block).
+        var header_idx: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and (edge.kind == .fallthrough or edge.kind == .branch_true)) {
+                header_idx = edge.to;
+                break;
+            }
+        }
+
+        if (header_idx) |hidx| {
+            const ctx = ForEachListContext{
+                .iter_variable = fi.variable,
+                .index_variable = fi.index_variable,
+                .cursor_addr = cursor_addr,
+                .index_addr = index_addr,
+                .elem_base_type = elem_base_type,
+            };
+            try self.foreach_list_contexts.put(hidx, ctx);
+
+            // Also register on the increment block (the block with back_edge to header).
+            for (self.cfg.edges.items) |edge| {
+                if (edge.to == hidx and edge.kind == .back_edge) {
+                    try self.foreach_list_contexts.put(edge.from, ctx);
+                }
+            }
+
+            // Also register on the body block so we can load the element there.
+            for (self.cfg.edges.items) |edge| {
+                if (edge.from == hidx and edge.kind == .branch_true) {
+                    try self.foreach_list_contexts.put(edge.to, ctx);
                 }
             }
         }
@@ -4128,11 +4241,26 @@ pub const BlockEmitter = struct {
     }
 
     /// Emit the FOR EACH condition: compare hidden index with array upper bound
-    /// or hashmap size.
+    /// or hashmap size, or check list cursor != NULL.
     fn emitForEachCondition(self: *BlockEmitter, header_idx: u32, true_target: u32, false_target: u32) EmitError!void {
         // Check for hashmap context first.
         if (self.foreach_hashmap_contexts.get(header_idx)) |hctx| {
             try self.emitForEachHashmapCondition(&hctx, true_target, false_target);
+            return;
+        }
+
+        // Check for list context.
+        if (self.foreach_list_contexts.get(header_idx)) |lctx| {
+            // Condition: cursor != NULL  →  continue loop
+            const cursor = try self.builder.newTemp();
+            try self.builder.emitLoad(cursor, "l", lctx.cursor_addr);
+            const cond = try self.builder.newTemp();
+            try self.builder.emitCompare(cond, "l", "ne", cursor, "0");
+            try self.builder.emitBranch(
+                cond,
+                try blockLabel(self.cfg, true_target, self.allocator),
+                try blockLabel(self.cfg, false_target, self.allocator),
+            );
             return;
         }
 
@@ -4198,7 +4326,8 @@ pub const BlockEmitter = struct {
 
     /// Emit the element load at the start of a FOR EACH body block.
     /// Loads arr(index) into the iterator variable, or for hashmaps,
-    /// loads the key (and optionally value) from the keys array.
+    /// loads the key (and optionally value) from the keys array,
+    /// or for lists, loads the element from the cursor.
     pub fn emitForEachBodyLoad(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) EmitError!void {
         // Only emit for body blocks (not header or increment).
         if (block.kind != .loop_body) return;
@@ -4206,6 +4335,12 @@ pub const BlockEmitter = struct {
         // Check for hashmap context first.
         if (self.foreach_hashmap_contexts.get(block.index)) |hctx| {
             try self.emitForEachHashmapBodyLoad(&hctx);
+            return;
+        }
+
+        // Check for list context.
+        if (self.foreach_list_contexts.get(block.index)) |lctx| {
+            try self.emitForEachListBodyLoad(&lctx);
             return;
         }
 
@@ -4265,7 +4400,7 @@ pub const BlockEmitter = struct {
         }
     }
 
-    /// Emit the FOR EACH increment: index += 1.
+    /// Emit the FOR EACH increment: index += 1, or cursor = list_iter_next(cursor).
     pub fn emitForEachIncrement(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) EmitError!void {
         // Check for hashmap context first.
         if (self.foreach_hashmap_contexts.get(block.index)) |hctx| {
@@ -4277,6 +4412,36 @@ pub const BlockEmitter = struct {
             return;
         }
 
+        // Check for list context.
+        if (self.foreach_list_contexts.get(block.index)) |lctx| {
+            // cursor = list_iter_next(cursor)
+            const cur_cursor = try self.builder.newTemp();
+            try self.builder.emitLoad(cur_cursor, "l", lctx.cursor_addr);
+            const next_cursor = try self.builder.newTemp();
+            try self.builder.emitCall(next_cursor, "l", "list_iter_next", try std.fmt.allocPrint(self.allocator, "l {s}", .{cur_cursor}));
+            try self.builder.emitStore("l", next_cursor, lctx.cursor_addr);
+
+            // Increment hidden index
+            const cur_idx = try self.builder.newTemp();
+            try self.builder.emitLoad(cur_idx, "w", lctx.index_addr);
+            const next_idx = try self.builder.newTemp();
+            try self.builder.emitBinary(next_idx, "w", "add", cur_idx, "1");
+            try self.builder.emitStore("w", next_idx, lctx.index_addr);
+
+            // If there's an explicit index variable, update it.
+            if (lctx.index_variable.len > 0) {
+                const idx_resolved = try self.resolveVarAddr(lctx.index_variable, null);
+                if (std.mem.eql(u8, idx_resolved.store_type, "d")) {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "d", "swtof", next_idx);
+                    try self.builder.emitStore(idx_resolved.store_type, cvt, idx_resolved.addr);
+                } else {
+                    try self.builder.emitStore(idx_resolved.store_type, next_idx, idx_resolved.addr);
+                }
+            }
+            return;
+        }
+
         const ctx = self.foreach_contexts.get(block.index) orelse return;
 
         // Load current index, add 1, store back
@@ -4285,6 +4450,81 @@ pub const BlockEmitter = struct {
         const next = try self.builder.newTemp();
         try self.builder.emitBinary(next, "w", "add", cur, "1");
         try self.builder.emitStore("w", next, ctx.index_addr);
+    }
+
+    /// Emit the body load for a FOR EACH over a LIST.
+    /// Loads the element value from the current cursor using the
+    /// appropriate list_iter_value_* function.
+    fn emitForEachListBodyLoad(self: *BlockEmitter, lctx: *const ForEachListContext) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH LIST: load {s} from cursor", .{lctx.iter_variable}));
+
+        // Load current cursor
+        const cursor = try self.builder.newTemp();
+        try self.builder.emitLoad(cursor, "l", lctx.cursor_addr);
+
+        // Call the appropriate list_iter_value_* based on element type
+        const elem_val = try self.builder.newTemp();
+        const cursor_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{cursor});
+        if (lctx.elem_base_type.isString()) {
+            // String: list_iter_value_ptr returns a StringDescriptor*
+            try self.builder.emitCall(elem_val, "l", "list_iter_value_ptr", cursor_arg);
+        } else if (lctx.elem_base_type.isFloat()) {
+            // Float/double: list_iter_value_float returns double
+            try self.builder.emitCall(elem_val, "d", "list_iter_value_float", cursor_arg);
+        } else if (lctx.elem_base_type.isInteger()) {
+            // Integer: list_iter_value_int returns int64_t (l)
+            try self.builder.emitCall(elem_val, "l", "list_iter_value_int", cursor_arg);
+        } else {
+            // Default to pointer (for objects, UDTs, etc.)
+            try self.builder.emitCall(elem_val, "l", "list_iter_value_ptr", cursor_arg);
+        }
+
+        // Store into the iterator variable.
+        // Use the ELEMENT type to determine the correct store operation,
+        // not the variable's inferred type.  The iterator variable may
+        // be inferred as double by default when it wasn't explicitly
+        // DIM'd, but we must store using the element's actual type.
+        const resolved = try self.resolveVarAddr(lctx.iter_variable, null);
+        if (lctx.elem_base_type.isString()) {
+            // String element → always store as pointer (l)
+            try self.builder.emitStore("l", elem_val, resolved.addr);
+        } else if (lctx.elem_base_type.isInteger()) {
+            // list_iter_value_int returns l (int64), may need truncation to w
+            if (std.mem.eql(u8, resolved.store_type, "w")) {
+                const trunc = try self.builder.newTemp();
+                try self.builder.emitTrunc(trunc, "w", elem_val);
+                try self.builder.emitStore("w", trunc, resolved.addr);
+            } else if (std.mem.eql(u8, resolved.store_type, "l")) {
+                try self.builder.emitStore("l", elem_val, resolved.addr);
+            } else {
+                // Integer element → double variable: convert
+                const trunc = try self.builder.newTemp();
+                try self.builder.emitTrunc(trunc, "w", elem_val);
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "d", "swtof", trunc);
+                try self.builder.emitStore("d", cvt, resolved.addr);
+            }
+        } else if (lctx.elem_base_type.isFloat()) {
+            // Float/double element → store as d
+            try self.builder.emitStore("d", elem_val, resolved.addr);
+        } else {
+            // Pointer/object element → store as l
+            try self.builder.emitStore("l", elem_val, resolved.addr);
+        }
+
+        // If there's an index variable, store the current index.
+        if (lctx.index_variable.len > 0) {
+            const cur_idx = try self.builder.newTemp();
+            try self.builder.emitLoad(cur_idx, "w", lctx.index_addr);
+            const idx_resolved = try self.resolveVarAddr(lctx.index_variable, null);
+            if (std.mem.eql(u8, idx_resolved.store_type, "d")) {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "d", "swtof", cur_idx);
+                try self.builder.emitStore(idx_resolved.store_type, cvt, idx_resolved.addr);
+            } else {
+                try self.builder.emitStore(idx_resolved.store_type, cur_idx, idx_resolved.addr);
+            }
+        }
     }
 
     /// Emit the body load for a FOR EACH over a HASHMAP.
