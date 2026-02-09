@@ -951,6 +951,15 @@ pub const Parser = struct {
             }
         }
 
+        // Consume the WEND token so nested WHILEs don't cause the
+        // outer WHILE to exit prematurely (the inner WEND would
+        // otherwise still be the current token when control returns
+        // to the outer parseWhileStatement's body loop).
+        if (self.check(.kw_wend)) {
+            _ = self.advance();
+            if (self.check(.end_of_line)) _ = self.advance();
+        }
+
         return self.builder.stmt(loc, .{ .while_stmt = .{
             .condition = condition,
             .body = try self.allocator.dupe(ast.StmtPtr, body.items),

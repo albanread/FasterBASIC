@@ -1284,6 +1284,84 @@ pub const SemanticAnalyzer = struct {
                 for (ifs.else_statements) |s| try self.collectDeclaration(s);
             },
             .for_in => |fi| {
+                // Register the iterator variable.  Try to infer its type
+                // from the collection's declared type so that:
+                //   - Array iteration: element type (e.g. INTEGER for DIM a(10) AS INTEGER)
+                //   - Hashmap iteration: STRING (keys are always strings)
+                const arr_name: ?[]const u8 = switch (fi.array.data) {
+                    .variable => |v| v.name,
+                    .array_access => |aa| aa.name,
+                    else => null,
+                };
+
+                // Detect whether the collection is a HASHMAP variable.
+                var is_hashmap = false;
+                if (arr_name) |aname| {
+                    var hup_buf: [128]u8 = undefined;
+                    const hup = upperBuf(aname, &hup_buf) orelse aname;
+                    if (self.symbol_table.lookupVariable(hup)) |vsym| {
+                        if (vsym.type_desc.base_type == .object and
+                            std.mem.eql(u8, vsym.type_desc.object_type_name, "HASHMAP"))
+                        {
+                            is_hashmap = true;
+                        }
+                    }
+                }
+
+                const iter_type: BaseType = blk: {
+                    // For hashmaps, the iterator variable is the KEY → always STRING.
+                    if (is_hashmap) break :blk .string;
+
+                    // For arrays, infer from the declared element type.
+                    if (arr_name) |aname| {
+                        var aup_buf: [128]u8 = undefined;
+                        const aup = upperBuf(aname, &aup_buf) orelse aname;
+                        if (self.symbol_table.lookupArray(aup)) |arr_sym| {
+                            const ebt = arr_sym.element_type_desc.base_type;
+                            if (ebt != .unknown) break :blk ebt;
+                        }
+                    }
+                    break :blk .double;
+                };
+                // Register iterator variable with the inferred type.
+                {
+                    var iup_buf: [128]u8 = undefined;
+                    const iter_upper = upperBuf(fi.variable, &iup_buf) orelse fi.variable;
+                    if (!self.symbol_table.variables.contains(iter_upper)) {
+                        const key = try self.allocator.dupe(u8, iter_upper);
+                        try self.symbol_table.insertVariable(key, .{
+                            .name = fi.variable,
+                            .type_desc = TypeDescriptor.fromBase(iter_type),
+                            .is_declared = false,
+                            .first_use = stmt.loc,
+                            .scope = if (self.in_function) Scope.makeFunction(self.current_function_name) else Scope.makeGlobal(),
+                            .is_global = !self.in_function,
+                        });
+                    }
+                }
+                // Register the index/value variable if present.
+                // For hashmaps: the second variable is the VALUE → STRING.
+                // For arrays: the second variable is the INDEX → integer.
+                if (fi.index_variable.len > 0) {
+                    if (is_hashmap) {
+                        // Hashmap value variable → STRING
+                        var vup_buf: [128]u8 = undefined;
+                        const val_upper = upperBuf(fi.index_variable, &vup_buf) orelse fi.index_variable;
+                        if (!self.symbol_table.variables.contains(val_upper)) {
+                            const vkey = try self.allocator.dupe(u8, val_upper);
+                            try self.symbol_table.insertVariable(vkey, .{
+                                .name = fi.index_variable,
+                                .type_desc = TypeDescriptor.fromBase(.string),
+                                .is_declared = false,
+                                .first_use = stmt.loc,
+                                .scope = if (self.in_function) Scope.makeFunction(self.current_function_name) else Scope.makeGlobal(),
+                                .is_global = !self.in_function,
+                            });
+                        }
+                    } else {
+                        try self.autoRegisterForVariable(fi.index_variable, stmt.loc);
+                    }
+                }
                 for (fi.body) |s| try self.collectDeclaration(s);
             },
             .while_stmt => |ws| {
@@ -1435,14 +1513,111 @@ pub const SemanticAnalyzer = struct {
 
         const owned_fields = try self.allocator.dupe(TypeSymbol.Field, fields.items);
 
+        // ── SIMD classification ─────────────────────────────────────────
+        // Analyse the fields to determine NEON eligibility, mirroring the
+        // C compiler's classifySIMD() logic.  Requirements:
+        //   - 2..16 fields, all built-in and the same numeric type
+        //   - No strings or nested UDTs
+        //   - Total size ≤ 128 bits (16 bytes)
+        var detected_simd_type = td.simd_type;
+        var detected_simd_info = td.simd_info;
+
+        if (!detected_simd_info.isValid()) {
+            detected_simd_info = classifySIMDFields(owned_fields);
+            if (detected_simd_info.isValid()) {
+                // Set legacy simd_type for backward compatibility
+                const st = detected_simd_info.simd_type;
+                detected_simd_type = switch (st) {
+                    .v2d, .pair => .pair,
+                    .v4s, .quad => .quad,
+                    else => .none,
+                };
+            }
+        }
+
         try self.symbol_table.types.put(try self.allocator.dupe(u8, upper_name), .{
             .name = td.type_name,
             .fields = owned_fields,
             .declaration = loc,
             .is_declared = true,
-            .simd_type = td.simd_type,
-            .simd_info = td.simd_info,
+            .simd_type = detected_simd_type,
+            .simd_info = detected_simd_info,
         });
+    }
+
+    /// Classify a UDT's fields for NEON SIMD eligibility.
+    /// Returns a populated SIMDInfo if the type qualifies, or a default
+    /// (invalid) SIMDInfo otherwise.
+    fn classifySIMDFields(type_fields: []const TypeSymbol.Field) ast.TypeDeclStmt.SIMDInfo {
+        const SIMDType = ast.TypeDeclStmt.SIMDType;
+        var info: ast.TypeDeclStmt.SIMDInfo = .{};
+
+        const nfields: i32 = @intCast(type_fields.len);
+        if (nfields < 2 or nfields > 16) return info;
+
+        // All fields must be built-in and the same type
+        if (!type_fields[0].is_built_in) return info;
+        const lane_bt = type_fields[0].type_desc.base_type;
+
+        // Must be a numeric type — no strings, no nested UDTs
+        if (!lane_bt.isNumeric()) return info;
+
+        for (type_fields[1..]) |f| {
+            if (!f.is_built_in) return info;
+            if (f.type_desc.base_type != lane_bt) return info;
+        }
+
+        // Determine per-lane bit width
+        const bits: i32 = @intCast(lane_bt.bitWidth());
+        if (bits == 0) return info;
+
+        const is_float = lane_bt.isFloat();
+
+        // Populate common info
+        info.lane_count = nfields;
+        info.lane_bit_width = bits;
+        info.is_floating_point = is_float;
+        info.lane_base_type = @intFromEnum(lane_bt);
+
+        // Classify: determine SIMDType and physical lane count
+        if (nfields == 3 and bits == 32) {
+            // 3 × 32-bit → pad to 4 lanes in a Q register
+            info.simd_type = SIMDType.v4s_pad1;
+            info.physical_lanes = 4;
+            info.total_bytes = 16;
+            info.is_full_q = true;
+            info.is_padded = true;
+        } else {
+            info.physical_lanes = nfields;
+            info.total_bytes = @divTrunc(nfields * bits, 8);
+            info.is_full_q = (info.total_bytes == 16);
+            info.is_padded = false;
+
+            // Map to specific SIMDType
+            if (bits == 64 and nfields == 2) {
+                info.simd_type = SIMDType.v2d;
+            } else if (bits == 32 and nfields == 4) {
+                info.simd_type = SIMDType.v4s;
+            } else if (bits == 32 and nfields == 2) {
+                info.simd_type = SIMDType.v2s;
+            } else if (bits == 16 and nfields == 8) {
+                info.simd_type = SIMDType.v8h;
+            } else if (bits == 16 and nfields == 4) {
+                info.simd_type = SIMDType.v4h;
+            } else if (bits == 8 and nfields == 16) {
+                info.simd_type = SIMDType.v16b;
+            } else if (bits == 8 and nfields == 8) {
+                info.simd_type = SIMDType.v8b;
+            } else if (bits == 32 and nfields == 3) {
+                // Handled above (padded case), but keep for safety
+                info.simd_type = SIMDType.v4s_pad1;
+            } else {
+                // Not a recognised NEON arrangement
+                info.simd_type = SIMDType.none;
+            }
+        }
+
+        return info;
     }
 
     fn collectClassDeclaration(self: *SemanticAnalyzer, cls: *const ast.ClassStmt, loc: SourceLocation) AnalyzeError!void {
@@ -2108,6 +2283,12 @@ pub const SemanticAnalyzer = struct {
                 try self.while_stack.append(self.allocator, stmt.loc);
                 try self.validateExpression(ws.condition);
                 for (ws.body) |s| try self.validateStatement(s);
+                // The WEND token is consumed by parseWhileStatement,
+                // so pop the stack here rather than waiting for a
+                // separate wend AST node.
+                if (self.while_stack.items.len > 0) {
+                    _ = self.while_stack.pop();
+                }
             },
             .wend => {
                 if (self.while_stack.items.len == 0) {

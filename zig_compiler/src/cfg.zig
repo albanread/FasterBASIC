@@ -797,6 +797,7 @@ fn dumpStmtBrief(stmt: *const ast.Statement, writer: anytype) void {
         },
         .if_stmt => writer.print(" IF", .{}) catch {},
         .for_stmt => |fs| writer.print(" FOR {s}", .{fs.variable}) catch {},
+        .for_in => |fi| writer.print(" FOR EACH {s} IN ...", .{fi.variable}) catch {},
         .while_stmt => writer.print(" WHILE", .{}) catch {},
         .do_stmt => writer.print(" DO", .{}) catch {},
         .repeat_stmt => writer.print(" REPEAT", .{}) catch {},
@@ -1033,6 +1034,7 @@ pub const CFGBuilder = struct {
             // ── Structured control flow ─────────────────────────────────
             .if_stmt => |ifs| try self.processIfStatement(stmt, &ifs),
             .for_stmt => |fs| try self.processForStatement(stmt, &fs),
+            .for_in => |fi| try self.processForInStatement(stmt, &fi),
             .while_stmt => |ws| try self.processWhileStatement(stmt, &ws),
             .do_stmt => |ds| try self.processDoStatement(stmt, &ds),
             .repeat_stmt => |rs| try self.processRepeatStatement(stmt, &rs),
@@ -1123,6 +1125,60 @@ pub const CFGBuilder = struct {
         }
 
         self.current_block = merge_block;
+    }
+
+    // ── FOR EACH / FOR...IN loop ────────────────────────────────────────
+
+    fn processForInStatement(self: *CFGBuilder, stmt: *const ast.Statement, fi: *const ast.ForInStmt) !void {
+        // The FOR EACH statement goes into the current block for init
+        // (set hidden index = 0, record array descriptor address).
+        try self.cfg.getBlock(self.current_block).addStatement(self.allocator, stmt);
+
+        // Create loop structure blocks (same shape as FOR).
+        const header = try self.cfg.newBlock(.loop_header);
+        const body = try self.cfg.newBlock(.loop_body);
+        const increment = try self.cfg.newBlock(.loop_increment);
+        const exit_blk = try self.cfg.newBlock(.loop_exit);
+
+        // The header checks: hidden_index < array_length.
+        // We set branch_condition to the array expression so the codegen
+        // can identify this as a FOR EACH header (it will use the
+        // foreach_contexts map instead of evaluating the expression).
+        self.cfg.getBlock(header).branch_condition = fi.array;
+        self.cfg.getBlock(header).loop_exit_block = exit_blk;
+
+        // Init → header
+        try self.cfg.addEdge(self.current_block, header, .fallthrough);
+
+        // Header → body (index in range) or exit (done)
+        try self.cfg.addEdge(header, body, .branch_true);
+        try self.cfg.addEdge(header, exit_blk, .branch_false);
+
+        // Push loop context for EXIT FOR.
+        try self.loop_stack.append(self.allocator, .{
+            .header_block = header,
+            .exit_block = exit_blk,
+            .increment_block = increment,
+        });
+
+        // Process body statements.
+        self.current_block = body;
+        for (fi.body) |s| {
+            try self.processStatement(s);
+        }
+
+        // Body → increment
+        if (!self.cfg.getBlock(self.current_block).hasTerminator()) {
+            try self.cfg.addEdge(self.current_block, increment, .fallthrough);
+        }
+
+        // Increment → header (back edge)
+        try self.cfg.addEdge(increment, header, .back_edge);
+
+        // Pop loop context.
+        _ = self.loop_stack.pop();
+
+        self.current_block = exit_blk;
     }
 
     // ── FOR loop ────────────────────────────────────────────────────────

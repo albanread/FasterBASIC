@@ -147,6 +147,10 @@ pub const QBEBuilder = struct {
     /// Whether the current block has been terminated (jmp/ret/jnz).
     /// When true, further instructions are unreachable until a new label.
     terminated: bool = false,
+    /// The most recently emitted block label (without '@' prefix).
+    /// Used by IIF phi nodes to reference the correct predecessor block
+    /// when nested IIFs create intermediate blocks.
+    current_label: []const u8 = "",
 
     /// String constant pool: value → label name.
     string_pool: std.StringHashMap([]const u8),
@@ -238,6 +242,7 @@ pub const QBEBuilder = struct {
     pub fn emitLabel(self: *QBEBuilder, label: []const u8) !void {
         try self.emit("@{s}\n", .{label});
         self.terminated = false;
+        self.current_label = label;
     }
 
     // ── Arithmetic & Logic ──────────────────────────────────────────────
@@ -440,6 +445,12 @@ pub const QBEBuilder = struct {
     }
 
     /// Emit a raw line of IL.
+    /// Emit a QBE `blit` instruction to copy `n` bytes from `src` to `dst`.
+    /// Both `src` and `dst` must be pointer-typed (`l`) temporaries.
+    pub fn emitBlit(self: *QBEBuilder, src: []const u8, dst: []const u8, n: u32) !void {
+        try self.emit("    blit {s}, {s}, {d}\n", .{ src, dst, n });
+    }
+
     pub fn raw(self: *QBEBuilder, text: []const u8) !void {
         try self.output.appendSlice(self.allocator, text);
     }
@@ -1200,9 +1211,14 @@ pub const ExprEmitter = struct {
                 for (0..fc_ulen) |ui| fc_upper_buf[ui] = std.ascii.toUpper(fc_base[ui]);
                 const fc_upper = fc_upper_buf[0..fc_ulen];
 
-                // ABS and SGN are context-dependent: integer arg → integer result,
-                // double arg → double result.  Check argument type first.
-                if (std.mem.eql(u8, fc_upper, "ABS") or std.mem.eql(u8, fc_upper, "SGN")) {
+                // SGN always returns integer (-1, 0, or 1) regardless of input type.
+                if (std.mem.eql(u8, fc_upper, "SGN")) {
+                    break :blk ExprType.integer;
+                }
+
+                // ABS is context-dependent: integer arg → integer result,
+                // double arg → double result.
+                if (std.mem.eql(u8, fc_upper, "ABS")) {
                     if (fc.arguments.len > 0) {
                         const arg_et = self.inferExprType(fc.arguments[0]);
                         if (arg_et == .integer) break :blk ExprType.integer;
@@ -1375,6 +1391,60 @@ pub const ExprEmitter = struct {
         };
     }
 
+    /// Check whether an expression resolves to a LONG (64-bit integer)
+    /// base type.  This is needed because `inferExprType` collapses both
+    /// INTEGER (32-bit) and LONG (64-bit) into `.integer`.  When emitting
+    /// binary arithmetic we must use QBE `l` ops for LONG operands.
+    fn isLongExpr(self: *ExprEmitter, expr: *const ast.Expression) bool {
+        switch (expr.data) {
+            .variable => |v| {
+                // Check function context first (params / locals)
+                if (self.func_ctx) |fctx| {
+                    var fup_buf: [128]u8 = undefined;
+                    const fbase = SymbolMapper.stripSuffix(v.name);
+                    const flen = @min(fbase.len, fup_buf.len);
+                    for (0..flen) |fi| fup_buf[fi] = std.ascii.toUpper(v.name[fi]);
+                    const fupper = fup_buf[0..flen];
+                    if (fctx.resolve(fupper)) |rv| {
+                        return rv.base_type == .long or rv.base_type == .ulong;
+                    }
+                }
+                // Fall back to global symbol table
+                var vup_buf: [128]u8 = undefined;
+                const vbase = SymbolMapper.stripSuffix(v.name);
+                const vlen = @min(vbase.len, vup_buf.len);
+                for (0..vlen) |vi| vup_buf[vi] = std.ascii.toUpper(vbase[vi]);
+                const vupper = vup_buf[0..vlen];
+                if (self.symbol_table.lookupVariable(vupper)) |vsym| {
+                    return vsym.type_desc.base_type == .long or vsym.type_desc.base_type == .ulong;
+                }
+                // Check suffix
+                if (v.type_suffix) |s| {
+                    return s == .ampersand;
+                }
+                return false;
+            },
+            .binary => |b| {
+                return self.isLongExpr(b.left) or self.isLongExpr(b.right);
+            },
+            .unary => |u| {
+                return self.isLongExpr(u.operand);
+            },
+            .function_call => |fc| {
+                var fc_upper_buf: [128]u8 = undefined;
+                const fc_base = SymbolMapper.stripSuffix(fc.name);
+                const fc_ulen = @min(fc_base.len, fc_upper_buf.len);
+                for (0..fc_ulen) |ui| fc_upper_buf[ui] = std.ascii.toUpper(fc_base[ui]);
+                const fc_upper = fc_upper_buf[0..fc_ulen];
+                if (self.symbol_table.lookupFunction(fc_upper)) |fsym| {
+                    return fsym.return_type_desc.base_type == .long or fsym.return_type_desc.base_type == .ulong;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn typeFromSuffix(suffix: ?Tag) ExprType {
         if (suffix) |s| {
             return switch (s) {
@@ -1468,6 +1538,14 @@ pub const ExprEmitter = struct {
                 if (fctx.return_addr) |ret_addr| {
                     const dest = try self.builder.newTemp();
                     try self.builder.emitLoad(dest, fctx.return_type, ret_addr);
+                    // SINGLE values are loaded as QBE 's' but the expression
+                    // system works entirely with 'd' (double). Extend to
+                    // double so that comparisons and arithmetic work.
+                    if (std.mem.eql(u8, fctx.return_type, "s")) {
+                        const dbl = try self.builder.newTemp();
+                        try self.builder.emit("    {s} =d exts {s}\n", .{ dbl, dest });
+                        return dbl;
+                    }
                     return dest;
                 }
             }
@@ -1481,6 +1559,13 @@ pub const ExprEmitter = struct {
                     try self.builder.emit("    {s} =l copy {s}\n", .{ dest, rv.addr });
                 } else {
                     try self.builder.emitLoad(dest, rv.qbe_type, rv.addr);
+                }
+                // SINGLE locals/params are loaded as 's' but the expression
+                // system expects 'd'. Promote to double.
+                if (rv.base_type == .single) {
+                    const dbl = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =d exts {s}\n", .{ dbl, dest });
+                    return dbl;
                 }
                 return dest;
             }
@@ -1568,6 +1653,14 @@ pub const ExprEmitter = struct {
         } else {
             try self.builder.emitLoad(dest, qbe_t, try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
         }
+        // SINGLE globals are loaded as 's' but the expression system
+        // expects 'd' (double). Promote to double so that comparisons
+        // (ceqd, cgtd, …) and arithmetic work correctly.
+        if (bt == .single) {
+            const dbl = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ dbl, dest });
+            return dbl;
+        }
         return dest;
     }
 
@@ -1634,19 +1727,28 @@ pub const ExprEmitter = struct {
         const is_ptr_op = left_is_ptr or right_is_ptr;
 
         // Choose the QBE type for arithmetic: if both sides are integer, use "w".
+        // For LONG (64-bit int) operands, use "l" instead of "w".
         const is_int_op = (left_type == .integer and right_type == .integer);
-        const arith_type: []const u8 = if (is_ptr_op) "l" else if (is_int_op) "w" else "d";
+        const is_long_op = is_int_op and (self.isLongExpr(left) or self.isLongExpr(right));
+        const arith_type: []const u8 = if (is_ptr_op) "l" else if (is_long_op) "l" else if (is_int_op) "w" else "d";
 
         // If mixing types (one int, one double), promote the int to double.
         // Skip promotion for pointer operands — they are already 'l'.
+        // For LONG ops, promote 32-bit integers to 64-bit with extsw.
         const eff_lhs = if (!is_ptr_op and !is_int_op and left_type == .integer)
             try self.emitIntToDouble(lhs)
-        else
-            lhs;
+        else if (is_long_op and !self.isLongExpr(left)) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emitExtend(ext, "l", "extsw", lhs);
+            break :blk ext;
+        } else lhs;
         const eff_rhs = if (!is_ptr_op and !is_int_op and right_type == .integer)
             try self.emitIntToDouble(rhs)
-        else
-            rhs;
+        else if (is_long_op and !self.isLongExpr(right)) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emitExtend(ext, "l", "extsw", rhs);
+            break :blk ext;
+        } else rhs;
 
         switch (op) {
             // Arithmetic
@@ -1655,15 +1757,15 @@ pub const ExprEmitter = struct {
             .multiply => try self.builder.emitBinary(dest, arith_type, "mul", eff_lhs, eff_rhs),
             .divide => {
                 if (is_int_op) {
-                    // Integer division: result stays integer
-                    try self.builder.emitBinary(dest, "w", "div", eff_lhs, eff_rhs);
+                    // Integer division: result stays integer (w or l for LONG)
+                    try self.builder.emitBinary(dest, if (is_long_op) "l" else "w", "div", eff_lhs, eff_rhs);
                 } else {
                     try self.builder.emitBinary(dest, "d", "div", eff_lhs, eff_rhs);
                 }
             },
             .kw_mod => {
                 if (is_int_op) {
-                    try self.builder.emitBinary(dest, "w", "rem", eff_lhs, eff_rhs);
+                    try self.builder.emitBinary(dest, if (is_long_op) "l" else "w", "rem", eff_lhs, eff_rhs);
                 } else {
                     // Float MOD: a - floor(a/b) * b
                     const div_temp = try self.builder.newTemp();
@@ -1944,6 +2046,62 @@ pub const ExprEmitter = struct {
             }
         }
 
+        // ── SGN intrinsic ──────────────────────────────────────────────
+        // SGN(x) = -1 if x < 0, 0 if x == 0, 1 if x > 0
+        // Branchless: result = (x > 0) - (x < 0)
+        if (std.mem.eql(u8, name_upper, "SGN")) {
+            if (arguments.len >= 1) {
+                const arg_val = try self.emitExpression(arguments[0]);
+                const arg_type = self.inferExprType(arguments[0]);
+                const neg = try self.builder.newTemp();
+                const pos = try self.builder.newTemp();
+                const result = try self.builder.newTemp();
+                if (arg_type == .integer) {
+                    // Integer path: csltw / csgtw
+                    try self.builder.emitCompare(neg, "w", "slt", arg_val, "0");
+                    try self.builder.emitCompare(pos, "w", "sgt", arg_val, "0");
+                    try self.builder.emitBinary(result, "w", "sub", pos, neg);
+                } else {
+                    // Double path: cltd / cgtd
+                    const dval = if (arg_type == .integer) try self.emitIntToDouble(arg_val) else arg_val;
+                    try self.builder.emitCompare(neg, "d", "lt", dval, "d_0.0");
+                    try self.builder.emitCompare(pos, "d", "gt", dval, "d_0.0");
+                    try self.builder.emitBinary(result, "w", "sub", pos, neg);
+                }
+                return result;
+            }
+        }
+
+        // ── ABS intrinsic ──────────────────────────────────────────────
+        // Integer: branchless  (x ^ (x >> 31)) - (x >> 31)
+        //   or simply:  if x < 0 then -x else x  via select
+        // Double: call fabs
+        if (std.mem.eql(u8, name_upper, "ABS")) {
+            if (arguments.len >= 1) {
+                const arg_val = try self.emitExpression(arguments[0]);
+                const arg_type = self.inferExprType(arguments[0]);
+                if (arg_type == .integer) {
+                    // Integer ABS: arithmetic shift right 31 to get sign mask,
+                    // then XOR and subtract.
+                    // mask = x >> 31  (arithmetic: all 1s if negative, 0 if positive)
+                    // abs  = (x ^ mask) - mask
+                    const mask = try self.builder.newTemp();
+                    try self.builder.emitBinary(mask, "w", "sar", arg_val, "31");
+                    const xored = try self.builder.newTemp();
+                    try self.builder.emitBinary(xored, "w", "xor", arg_val, mask);
+                    const result = try self.builder.newTemp();
+                    try self.builder.emitBinary(result, "w", "sub", xored, mask);
+                    return result;
+                } else {
+                    // Double ABS: call fabs
+                    const dval = if (arg_type == .integer) try self.emitIntToDouble(arg_val) else arg_val;
+                    const result = try self.builder.newTemp();
+                    try self.builder.emitCall(result, "d", "fabs", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+                    return result;
+                }
+            }
+        }
+
         // Special case: STR$ with a double argument should call basic_str_double
         // instead of basic_str_int. We detect this after building args.
         const builtin = mapBuiltinFunction(name_upper);
@@ -1956,10 +2114,21 @@ pub const ExprEmitter = struct {
 
         for (arguments, 0..) |arg, i| {
             if (i > 0) try args_buf.appendSlice(self.allocator, ", ");
-            const arg_val = try self.emitExpression(arg);
+            var arg_val = try self.emitExpression(arg);
             const arg_type = self.inferExprType(arg);
             if (i == 0) first_arg_type = arg_type;
-            try std.fmt.format(args_buf.writer(self.allocator), "{s} {s}", .{ arg_type.argLetter(), arg_val });
+            // For builtin math functions that return double (sin, cos,
+            // sqrt, …), all arguments are expected to be double.
+            // Promote integer arguments to double so QBE sees the
+            // correct type (e.g. `$sin(d …)` instead of `$sin(w …)`).
+            var effective_type = arg_type;
+            if (builtin != null and arg_type == .integer and
+                std.mem.eql(u8, builtin.?.ret_type, "d"))
+            {
+                arg_val = try self.emitIntToDouble(arg_val);
+                effective_type = .double;
+            }
+            try std.fmt.format(args_buf.writer(self.allocator), "{s} {s}", .{ effective_type.argLetter(), arg_val });
         }
 
         const dest = try self.builder.newTemp();
@@ -2045,16 +2214,40 @@ pub const ExprEmitter = struct {
                         const cvt = try self.builder.newTemp();
                         try self.builder.emitExtend(cvt, "l", "extsw", arg_val);
                         effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "s") and expr_et == .double) {
+                        // double → single: truncate
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "s", "truncd", arg_val);
+                        effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "s") and expr_et == .integer) {
+                        // integer → single: convert w → s
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "s", "swtof", arg_val);
+                        effective_arg = cvt;
                     }
                     try std.fmt.format(typed_args.writer(self.allocator), "{s} {s}", .{ declared_type, effective_arg });
                 }
                 try self.builder.emitCall(dest, ret_type, mangled, typed_args.items);
+                // If the function returns SINGLE (s), promote to double (d)
+                // so the rest of the compiler can use it uniformly as 'd'.
+                if (std.mem.eql(u8, ret_type, "s")) {
+                    const promoted = try self.builder.newTemp();
+                    try self.builder.emitConvert(promoted, "d", "exts", dest);
+                    return promoted;
+                }
                 return dest;
             }
         }
 
         // Fallback: no symbol table info, use inferred argument types.
         try self.builder.emitCall(dest, ret_type, mangled, args_buf.items);
+        // If the function returns SINGLE (s), promote to double (d)
+        // so the rest of the compiler can use it uniformly as 'd'.
+        if (std.mem.eql(u8, ret_type, "s")) {
+            const promoted = try self.builder.newTemp();
+            try self.builder.emitConvert(promoted, "d", "exts", dest);
+            return promoted;
+        }
         return dest;
     }
 
@@ -2080,10 +2273,16 @@ pub const ExprEmitter = struct {
 
         try self.builder.emitLabel(true_label);
         const tv = try self.emitExpression(true_val);
+        // Capture the actual predecessor block for the true branch.
+        // If true_val is a nested IIF, current_label will be the inner
+        // IIF's done label, not true_label.
+        const true_pred = self.builder.current_label;
         try self.builder.emitJump(done_label);
 
         try self.builder.emitLabel(false_label);
         const fv = try self.emitExpression(false_val);
+        // Same for the false branch — capture the actual predecessor.
+        const false_pred = self.builder.current_label;
         try self.builder.emitJump(done_label);
 
         // Determine the QBE type for the phi node from the result type.
@@ -2096,7 +2295,7 @@ pub const ExprEmitter = struct {
 
         try self.builder.emitLabel(done_label);
         const dest = try self.builder.newTemp();
-        try self.builder.emit("    {s} ={s} phi @{s} {s}, @{s} {s}\n", .{ dest, phi_qbe_type, true_label, tv, false_label, fv });
+        try self.builder.emit("    {s} ={s} phi @{s} {s}, @{s} {s}\n", .{ dest, phi_qbe_type, true_pred, tv, false_pred, fv });
 
         return dest;
     }
@@ -2940,6 +3139,13 @@ pub const ExprEmitter = struct {
 
         const dest = try self.builder.newTemp();
         try self.builder.emitLoad(dest, load_type, elem_addr);
+        // SINGLE array elements are loaded as 's' but the expression
+        // system expects 'd'. Promote to double.
+        if (std.mem.eql(u8, load_type, "s")) {
+            const dbl = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ dbl, dest });
+            return dbl;
+        }
         return dest;
     }
 
@@ -3244,6 +3450,43 @@ const ForLoopContext = struct {
     step_addr: []const u8,
 };
 
+/// Context for FOR EACH / FOR...IN loops.  Stores the hidden index
+/// variable address, the array descriptor address, the iterator
+/// variable name, and the optional index variable name.
+const ForEachContext = struct {
+    /// The iterator variable that receives array elements (e.g. "n").
+    iter_variable: []const u8,
+    /// Optional index variable (e.g. "idx" in `FOR item, idx IN arr`).
+    index_variable: []const u8,
+    /// Stack address of the hidden loop index (integer, w).
+    index_addr: []const u8,
+    /// Address of the array descriptor (l).
+    array_desc_addr: []const u8,
+    /// QBE load type for array elements ("w", "d", "l", etc.).
+    elem_load_type: []const u8,
+    /// The base type of array elements.
+    elem_base_type: semantic.BaseType,
+};
+
+/// Context for FOR EACH / FOR...IN loops over HASHMAP collections.
+/// Uses hashmap_keys() to get a NULL-terminated key array, then
+/// iterates by index, loading each key and optionally looking up
+/// the corresponding value.
+const ForEachHashmapContext = struct {
+    /// The iterator variable that receives hashmap keys (always string).
+    key_variable: []const u8,
+    /// Optional value variable (e.g. "v" in `FOR k, v IN dict`).
+    value_variable: []const u8,
+    /// Stack address of the hidden loop index (integer, w).
+    index_addr: []const u8,
+    /// Stack address holding the hashmap size (integer, w).
+    size_addr: []const u8,
+    /// Stack address holding the keys array pointer (l).
+    keys_array_addr: []const u8,
+    /// Stack address holding the hashmap pointer (l) for lookups.
+    map_ptr_addr: []const u8,
+};
+
 /// Pre-allocated stack slots for FOR loop limit/step temporaries.
 /// QBE requires all `alloc` instructions to appear in the function's
 /// start block.  We scan the entire CFG for FOR statements before
@@ -3283,6 +3526,12 @@ pub const BlockEmitter = struct {
     /// FOR loop contexts, keyed by the loop header block index.
     for_contexts: std.AutoHashMap(u32, ForLoopContext),
 
+    /// FOR EACH loop contexts, keyed by the loop header block index.
+    foreach_contexts: std.AutoHashMap(u32, ForEachContext),
+
+    /// FOR EACH hashmap loop contexts, keyed by the loop header block index.
+    foreach_hashmap_contexts: std.AutoHashMap(u32, ForEachHashmapContext),
+
     /// CASE selector contexts, keyed by the case entry block index.
     case_contexts: std.AutoHashMap(u32, CaseContext),
 
@@ -3315,6 +3564,8 @@ pub const BlockEmitter = struct {
             .cfg = the_cfg,
             .allocator = allocator,
             .for_contexts = std.AutoHashMap(u32, ForLoopContext).init(allocator),
+            .foreach_contexts = std.AutoHashMap(u32, ForEachContext).init(allocator),
+            .foreach_hashmap_contexts = std.AutoHashMap(u32, ForEachHashmapContext).init(allocator),
             .case_contexts = std.AutoHashMap(u32, CaseContext).init(allocator),
             .for_pre_allocs = std.StringHashMap(ForPreAlloc).init(allocator),
         };
@@ -3322,6 +3573,8 @@ pub const BlockEmitter = struct {
 
     pub fn deinit(self: *BlockEmitter) void {
         self.for_contexts.deinit();
+        self.foreach_contexts.deinit();
+        self.foreach_hashmap_contexts.deinit();
         self.case_contexts.deinit();
         self.for_pre_allocs.deinit();
     }
@@ -3329,6 +3582,8 @@ pub const BlockEmitter = struct {
     /// Reset per-function state.
     pub fn resetContexts(self: *BlockEmitter) void {
         self.for_contexts.clearRetainingCapacity();
+        self.foreach_contexts.clearRetainingCapacity();
+        self.foreach_hashmap_contexts.clearRetainingCapacity();
         self.case_contexts.clearRetainingCapacity();
         self.for_pre_allocs.clearRetainingCapacity();
         self.func_ctx = null;
@@ -3470,6 +3725,7 @@ pub const BlockEmitter = struct {
             // branching is handled by emitTerminator via CFG edges.
 
             .for_stmt => |fs| try self.emitForInit(&fs, block),
+            .for_in => |fi| try self.emitForEachInit(&fi, block),
             .if_stmt => {}, // condition is in branch_condition; branching in terminator
             .while_stmt => {}, // condition is in branch_condition; branching in terminator
             .do_stmt => {}, // condition is in branch_condition; branching in terminator
@@ -3626,6 +3882,9 @@ pub const BlockEmitter = struct {
                 if (block.kind == .loop_header and self.isForLoopHeader(block.index)) {
                     // FOR loop condition: compare loop variable <= end value
                     try self.emitForCondition(block.index, true_target.?, false_target.?);
+                } else if (block.kind == .loop_header and self.isForEachLoopHeader(block.index)) {
+                    // FOR EACH condition: compare index < array length
+                    try self.emitForEachCondition(block.index, true_target.?, false_target.?);
                 } else {
                     // Regular boolean condition (IF, WHILE, DO, REPEAT UNTIL)
                     const cond_val = try self.expr_emitter.emitExpression(cond);
@@ -3701,6 +3960,384 @@ pub const BlockEmitter = struct {
     /// registered ForLoopContext).
     fn isForLoopHeader(self: *const BlockEmitter, header_idx: u32) bool {
         return self.for_contexts.contains(header_idx);
+    }
+
+    /// Check if a loop_header block is associated with a FOR EACH loop.
+    fn isForEachLoopHeader(self: *const BlockEmitter, header_idx: u32) bool {
+        return self.foreach_contexts.contains(header_idx) or self.foreach_hashmap_contexts.contains(header_idx);
+    }
+
+    // ── FOR EACH loop helpers ───────────────────────────────────────────
+
+    /// Emit FOR EACH initialisation: set hidden index to 0, register context.
+    /// Detects whether the collection is a hashmap or an array and dispatches
+    /// to the appropriate init path.
+    fn emitForEachInit(self: *BlockEmitter, fi: *const ast.ForInStmt, block: *const cfg_mod.BasicBlock) EmitError!void {
+        // Determine collection name from the expression.
+        const coll_name = switch (fi.array.data) {
+            .variable => |v| v.name,
+            .array_access => |aa| aa.name,
+            else => "unknown",
+        };
+
+        // Detect if the collection is a hashmap.
+        if (self.expr_emitter.isHashmapVariable(coll_name)) {
+            try self.emitForEachHashmapInit(fi, block, coll_name);
+            return;
+        }
+
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN ...", .{fi.variable}));
+
+        const desc_name = try self.symbol_mapper.arrayDescName(coll_name);
+        const desc_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{desc_name});
+
+        // Look up element type from symbol table.
+        var arr_upper_buf: [128]u8 = undefined;
+        const arr_len = @min(coll_name.len, arr_upper_buf.len);
+        for (0..arr_len) |i| arr_upper_buf[i] = std.ascii.toUpper(coll_name[i]);
+        const arr_upper = arr_upper_buf[0..arr_len];
+
+        var elem_load_type: []const u8 = "d";
+        var elem_base_type: semantic.BaseType = .double;
+        if (self.symbol_table.lookupArray(arr_upper)) |arr_sym| {
+            elem_base_type = arr_sym.element_type_desc.base_type;
+            elem_load_type = elem_base_type.toQBEType();
+        }
+
+        // Allocate a hidden index variable on the stack (integer, w).
+        const index_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(index_addr, 4, 4);
+        // Set index = 0
+        try self.builder.emitStore("w", "0", index_addr);
+
+        // If there's an explicit index variable, resolve and init it too.
+        if (fi.index_variable.len > 0) {
+            const idx_resolved = try self.resolveVarAddr(fi.index_variable, null);
+            try self.builder.emitStore(idx_resolved.store_type, "0", idx_resolved.addr);
+        }
+
+        // Find the header block index (the successor of the current block).
+        var header_idx: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and (edge.kind == .fallthrough or edge.kind == .branch_true)) {
+                header_idx = edge.to;
+                break;
+            }
+        }
+
+        if (header_idx) |hidx| {
+            const ctx = ForEachContext{
+                .iter_variable = fi.variable,
+                .index_variable = fi.index_variable,
+                .index_addr = index_addr,
+                .array_desc_addr = desc_addr,
+                .elem_load_type = elem_load_type,
+                .elem_base_type = elem_base_type,
+            };
+            try self.foreach_contexts.put(hidx, ctx);
+
+            // Also register on the increment block (the block with back_edge to header).
+            for (self.cfg.edges.items) |edge| {
+                if (edge.to == hidx and edge.kind == .back_edge) {
+                    try self.foreach_contexts.put(edge.from, ctx);
+                }
+            }
+
+            // Also register on the body block so we can load the element there.
+            for (self.cfg.edges.items) |edge| {
+                if (edge.from == hidx and edge.kind == .branch_true) {
+                    try self.foreach_contexts.put(edge.to, ctx);
+                }
+            }
+        }
+    }
+
+    /// Emit FOR EACH initialisation for HASHMAP collections.
+    /// Calls hashmap_keys() and hashmap_size(), stores results on the stack,
+    /// and registers a ForEachHashmapContext for use by condition/body/increment.
+    fn emitForEachHashmapInit(self: *BlockEmitter, fi: *const ast.ForInStmt, block: *const cfg_mod.BasicBlock, coll_name: []const u8) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN {s} (HASHMAP)", .{ fi.variable, coll_name }));
+
+        // Load the hashmap pointer from the global variable.
+        const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
+        const map_ptr = try self.builder.newTemp();
+        try self.builder.emitLoad(map_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+
+        // Call hashmap_keys(map) → returns NULL-terminated char** array.
+        const keys_arr = try self.builder.newTemp();
+        try self.builder.emitCall(keys_arr, "l", "hashmap_keys", try std.fmt.allocPrint(self.allocator, "l {s}", .{map_ptr}));
+
+        // Call hashmap_size(map) → returns int64_t count.
+        const size_l = try self.builder.newTemp();
+        try self.builder.emitCall(size_l, "l", "hashmap_size", try std.fmt.allocPrint(self.allocator, "l {s}", .{map_ptr}));
+        // Truncate to int32 for comparison with w-typed index.
+        const size_w = try self.builder.newTemp();
+        try self.builder.emitTrunc(size_w, "w", size_l);
+
+        // Allocate stack slots for: hidden index, size, keys array ptr, map ptr.
+        const index_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(index_addr, 4, 4);
+        try self.builder.emitStore("w", "0", index_addr);
+
+        const size_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(size_addr, 4, 4);
+        try self.builder.emitStore("w", size_w, size_addr);
+
+        const keys_array_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(keys_array_addr, 8, 8);
+        try self.builder.emitStore("l", keys_arr, keys_array_addr);
+
+        const map_ptr_addr = try self.builder.newTemp();
+        try self.builder.emitAlloc(map_ptr_addr, 8, 8);
+        try self.builder.emitStore("l", map_ptr, map_ptr_addr);
+
+        // Find the header block index (the successor of the current block).
+        var header_idx: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and (edge.kind == .fallthrough or edge.kind == .branch_true)) {
+                header_idx = edge.to;
+                break;
+            }
+        }
+
+        if (header_idx) |hidx| {
+            const ctx = ForEachHashmapContext{
+                .key_variable = fi.variable,
+                .value_variable = fi.index_variable,
+                .index_addr = index_addr,
+                .size_addr = size_addr,
+                .keys_array_addr = keys_array_addr,
+                .map_ptr_addr = map_ptr_addr,
+            };
+            try self.foreach_hashmap_contexts.put(hidx, ctx);
+
+            // Also register on the increment block (the block with back_edge to header).
+            for (self.cfg.edges.items) |edge| {
+                if (edge.to == hidx and edge.kind == .back_edge) {
+                    try self.foreach_hashmap_contexts.put(edge.from, ctx);
+                }
+            }
+
+            // Also register on the body block so we can load the key/value there.
+            for (self.cfg.edges.items) |edge| {
+                if (edge.from == hidx and edge.kind == .branch_true) {
+                    try self.foreach_hashmap_contexts.put(edge.to, ctx);
+                }
+            }
+        }
+    }
+
+    /// Emit the FOR EACH condition: compare hidden index with array upper bound
+    /// or hashmap size.
+    fn emitForEachCondition(self: *BlockEmitter, header_idx: u32, true_target: u32, false_target: u32) EmitError!void {
+        // Check for hashmap context first.
+        if (self.foreach_hashmap_contexts.get(header_idx)) |hctx| {
+            try self.emitForEachHashmapCondition(&hctx, true_target, false_target);
+            return;
+        }
+
+        const ctx = self.foreach_contexts.get(header_idx) orelse {
+            try self.builder.emitComment("WARN: FOR EACH context not found, jumping to body");
+            try self.builder.emitJump(try blockLabel(self.cfg, true_target, self.allocator));
+            return;
+        };
+
+        // Load current index (w = int32)
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "w", ctx.index_addr);
+
+        // ArrayDescriptor layout (from array_descriptor.h):
+        //   Offset  0: void*   data          (8 bytes, pointer)
+        //   Offset  8: int64_t lowerBound1    (8 bytes)
+        //   Offset 16: int64_t upperBound1    (8 bytes)
+        //   ...
+        // Read upperBound1 at offset 16 as int64_t (l), then truncate
+        // to int32 (w) for comparison with our w-typed index.
+        const ub_addr = try self.builder.newTemp();
+        try self.builder.emitBinary(ub_addr, "l", "add", ctx.array_desc_addr, "16");
+        const upper_bound_l = try self.builder.newTemp();
+        try self.builder.emitLoad(upper_bound_l, "l", ub_addr);
+        // Truncate int64 → int32
+        const upper_bound = try self.builder.newTemp();
+        try self.builder.emitTrunc(upper_bound, "w", upper_bound_l);
+
+        // Condition: index <= upperBound  →  continue loop
+        // Equivalent to: !(index > upperBound)
+        const idx_gt = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csgtw {s}, {s}\n", .{ idx_gt, cur_idx, upper_bound });
+        const cond = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w xor {s}, 1\n", .{ cond, idx_gt });
+
+        try self.builder.emitBranch(
+            cond,
+            try blockLabel(self.cfg, true_target, self.allocator),
+            try blockLabel(self.cfg, false_target, self.allocator),
+        );
+    }
+
+    /// Emit the FOR EACH hashmap condition: compare index < size.
+    fn emitForEachHashmapCondition(self: *BlockEmitter, hctx: *const ForEachHashmapContext, true_target: u32, false_target: u32) EmitError!void {
+        // Load current index
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "w", hctx.index_addr);
+
+        // Load hashmap size
+        const size = try self.builder.newTemp();
+        try self.builder.emitLoad(size, "w", hctx.size_addr);
+
+        // Condition: index < size  →  continue loop
+        const cond = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltw {s}, {s}\n", .{ cond, cur_idx, size });
+
+        try self.builder.emitBranch(
+            cond,
+            try blockLabel(self.cfg, true_target, self.allocator),
+            try blockLabel(self.cfg, false_target, self.allocator),
+        );
+    }
+
+    /// Emit the element load at the start of a FOR EACH body block.
+    /// Loads arr(index) into the iterator variable, or for hashmaps,
+    /// loads the key (and optionally value) from the keys array.
+    pub fn emitForEachBodyLoad(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) EmitError!void {
+        // Only emit for body blocks (not header or increment).
+        if (block.kind != .loop_body) return;
+
+        // Check for hashmap context first.
+        if (self.foreach_hashmap_contexts.get(block.index)) |hctx| {
+            try self.emitForEachHashmapBodyLoad(&hctx);
+            return;
+        }
+
+        const ctx = self.foreach_contexts.get(block.index) orelse return;
+
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH: load {s} = arr(index)", .{ctx.iter_variable}));
+
+        // Load current index
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "w", ctx.index_addr);
+
+        // Get element address: fbc_array_element_addr(desc, index)
+        const elem_addr = try self.builder.newTemp();
+        const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ ctx.array_desc_addr, cur_idx });
+        try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
+
+        // Load element value
+        const elem_val = try self.builder.newTemp();
+        try self.builder.emitLoad(elem_val, ctx.elem_load_type, elem_addr);
+
+        // For SINGLE elements, promote to double (matching emitVariableLoad behaviour)
+        var store_val = elem_val;
+        if (ctx.elem_base_type == .single) {
+            const dbl = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ dbl, elem_val });
+            store_val = dbl;
+        }
+
+        // Store into the iterator variable
+        const resolved = try self.resolveVarAddr(ctx.iter_variable, null);
+        // Convert if needed: element type may differ from variable storage type
+        if (ctx.elem_base_type.isInteger() and std.mem.eql(u8, resolved.store_type, "d")) {
+            // Integer element → double variable: convert
+            const cvt = try self.builder.newTemp();
+            try self.builder.emitConvert(cvt, "d", "swtof", elem_val);
+            try self.builder.emitStore(resolved.store_type, cvt, resolved.addr);
+        } else if (ctx.elem_base_type == .double and resolved.base_type.isInteger()) {
+            // Double element → integer variable: convert
+            const cvt = try self.builder.newTemp();
+            try self.builder.emitConvert(cvt, "w", "dtosi", elem_val);
+            try self.builder.emitStore(resolved.store_type, cvt, resolved.addr);
+        } else {
+            try self.builder.emitStore(resolved.store_type, store_val, resolved.addr);
+        }
+
+        // If there's an index variable, store the current index into it too.
+        if (ctx.index_variable.len > 0) {
+            const idx_resolved = try self.resolveVarAddr(ctx.index_variable, null);
+            if (std.mem.eql(u8, idx_resolved.store_type, "d")) {
+                // Index is integer but variable may be double
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "d", "swtof", cur_idx);
+                try self.builder.emitStore(idx_resolved.store_type, cvt, idx_resolved.addr);
+            } else {
+                try self.builder.emitStore(idx_resolved.store_type, cur_idx, idx_resolved.addr);
+            }
+        }
+    }
+
+    /// Emit the FOR EACH increment: index += 1.
+    pub fn emitForEachIncrement(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) EmitError!void {
+        // Check for hashmap context first.
+        if (self.foreach_hashmap_contexts.get(block.index)) |hctx| {
+            const cur = try self.builder.newTemp();
+            try self.builder.emitLoad(cur, "w", hctx.index_addr);
+            const next_val = try self.builder.newTemp();
+            try self.builder.emitBinary(next_val, "w", "add", cur, "1");
+            try self.builder.emitStore("w", next_val, hctx.index_addr);
+            return;
+        }
+
+        const ctx = self.foreach_contexts.get(block.index) orelse return;
+
+        // Load current index, add 1, store back
+        const cur = try self.builder.newTemp();
+        try self.builder.emitLoad(cur, "w", ctx.index_addr);
+        const next = try self.builder.newTemp();
+        try self.builder.emitBinary(next, "w", "add", cur, "1");
+        try self.builder.emitStore("w", next, ctx.index_addr);
+    }
+
+    /// Emit the body load for a FOR EACH over a HASHMAP.
+    /// Loads keys[index] as a C string, converts to StringDescriptor,
+    /// stores to key variable.  If a value variable is present, calls
+    /// hashmap_lookup to get the value.
+    fn emitForEachHashmapBodyLoad(self: *BlockEmitter, hctx: *const ForEachHashmapContext) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH HASHMAP: load key={s}", .{hctx.key_variable}));
+
+        // Load current index
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "w", hctx.index_addr);
+
+        // Load the keys array pointer
+        const keys_ptr = try self.builder.newTemp();
+        try self.builder.emitLoad(keys_ptr, "l", hctx.keys_array_addr);
+
+        // Compute address of keys[index]: keys_ptr + index * 8 (pointer size)
+        const idx_ext = try self.builder.newTemp();
+        try self.builder.emitExtend(idx_ext, "l", "extsw", cur_idx);
+        const offset = try self.builder.newTemp();
+        try self.builder.emitBinary(offset, "l", "mul", idx_ext, "8");
+        const key_slot_addr = try self.builder.newTemp();
+        try self.builder.emitBinary(key_slot_addr, "l", "add", keys_ptr, offset);
+
+        // Load the char* key from keys[index]
+        const key_cstr = try self.builder.newTemp();
+        try self.builder.emitLoad(key_cstr, "l", key_slot_addr);
+
+        // Convert char* → StringDescriptor* via string_new_utf8
+        const key_str_desc = try self.builder.newTemp();
+        try self.builder.emitCall(key_str_desc, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_cstr}));
+
+        // Store the StringDescriptor* into the key variable
+        const key_resolved = try self.resolveVarAddr(hctx.key_variable, null);
+        try self.builder.emitStore("l", key_str_desc, key_resolved.addr);
+
+        // If there's a value variable, look up the value from the hashmap.
+        if (hctx.value_variable.len > 0) {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH HASHMAP: load value={s}", .{hctx.value_variable}));
+
+            // Load the hashmap pointer
+            const map_ptr = try self.builder.newTemp();
+            try self.builder.emitLoad(map_ptr, "l", hctx.map_ptr_addr);
+
+            // Call hashmap_lookup(map, key_cstr) → returns value (StringDescriptor*)
+            const val_ptr = try self.builder.newTemp();
+            try self.builder.emitCall(val_ptr, "l", "hashmap_lookup", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ map_ptr, key_cstr }));
+
+            // Store the value into the value variable
+            const val_resolved = try self.resolveVarAddr(hctx.value_variable, null);
+            try self.builder.emitStore("l", val_ptr, val_resolved.addr);
+        }
     }
 
     /// Emit the FOR loop initialisation: set loop variable to start value,
@@ -3941,7 +4578,13 @@ pub const BlockEmitter = struct {
     /// Uses integer (w) arithmetic. Step was stored at init time.
     pub fn emitForIncrement(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) EmitError!void {
         const ctx = self.for_contexts.get(block.index) orelse {
-            try self.builder.emitComment("WARN: FOR increment context not found");
+            // Don't warn if this is a FOR EACH block (array or hashmap) —
+            // those have their own increment logic.
+            if (!self.foreach_contexts.contains(block.index) and
+                !self.foreach_hashmap_contexts.contains(block.index))
+            {
+                try self.builder.emitComment("WARN: FOR increment context not found");
+            }
             return;
         };
 
@@ -4037,6 +4680,211 @@ pub const BlockEmitter = struct {
             // No condition: unconditional match (OTHERWISE-like)
             try self.builder.emitJump(try blockLabel(self.cfg, match_target, self.allocator));
         }
+    }
+
+    // ── UDT Arithmetic Helpers (NEON + Scalar) ──────────────────────────
+
+    /// Map SIMDInfo to the integer arrangement code used in NEON IL opcodes:
+    ///   0 = Kw  (.4s integer)
+    ///   1 = Kl  (.2d integer)
+    ///   2 = Ks  (.4s float)
+    ///   3 = Kd  (.2d float)
+    ///   4 =      .8h integer
+    ///   5 =      .16b integer
+    fn simdArrangementCode(info: ast.TypeDeclStmt.SIMDInfo) i32 {
+        return switch (info.simd_type) {
+            .v4s, .v4s_pad1, .quad => if (info.is_floating_point) @as(i32, 2) else @as(i32, 0),
+            .v2d, .pair => if (info.is_floating_point) @as(i32, 3) else @as(i32, 1),
+            .v8h => 4,
+            .v16b => 5,
+            .v2s, .v4h, .v8b => 0, // half-register fallback
+            .none => 0,
+        };
+    }
+
+    /// Check whether a UDT contains any string fields (at any nesting depth).
+    fn hasStringFields(self: *BlockEmitter, ts: *const semantic.TypeSymbol) bool {
+        for (ts.fields) |field| {
+            if (field.type_desc.base_type == .string) return true;
+            if (field.type_desc.base_type == .user_defined) {
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                if (self.symbol_table.lookupType(nested_name)) |nested_ts| {
+                    if (self.hasStringFields(nested_ts)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Emit code to obtain the memory address of a UDT expression.
+    /// For variables this loads the pointer from the global slot;
+    /// for locals it returns the stack slot address directly.
+    fn getUDTAddressForExpr(self: *BlockEmitter, expr: *const ast.Expression) EmitError!?[]const u8 {
+        switch (expr.data) {
+            .variable => |v| {
+                // Check function-local first
+                if (self.func_ctx) |fctx| {
+                    var upper_buf: [128]u8 = undefined;
+                    const base = SymbolMapper.stripSuffix(v.name);
+                    const ulen = @min(base.len, upper_buf.len);
+                    for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(base[i]);
+                    const upper_base = upper_buf[0..ulen];
+                    if (fctx.resolve(upper_base)) |rv| {
+                        if (rv.base_type == .user_defined) {
+                            // For locals, the stack slot address IS the struct
+                            const dest = try self.builder.newTemp();
+                            try self.builder.emit("    {s} =l copy {s}\n", .{ dest, rv.addr });
+                            return dest;
+                        }
+                    }
+                }
+                // Global variable: load pointer from the global slot
+                const var_name = try self.symbol_mapper.globalVarName(v.name, null);
+                const dest = try self.builder.newTemp();
+                try self.builder.emitLoad(dest, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                return dest;
+            },
+            .array_access => |aa| {
+                // Emit the array element address
+                const index_val = try self.expr_emitter.emitExpression(aa.indices[0]);
+                const idx_type = self.expr_emitter.inferExprType(aa.indices[0]);
+                const index_int = if (idx_type == .integer) index_val else blk: {
+                    const t = try self.builder.newTemp();
+                    try self.builder.emitConvert(t, "w", "dtosi", index_val);
+                    break :blk t;
+                };
+                const desc_name = try self.symbol_mapper.arrayDescName(aa.name);
+                const desc_addr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
+                const bc_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+                const elem_addr = try self.builder.newTemp();
+                const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
+                return elem_addr;
+            },
+            else => return null,
+        }
+    }
+
+    /// Try to emit UDT element-wise arithmetic for a LET statement.
+    /// Handles `C = A + B` (and -, *, /) where A, B, C are the same UDT type.
+    /// Returns true if the statement was handled (NEON or scalar).
+    fn tryEmitUDTArithmetic(self: *BlockEmitter, lt: *const ast.LetStmt, target_addr: []const u8, udt_type_name: []const u8) EmitError!bool {
+        // The value expression must be a binary expression
+        const bin = switch (lt.value.data) {
+            .binary => |b| b,
+            else => return false,
+        };
+
+        // Only handle arithmetic operators: +, -, *, /
+        const neon_op: []const u8 = switch (bin.op) {
+            .plus => "neonadd",
+            .minus => "neonsub",
+            .multiply => "neonmul",
+            .divide => "neondiv",
+            else => return false,
+        };
+        const scalar_op: []const u8 = switch (bin.op) {
+            .plus => "add",
+            .minus => "sub",
+            .multiply => "mul",
+            .divide => "div",
+            else => return false,
+        };
+
+        // Both operands must be the same UDT type as the target
+        const left_udt = self.expr_emitter.inferUDTNameForExpr(bin.left) orelse return false;
+        const right_udt = self.expr_emitter.inferUDTNameForExpr(bin.right) orelse return false;
+
+        if (!std.ascii.eqlIgnoreCase(left_udt, udt_type_name)) return false;
+        if (!std.ascii.eqlIgnoreCase(right_udt, udt_type_name)) return false;
+
+        // Look up the UDT definition
+        const type_sym = self.symbol_table.lookupType(udt_type_name) orelse return false;
+
+        // UDT must not contain string fields
+        if (self.hasStringFields(type_sym)) return false;
+
+        // Get addresses of left and right operands
+        const left_addr = try self.getUDTAddressForExpr(bin.left) orelse return false;
+        const right_addr = try self.getUDTAddressForExpr(bin.right) orelse return false;
+
+        // ── NEON fast path ──────────────────────────────────────────────
+        const simd_info = type_sym.simd_info;
+        if (simd_info.isValid() and simd_info.is_full_q and self.symbol_table.neon_enabled) {
+            // Division is only supported for float arrangements
+            if (std.mem.eql(u8, neon_op, "neondiv") and !simd_info.is_floating_point) {
+                // Fall through to scalar
+            } else {
+                const arr_code = simdArrangementCode(simd_info);
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "NEON arithmetic ({s}): {s} → 4 instructions", .{ udt_type_name, neon_op }));
+                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonldr {s}", .{left_addr}));
+                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonldr2 {s}", .{right_addr}));
+                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ neon_op, arr_code }));
+                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonstr {s}", .{target_addr}));
+                try self.builder.emitComment("End NEON UDT arithmetic assignment");
+                return true;
+            }
+        }
+
+        // ── Scalar fallback (field-by-field) ────────────────────────────
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Scalar UDT arithmetic ({s}): field-by-field {s}", .{ udt_type_name, scalar_op }));
+
+        var offset: u32 = 0;
+        for (type_sym.fields) |field| {
+            const field_bt = field.type_desc.base_type;
+
+            // Skip non-numeric fields
+            if (field_bt == .string) continue;
+
+            if (field_bt == .user_defined) {
+                // For nested UDTs, skip for now (could recurse)
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                const nested_sz = self.type_manager.sizeOfUDT(nested_name);
+                offset += if (nested_sz == 0) 8 else nested_sz;
+                continue;
+            }
+
+            const qbe_type = field_bt.toQBEType();
+            const qbe_load = field_bt.toQBEMemOp();
+
+            // Calculate field addresses
+            const left_field_addr = try self.builder.newTemp();
+            const right_field_addr = try self.builder.newTemp();
+            const dst_field_addr = try self.builder.newTemp();
+
+            if (offset > 0) {
+                const off_str = try std.fmt.allocPrint(self.allocator, "{d}", .{offset});
+                try self.builder.emitBinary(left_field_addr, "l", "add", left_addr, off_str);
+                try self.builder.emitBinary(right_field_addr, "l", "add", right_addr, off_str);
+                try self.builder.emitBinary(dst_field_addr, "l", "add", target_addr, off_str);
+            } else {
+                try self.builder.emit("    {s} =l copy {s}\n", .{ left_field_addr, left_addr });
+                try self.builder.emit("    {s} =l copy {s}\n", .{ right_field_addr, right_addr });
+                try self.builder.emit("    {s} =l copy {s}\n", .{ dst_field_addr, target_addr });
+            }
+
+            // Load left and right values
+            const left_val = try self.builder.newTemp();
+            const right_val = try self.builder.newTemp();
+            try self.builder.emitLoad(left_val, qbe_load, left_field_addr);
+            try self.builder.emitLoad(right_val, qbe_load, right_field_addr);
+
+            // Perform the arithmetic operation
+            const result = try self.builder.newTemp();
+            try self.builder.emitBinary(result, qbe_type, scalar_op, left_val, right_val);
+
+            // Store result to target field
+            try self.builder.emitStore(qbe_load, result, dst_field_addr);
+
+            // Advance offset
+            const field_size = self.type_manager.sizeOf(field_bt);
+            offset += if (field_size == 0) 8 else field_size;
+        }
+
+        try self.builder.emitComment("End scalar UDT arithmetic assignment");
+        return true;
     }
 
     // ── Leaf Statement Emitters ─────────────────────────────────────────
@@ -4209,6 +5057,74 @@ pub const BlockEmitter = struct {
     }
 
     fn emitLetStatement(self: *BlockEmitter, lt: *const ast.LetStmt) EmitError!void {
+        // ── UDT arithmetic interception ─────────────────────────────────
+        // Before evaluating the RHS expression, check if this is a UDT
+        // binary arithmetic assignment (C = A + B where A, B, C are UDTs).
+        // If so, emit NEON or scalar field-by-field arithmetic directly.
+        if (lt.member_chain.len == 0 and lt.indices.len == 0) {
+            const resolved_early = try self.resolveVarAddr(lt.variable, lt.type_suffix);
+            if (resolved_early.base_type == .user_defined) {
+                // Look up the UDT type name
+                var vlu_buf_early: [128]u8 = undefined;
+                const vlu_base_early = SymbolMapper.stripSuffix(lt.variable);
+                const vlu_len_early = @min(vlu_base_early.len, vlu_buf_early.len);
+                for (0..vlu_len_early) |vli| vlu_buf_early[vli] = std.ascii.toUpper(vlu_base_early[vli]);
+                const vlu_upper_early = vlu_buf_early[0..vlu_len_early];
+                const udt_name_early: ?[]const u8 = blk: {
+                    if (self.symbol_table.lookupVariable(vlu_upper_early)) |vsym| {
+                        if (vsym.type_desc.udt_name.len > 0) break :blk vsym.type_desc.udt_name;
+                    }
+                    break :blk null;
+                };
+                if (udt_name_early) |utn| {
+                    if (lt.value.data == .binary) {
+                        // Get the target struct address
+                        const dst_ptr_early = try self.builder.newTemp();
+                        try self.builder.emitLoad(dst_ptr_early, "l", resolved_early.addr);
+                        if (try self.tryEmitUDTArithmetic(lt, dst_ptr_early, utn)) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // Also handle array element UDT arithmetic: Arr(i) = A op B
+        if (lt.indices.len > 0 and lt.member_chain.len == 0 and !self.expr_emitter.isHashmapVariable(lt.variable)) {
+            if (lt.value.data == .binary) {
+                // Check if the array element type is a UDT
+                var alu_buf_early: [128]u8 = undefined;
+                const alu_len_early = @min(lt.variable.len, alu_buf_early.len);
+                for (0..alu_len_early) |ali| alu_buf_early[ali] = std.ascii.toUpper(lt.variable[ali]);
+                if (self.symbol_table.lookupArray(alu_buf_early[0..alu_len_early])) |arr_sym| {
+                    if (arr_sym.element_type_desc.base_type == .user_defined) {
+                        const arr_udt_name = arr_sym.element_type_desc.udt_name;
+                        if (arr_udt_name.len > 0) {
+                            // Compute the array element address
+                            const index_val_early = try self.expr_emitter.emitExpression(lt.indices[0]);
+                            const idx_type_early = self.expr_emitter.inferExprType(lt.indices[0]);
+                            const index_int_early = if (idx_type_early == .integer) index_val_early else blk: {
+                                const t = try self.builder.newTemp();
+                                try self.builder.emitConvert(t, "w", "dtosi", index_val_early);
+                                break :blk t;
+                            };
+                            const desc_name_early = try self.symbol_mapper.arrayDescName(lt.variable);
+                            const desc_addr_early = try self.builder.newTemp();
+                            try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr_early, desc_name_early });
+                            const bc_args_early = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
+                            try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args_early);
+                            const elem_addr_early = try self.builder.newTemp();
+                            const ea_args_early = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
+                            try self.builder.emitCall(elem_addr_early, "l", "fbc_array_element_addr", ea_args_early);
+
+                            if (try self.tryEmitUDTArithmetic(lt, elem_addr_early, arr_udt_name)) {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         const val = try self.expr_emitter.emitExpression(lt.value);
         const bt = semantic.baseTypeFromSuffix(lt.type_suffix);
         const store_type = bt.toQBEMemOp();
@@ -4249,6 +5165,36 @@ pub const BlockEmitter = struct {
             // Check function context for params/locals.
             const resolved = try self.resolveVarAddr(lt.variable, lt.type_suffix);
             const var_addr = resolved.addr;
+
+            // UDT value copy: when assigning one UDT variable to another
+            // (e.g. Cpy = Src), copy the struct bytes instead of the pointer
+            // so the two variables remain independent.
+            if (resolved.base_type == .user_defined) {
+                // Look up the UDT type name to determine its size.
+                var vlu_buf: [128]u8 = undefined;
+                const vlu_base = SymbolMapper.stripSuffix(lt.variable);
+                const vlu_len = @min(vlu_base.len, vlu_buf.len);
+                for (0..vlu_len) |vli| vlu_buf[vli] = std.ascii.toUpper(vlu_base[vli]);
+                const vlu_upper = vlu_buf[0..vlu_len];
+                const udt_type_name: ?[]const u8 = blk: {
+                    if (self.symbol_table.lookupVariable(vlu_upper)) |vsym| {
+                        if (vsym.type_desc.udt_name.len > 0) break :blk vsym.type_desc.udt_name;
+                    }
+                    break :blk null;
+                };
+                if (udt_type_name) |utn| {
+                    const udt_sz = self.type_manager.sizeOfUDT(utn);
+                    if (udt_sz > 0) {
+                        // val = pointer to source struct (from CREATE or variable load)
+                        // var_addr = $var_Cpy (holds pointer to dest struct)
+                        // Load destination struct pointer from the variable slot.
+                        const dst_ptr = try self.builder.newTemp();
+                        try self.builder.emitLoad(dst_ptr, "l", var_addr);
+                        try self.builder.emitBlit(val, dst_ptr, udt_sz);
+                        return;
+                    }
+                }
+            }
 
             // Convert value to target type if needed.
             const expr_type = self.expr_emitter.inferExprType(lt.value);
@@ -4606,11 +5552,24 @@ pub const BlockEmitter = struct {
                                 }
 
                                 if (is_last) {
-                                    // Store the value at this field.
-                                    const field_store_type = field.type_desc.base_type.toQBEMemOp();
-                                    const expr_type = self.expr_emitter.inferExprType(lt.value);
-                                    const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type);
-                                    try self.builder.emitStore(field_store_type, effective_val, field_addr);
+                                    // For user_defined (nested UDT) fields,
+                                    // copy the struct bytes inline with blit
+                                    // instead of storing a pointer.
+                                    if (field.type_desc.base_type == .user_defined) {
+                                        const nested_tn = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                                        const nested_sz = self.type_manager.sizeOfUDT(nested_tn);
+                                        if (nested_sz > 0) {
+                                            try self.builder.emitBlit(val, field_addr, nested_sz);
+                                        } else {
+                                            try self.builder.emitStore("l", val, field_addr);
+                                        }
+                                    } else {
+                                        // Store the value at this field.
+                                        const field_store_type = field.type_desc.base_type.toQBEMemOp();
+                                        const expr_type = self.expr_emitter.inferExprType(lt.value);
+                                        const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type);
+                                        try self.builder.emitStore(field_store_type, effective_val, field_addr);
+                                    }
                                 } else {
                                     // Intermediate nested UDT field.
                                     // If the field is itself a user_defined type
@@ -4814,6 +5773,29 @@ pub const BlockEmitter = struct {
                             try self.builder.emitCall(list_ptr, "l", "list_create", "");
                             try self.builder.emitStore("l", list_ptr, var_addr);
                         }
+                    } else if (arr.as_type_name.len > 0) {
+                        // No keyword tag — check if it's a UDT that needs
+                        // auto-allocation so the pointer slot isn't null.
+                        var udt_check_buf: [128]u8 = undefined;
+                        const udt_check_len = @min(arr.as_type_name.len, udt_check_buf.len);
+                        for (0..udt_check_len) |uci| udt_check_buf[uci] = std.ascii.toUpper(arr.as_type_name[uci]);
+                        const udt_check_upper = udt_check_buf[0..udt_check_len];
+
+                        // Only auto-alloc for actual UDT types (not classes,
+                        // not primitive type names like INTEGER/STRING).
+                        if (self.symbol_table.lookupClass(udt_check_upper) == null and
+                            TypeManager.baseTypeFromTypeName(arr.as_type_name) == .user_defined)
+                        {
+                            const udt_size = self.type_manager.sizeOfUDT(arr.as_type_name);
+                            const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
+
+                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
+                            const var_name = try self.symbol_mapper.globalVarName(arr.name, null);
+                            const var_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name});
+                            const udt_ptr = try self.builder.newTemp();
+                            try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                            try self.builder.emitStore("l", udt_ptr, var_addr);
+                        }
                     }
                 }
                 // Otherwise the global data section already zero-initialized it.
@@ -4877,6 +5859,19 @@ pub const BlockEmitter = struct {
             }
         } else if (bt == .string or bt == .long) {
             try self.builder.emitStore("l", "0", addr);
+        } else if (bt == .user_defined) {
+            // UDT local without initialiser — allocate struct memory via
+            // basic_malloc so the pointer slot isn't null.
+            if (arr.as_type_name.len > 0) {
+                const udt_size = self.type_manager.sizeOfUDT(arr.as_type_name);
+                const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS {s} (local auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
+                const udt_ptr = try self.builder.newTemp();
+                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                try self.builder.emitStore("l", udt_ptr, addr);
+            } else {
+                try self.builder.emitStore("l", "0", addr);
+            }
         }
 
         // If there's an initialiser, evaluate and store it.
@@ -4956,7 +5951,35 @@ pub const BlockEmitter = struct {
 
     fn emitReturnStatement(self: *BlockEmitter, rs: *const ast.ReturnStmt) EmitError!void {
         if (rs.return_value) |rv| {
-            const val = try self.expr_emitter.emitExpression(rv);
+            var val = try self.expr_emitter.emitExpression(rv);
+            // Convert the expression result to match the function's
+            // declared return type.  The expression system works with
+            // 'd' (double) for all floats and 'w' (word) for all ints,
+            // but the function may return 's' (SINGLE) or 'l' (LONG).
+            if (self.func_ctx) |fctx| {
+                const ret_t = fctx.return_type;
+                const expr_et = self.expr_emitter.inferExprType(rv);
+                if (std.mem.eql(u8, ret_t, "s") and expr_et == .double) {
+                    // double → single: truncate
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "s", "truncd", val);
+                    val = cvt;
+                } else if (std.mem.eql(u8, ret_t, "l") and expr_et == .integer and !self.expr_emitter.isLongExpr(rv)) {
+                    // word → long: sign-extend
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitExtend(cvt, "l", "extsw", val);
+                    val = cvt;
+                } else if (std.mem.eql(u8, ret_t, "w") and expr_et == .integer and self.expr_emitter.isLongExpr(rv)) {
+                    // long → word: truncate (shouldn't normally happen, but be safe)
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitInstruction(try std.fmt.allocPrint(
+                        self.allocator,
+                        "{s} =w copy {s}",
+                        .{ cvt, val },
+                    ));
+                    val = cvt;
+                }
+            }
             try self.builder.emitReturn(val);
         } else {
             try self.builder.emitReturn("");
@@ -5581,6 +6604,12 @@ pub const CFGCodeGenerator = struct {
         // Special: increment block for FOR loops.
         if (block.kind == .loop_increment) {
             try be.emitForIncrement(block);
+            try be.emitForEachIncrement(block);
+        }
+
+        // Special: body block for FOR EACH loops — load element before statements.
+        if (block.kind == .loop_body) {
+            try be.emitForEachBodyLoad(block);
         }
 
         // Emit statements in this block.
