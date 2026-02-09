@@ -1063,6 +1063,9 @@ pub fn main() !void {
                         "string_ops",
                         "string_utf32",
                         "list_ops",
+                        "string_pool",
+                        "array_descriptor_runtime",
+                        "math_ops",
                     };
                     for (zig_runtime_libs) |lib_name| {
                         const zig_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/lib{s}.a", .{ exe_dir, lib_name }) catch {
