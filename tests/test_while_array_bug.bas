@@ -1,7 +1,7 @@
 REM Minimal reproduction of the nested WHILE bug with array assignment
-DIM sieve(100) AS INT
-DIM i AS INT
-DIM j AS INT
+DIM sieve(100) AS INTEGER
+DIM i AS INTEGER
+DIM j AS INTEGER
 
 REM Initialize
 i = 1

@@ -1,8 +1,8 @@
-DIM i AS INT
+DIM i AS INTEGER
 i = 1
 WHILE i <= 2
     IF i = 1 THEN
-        DIM j AS INT
+        DIM j AS INTEGER
         j = 1
         WHILE j <= 2
             PRINT j

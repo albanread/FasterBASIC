@@ -411,39 +411,29 @@ pub const Lexer = struct {
             _ = self.advance();
         }
 
-        // Handle $ suffix for string functions like MID$, LEFT$, RIGHT$, CHR$, etc.
-        if (!self.isAtEnd() and self.currentChar() == '$') {
-            // Check if this is a known keyword with $ suffix
-            const text_with_dollar = self.source[start .. self.pos + 1];
-            var buf: [32]u8 = undefined;
-            if (text_with_dollar.len <= buf.len) {
-                const upper = toUpperBuf(text_with_dollar, &buf);
-                if (Tag.fromKeyword(upper) != null) {
-                    _ = self.advance(); // consume the $
-                }
-            }
-        }
-
         const lexeme = self.source[start..self.pos];
 
         // ── Keyword vs identifier disambiguation ────────────────────────
         //
-        // If a keyword is immediately followed by a *numeric* type suffix
-        // (%, #, !, &, @, ^) with no whitespace, it is a variable name,
-        // not a keyword.  This is standard BASIC behaviour:
-        //   SINGLE%  → identifier "SINGLE%" + suffix .type_int
+        // If a keyword is immediately followed by ANY type suffix
+        // (%, #, !, &, @, ^, $) with no whitespace, it is a variable
+        // name, not a keyword.  This is standard BASIC behaviour:
+        //   SINGLE%  → identifier "SINGLE" + suffix .type_int
         //   INTEGER  → keyword .kw_integer  (no suffix)
-        //   INTEGER% → identifier "INTEGER%" + suffix .type_int
+        //   INTEGER% → identifier "INTEGER" + suffix .type_int
+        //   LEFT$    → identifier "LEFT" + suffix .type_string
+        //   EMPTY$   → identifier "EMPTY" + suffix .type_string
         //
-        // The `$` suffix is NOT included here because it is used for
-        // string function keywords: LEFT$, MID$, CHR$, STR$, etc.
-        // Those are handled earlier by consuming the `$` into the
-        // lexeme when the combined form is a known keyword.
-        //
-        // We check for a numeric suffix first; if present, fall through
-        // to the identifier path.
+        // The `$` suffix IS included: when LEFT$ is used as a function
+        // call (e.g. LEFT$("hello", 3)), the parser's identifier path
+        // sees identifier "LEFT" + suffix "$" + lparen and dispatches
+        // through isBuiltinFunction().  When LEFT$ is used as a
+        // variable (e.g. left$ = "hello"), no lparen follows, so the
+        // parser treats it as a variable.  This avoids the ambiguity
+        // where keyword tokens like .kw_left demanded '(' even in
+        // variable-assignment contexts.
 
-        const followed_by_suffix = !self.isAtEnd() and isNumericTypeSuffix(self.currentChar());
+        const followed_by_suffix = !self.isAtEnd() and (isNumericTypeSuffix(self.currentChar()) or self.currentChar() == '$');
 
         if (!followed_by_suffix) {
             if (Tag.fromKeyword(lexeme)) |kw_tag| {
@@ -841,18 +831,26 @@ test "keyword without suffix stays keyword" {
     try std.testing.expectEqual(Tag.kw_double, lexer2.tokens.items[2].tag);
 }
 
-test "dollar suffix preserves string function keywords" {
-    // LEFT$, MID$, RIGHT$ are in the keyword map — they should remain
-    // keywords, not become identifier "LEFT" + type_string suffix.
+test "dollar suffix makes keywords become identifiers" {
+    // LEFT$, MID$, RIGHT$ should be tokenized as identifier + type_string
+    // suffix, NOT as keyword tokens.  The parser's identifier path uses
+    // isBuiltinFunction() to dispatch function calls when '(' follows,
+    // and treats them as variables otherwise.
     var lexer3 = Lexer.init("LEFT$ MID$ RIGHT$", std.testing.allocator);
     defer lexer3.deinit();
     try lexer3.tokenize();
-    try std.testing.expectEqual(Tag.kw_left, lexer3.tokens.items[0].tag);
+    // LEFT$  →  identifier "LEFT$" + type_string "$"
+    try std.testing.expectEqual(Tag.identifier, lexer3.tokens.items[0].tag);
     try std.testing.expectEqualStrings("LEFT$", lexer3.tokens.items[0].lexeme);
-    try std.testing.expectEqual(Tag.kw_mid, lexer3.tokens.items[1].tag);
-    try std.testing.expectEqualStrings("MID$", lexer3.tokens.items[1].lexeme);
-    try std.testing.expectEqual(Tag.kw_right, lexer3.tokens.items[2].tag);
-    try std.testing.expectEqualStrings("RIGHT$", lexer3.tokens.items[2].lexeme);
+    try std.testing.expectEqual(Tag.type_string, lexer3.tokens.items[1].tag);
+    // MID$  →  identifier "MID$" + type_string "$"
+    try std.testing.expectEqual(Tag.identifier, lexer3.tokens.items[2].tag);
+    try std.testing.expectEqualStrings("MID$", lexer3.tokens.items[2].lexeme);
+    try std.testing.expectEqual(Tag.type_string, lexer3.tokens.items[3].tag);
+    // RIGHT$  →  identifier "RIGHT$" + type_string "$"
+    try std.testing.expectEqual(Tag.identifier, lexer3.tokens.items[4].tag);
+    try std.testing.expectEqualStrings("RIGHT$", lexer3.tokens.items[4].lexeme);
+    try std.testing.expectEqual(Tag.type_string, lexer3.tokens.items[5].tag);
 }
 
 test "integer divide backslash" {

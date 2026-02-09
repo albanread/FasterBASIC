@@ -1,7 +1,7 @@
 REM Simple nested WHILE test
-DIM arr(10) AS INT
-DIM i AS INT
-DIM j AS INT
+DIM arr(10) AS INTEGER
+DIM i AS INTEGER
+DIM j AS INTEGER
 
 i = 1
 WHILE i <= 3

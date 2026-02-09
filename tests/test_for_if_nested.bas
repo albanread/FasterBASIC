@@ -1,9 +1,9 @@
 1000 REM Test FOR loop nested inside IF statement
 1010 REM This tests the CFG fix for nested control structures
 1020
-1030 DIM flag AS INT
-1040 DIM outer AS INT
-1050 DIM inner AS INT
+1030 DIM flag AS INTEGER
+1040 DIM outer AS INTEGER
+1050 DIM inner AS INTEGER
 1060
 1070 PRINT "Testing FOR loop nested inside IF"
 1080 PRINT ""
@@ -46,7 +46,7 @@
 1450
 1460 REM Test 3: Nested FOR inside IF with condition
 1470 PRINT "Testing conditional FOR execution:"
-1480 DIM total AS INT
+1480 DIM total AS INTEGER
 1490 total = 0
 1500
 1510 FOR outer = 1 TO 3

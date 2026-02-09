@@ -554,6 +554,82 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
+/// List all .c files in a directory.  Returns an owned slice of owned strings.
+fn listCFiles(dir_path: []const u8, allocator: std.mem.Allocator) ![][]const u8 {
+    var results: std.ArrayList([]const u8) = .empty;
+    defer results.deinit(allocator); // only the list; callers own the strings
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return &.{};
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        if (name.len < 3) continue;
+        if (!std.mem.endsWith(u8, name, ".c")) continue;
+        const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
+        try results.append(allocator, full);
+    }
+
+    return try results.toOwnedSlice(allocator);
+}
+
+/// Try to locate the runtime/ directory.
+/// Search order:
+///   1. Explicitly supplied --runtime-dir
+///   2. <exe_dir>/../runtime/       (installed layout)
+///   3. <exe_dir>/../../runtime/    (in-tree: zig-out/bin -> ../../runtime)
+///   4. ./runtime/                  (cwd fallback)
+fn findRuntimeDir(explicit: ?[]const u8, allocator: std.mem.Allocator) ?[]const u8 {
+    // 1. Explicit
+    if (explicit) |dir| {
+        if (fileExists(dir)) return dir;
+    }
+
+    // Helper: check if a candidate directory contains basic_runtime.c
+    const candidates = [_][]const u8{
+        // Try relative to cwd
+        "runtime",
+    };
+
+    // 2-4: Simple relative checks
+    for (candidates) |cand| {
+        const probe = std.fmt.allocPrint(allocator, "{s}/basic_runtime.c", .{cand}) catch continue;
+        defer allocator.free(probe);
+        if (fileExists(probe)) {
+            return allocator.dupe(u8, cand) catch null;
+        }
+    }
+
+    // Try paths relative to executable
+    const exe_path = std.fs.selfExePathAlloc(allocator) catch return null;
+    defer allocator.free(exe_path);
+
+    // Find directory of executable
+    const exe_dir = std.fs.path.dirname(exe_path) orelse return null;
+
+    const relative_tries = [_][]const u8{
+        "/../runtime",
+        "/../../runtime",
+    };
+
+    for (relative_tries) |suffix| {
+        const try_dir = std.fmt.allocPrint(allocator, "{s}{s}", .{ exe_dir, suffix }) catch continue;
+        const probe = std.fmt.allocPrint(allocator, "{s}/basic_runtime.c", .{try_dir}) catch {
+            allocator.free(try_dir);
+            continue;
+        };
+        defer allocator.free(probe);
+        if (fileExists(probe)) {
+            return try_dir;
+        }
+        allocator.free(try_dir);
+    }
+
+    return null;
+}
+
 // ─── Check for .bas extension ───────────────────────────────────────────────
 
 fn isBasicFile(path: []const u8) bool {
@@ -866,35 +942,89 @@ pub fn main() !void {
             };
             defer std.fs.cwd().deleteFile(asm_tmp_path) catch {};
 
-            // Step 2: Assemble + link → executable
+            // Step 2: Locate the runtime directory
+            const rt_dir = findRuntimeDir(opts.runtime_dir, allocator);
+
+            if (opts.verbose) {
+                if (rt_dir) |d| {
+                    stderr.print("Runtime directory: {s}\n", .{d}) catch {};
+                } else {
+                    stderr.print("Warning: runtime directory not found — linking without runtime\n", .{}) catch {};
+                }
+            }
+
+            // Step 3: Assemble + link → executable
             if (opts.verbose) {
                 stderr.print("Linking executable...\n", .{}) catch {};
             }
 
-            // Build link command: cc -o output asm_file [runtime_file]
+            // Build link command:
+            //   cc -O1 -o <output> <asm_file> <runtime .c files...> -I<runtime_dir> -lm
             var link_args: std.ArrayList([]const u8) = .empty;
             defer link_args.deinit(allocator);
 
             try link_args.append(allocator, opts.cc_path);
+            try link_args.append(allocator, "-O1");
             try link_args.append(allocator, "-o");
             try link_args.append(allocator, output_path);
             try link_args.append(allocator, asm_tmp_path);
 
-            // Link runtime library if available
-            if (opts.runtime_dir) |rt_dir| {
-                const rt_path = std.fmt.allocPrint(allocator, "{s}/runtime_stubs.c", .{rt_dir}) catch {
+            // Add all runtime C source files
+            var rt_file_count: usize = 0;
+            if (rt_dir) |dir| {
+                // First check for a pre-built static library
+                const lib_path = std.fmt.allocPrint(allocator, "{s}/libfbruntime.a", .{dir}) catch {
                     stderr.print("Error: out of memory\n", .{}) catch {};
                     std.process.exit(1);
                 };
-                defer allocator.free(rt_path);
-                if (fileExists(rt_path)) {
-                    try link_args.append(allocator, rt_path);
+
+                if (fileExists(lib_path)) {
+                    // Use pre-built archive
+                    try link_args.append(allocator, lib_path);
+                    rt_file_count = 1;
+                    if (opts.verbose) {
+                        stderr.print("  Using pre-built runtime: {s}\n", .{lib_path}) catch {};
+                    }
+                } else {
+                    allocator.free(lib_path);
+
+                    // Compile runtime .c files directly
+                    const rt_files = listCFiles(dir, allocator) catch |err| {
+                        stderr.print("Error: cannot list runtime sources in '{s}': {s}\n", .{ dir, @errorName(err) }) catch {};
+                        std.process.exit(1);
+                    };
+
+                    for (rt_files) |cf| {
+                        try link_args.append(allocator, cf);
+                    }
+                    rt_file_count = rt_files.len;
+
+                    // Add -I<runtime_dir> so runtime headers can find each other
+                    const inc_flag = std.fmt.allocPrint(allocator, "-I{s}", .{dir}) catch {
+                        stderr.print("Error: out of memory\n", .{}) catch {};
+                        std.process.exit(1);
+                    };
+                    try link_args.append(allocator, inc_flag);
                 }
+            }
+
+            // Always link libm (math functions used by runtime)
+            try link_args.append(allocator, "-lm");
+
+            if (rt_file_count == 0) {
+                stderr.print("Warning: no runtime files found — executable may have unresolved symbols\n", .{}) catch {};
+            }
+
+            if (opts.verbose) {
+                stderr.print("  Linking with {d} runtime source(s)\n", .{rt_file_count}) catch {};
             }
 
             runExternalCommand(link_args.items, allocator, opts.verbose, stderr) catch |err| {
                 stderr.print("Error: linking failed: {s}\n", .{@errorName(err)}) catch {};
                 stderr.print("Make sure '{s}' is installed and in your PATH.\n", .{opts.cc_path}) catch {};
+                if (rt_dir == null) {
+                    stderr.print("Hint: specify --runtime-dir <path> pointing to the FasterBASIC runtime/ directory.\n", .{}) catch {};
+                }
                 std.process.exit(1);
             };
 

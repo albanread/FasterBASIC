@@ -1,5 +1,5 @@
 0
-48817 25450562 1770561410134629818 f082f42c8dea8404a4fffcfc10f138d1 0 src/main.zig
+53843 25450562 1770575764716106552 b6b82379a2e9c60357033c59b8ef4014 0 src/main.zig
 22376 25472057 1760154801000000000 2d968f90418b6afe5ba91eaa2e18ba71 1 ubsan_rt.zig
 26224 25497457 1770541439062898407 69d29e33eb98643fb578c69cadc9f294 0 /Users/oberon/compact_repo/zig_compiler/qbe/parse.c
 7866 25497473 1770243582912152410 5dffa92f14f8c94de79f968d147c9370 0 /Users/oberon/compact_repo/zig_compiler/qbe/ssa.c
@@ -864,12 +864,13 @@
 419 25471885 1760154801000000000 ed7dfc04a5d0c4f0853edb5414ce981e 1 std/os/linux/bpf/btf_ext.zig
 24293 25471886 1760154801000000000 0c7d3ee9ea8e698a843ee6039fd161c4 1 std/os/linux/bpf/helpers.zig
 3221 25471633 1760154801000000000 fda67b74062c7f535bb0a6d0f1fe74fb 1 std/crypto/codecs/asn1/der/ArrayListReverse.zig
-48817 25450562 1770561410134629818 f082f42c8dea8404a4fffcfc10f138d1 0 /Users/oberon/compact_repo/zig_compiler/src/main.zig
-38921 25446568 1770567362981783908 6f7ce515e9a04cc774c9cdf5ee7d7139 0 /Users/oberon/compact_repo/zig_compiler/src/lexer.zig
+53843 25450562 1770575764716106552 b6b82379a2e9c60357033c59b8ef4014 0 /Users/oberon/compact_repo/zig_compiler/src/main.zig
+39164 25446568 1770571344279737020 a3d6c232bd9413b2ca11d0c57675ee78 0 /Users/oberon/compact_repo/zig_compiler/src/lexer.zig
 23412 25446555 1770550652703796749 2e494fff4b85112f7aedf3363fabe792 0 /Users/oberon/compact_repo/zig_compiler/src/token.zig
-150941 25484756 1770567620497934113 b873e6ed5ccf9626fdb4b665e63b4b35 0 /Users/oberon/compact_repo/zig_compiler/src/parser.zig
+186433 25484756 1770589262217045530 9a529b82ef09e74250ac115d9074e401 0 /Users/oberon/compact_repo/zig_compiler/src/parser.zig
 37019 25446793 1770553748471736199 29beecdc5352e9665b6be4b2dd36fb19 0 /Users/oberon/compact_repo/zig_compiler/src/ast.zig
-85002 25446897 1770565620190415835 a66e582aea290967f95ab442b2ab417d 0 /Users/oberon/compact_repo/zig_compiler/src/semantic.zig
+108758 25446897 1770591733605233024 acc0b38f0c6c5e9bf2035de3f62b3935 0 /Users/oberon/compact_repo/zig_compiler/src/semantic.zig
 91379 25481899 1770561803687632824 d8c17c4e9b07810f5955590473aa8585 0 /Users/oberon/compact_repo/zig_compiler/src/cfg.zig
-169469 25484996 1770565322642768919 9e2c793bc15a28fc2560b60a8552bbf9 0 /Users/oberon/compact_repo/zig_compiler/src/codegen.zig
+340945 25484996 1770624545865542618 4f867cdef42cfec807f87469dfd7a8e9 0 /Users/oberon/compact_repo/zig_compiler/src/codegen.zig
 9435 25498094 1770559423691002767 6e10fba82461ab4e904824d0f5b58a77 0 /Users/oberon/compact_repo/zig_compiler/src/qbe.zig
+19860 25572134 1770322580091579084 aeeef8a510416322f1f91a8b97f93fdd 0 /Users/oberon/compact_repo/zig_compiler/src/hashmap.qbe

@@ -177,11 +177,35 @@ pub const Parser = struct {
             // here — let the outer parser handle it.
             if (self.check(.kw_end) and stmts.items.len > 0) break;
 
+            // Tokens that belong to an enclosing multi-line construct
+            // (ELSE, ELSEIF for IF blocks; WEND for WHILE; LOOP for DO;
+            // UNTIL for REPEAT; NEXT for FOR).  After parsing a nested
+            // multi-line construct, parseProgramLine may land on one of
+            // these.  They must not be consumed here — leave them for the
+            // enclosing construct's parser.
+            if (stmts.items.len > 0) {
+                const tag = self.current().tag;
+                if (tag == .kw_else or tag == .kw_elseif or
+                    tag == .kw_wend or tag == .kw_loop or
+                    tag == .kw_until or tag == .kw_next)
+                {
+                    break;
+                }
+            }
+
             // Compound END tokens (produced by the lexer for "END SUB",
             // "END FUNCTION", "END IF", etc.) also signal a scope boundary.
             // Don't try to parse them as statements — leave them for the
             // enclosing construct's parser to consume.
-            if (self.isScopeClosingToken()) break;
+            if (self.isScopeClosingToken()) {
+                if (stmts.items.len == 0) {
+                    // Orphaned scope-closing token at top level (e.g. ENDIF
+                    // without a matching IF).  Skip past it so the outer
+                    // parse loop doesn't spin forever on the same token.
+                    _ = self.advance();
+                }
+                break;
+            }
             const stmt = self.parseStatement() catch |err| {
                 // Error recovery: skip to end of line.
                 switch (err) {
@@ -284,7 +308,24 @@ pub const Parser = struct {
             // ME.field = value  (assignment to class member via ME reference)
             .kw_me => self.parseMeStatement(),
 
+            // SUPER.Method() call inside a class method
+            .kw_super => self.parseSuperStatement(),
+
+            // Keywords that can also be used as variable names or method
+            // call targets when they appear at the start of a statement
+            // (e.g. `left = 7`, `empty$ = ""`, `data.field = x`).
+            .kw_mid, .kw_left, .kw_right => self.parseKeywordAsIdentifierStatement(),
+
             else => {
+                // ── General keyword-as-identifier fallback at statement start ──
+                // When allow_implicit_let is true and a keyword appears that is
+                // not otherwise handled, treat it as an identifier-started
+                // statement (variable assignment, method call, etc.).
+                // Examples: `Append = ME.Value + suffix`, `local.Method()`,
+                //           `color$ = "red"`, `circle.Draw()`.
+                if (tok.isKeyword() and self.allow_implicit_let) {
+                    return self.parseKeywordAsIdentifierStatement();
+                }
                 try self.addError("Unexpected token at start of statement");
                 return error.ParseError;
             },
@@ -509,18 +550,37 @@ pub const Parser = struct {
             } });
         }
 
-        // Parse then-clause statements.
-        const stmt = try self.parseStatement();
-        try then_stmts.append(self.allocator, stmt);
+        // Parse then-clause statements (colon-separated, until ELSE/ELSEIF/EOL).
+        while (!self.isAtEnd() and !self.check(.end_of_line) and !self.check(.end_of_file) and
+            !self.check(.kw_else) and !self.check(.kw_elseif))
+        {
+            const stmt = try self.parseStatement();
+            try then_stmts.append(self.allocator, stmt);
 
-        // Optional ELSE clause.
+            // If there's a colon, continue parsing more THEN statements.
+            if (self.check(.colon)) {
+                _ = self.advance();
+            } else {
+                break;
+            }
+        }
+
+        // Optional ELSE clause (also supports multiple colon-separated statements).
         var else_stmts: std.ArrayList(ast.StmtPtr) = .empty;
         defer else_stmts.deinit(self.allocator);
 
         if (self.check(.kw_else)) {
             _ = self.advance();
-            const else_stmt = try self.parseStatement();
-            try else_stmts.append(self.allocator, else_stmt);
+            while (!self.isAtEnd() and !self.check(.end_of_line) and !self.check(.end_of_file)) {
+                const else_stmt = try self.parseStatement();
+                try else_stmts.append(self.allocator, else_stmt);
+
+                if (self.check(.colon)) {
+                    _ = self.advance();
+                } else {
+                    break;
+                }
+            }
         }
 
         return self.builder.stmt(loc, .{ .if_stmt = .{
@@ -655,6 +715,28 @@ pub const Parser = struct {
             return self.tokens[self.pos + 1].tag;
         }
         return self.current().tag;
+    }
+
+    /// Check whether the current position (possibly preceded by a line
+    /// number) is an "END TRY" sequence.  Returns true only when the
+    /// effective END keyword is followed by TRY.  A bare END (program
+    /// termination) returns false.
+    fn isEndTry(self: *Parser) bool {
+        // Find the position of the END token, skipping an optional leading
+        // line number.
+        const end_pos = if (self.check(.number) and self.pos + 1 < self.tokens.len and
+            self.tokens[self.pos + 1].tag == .kw_end)
+            self.pos + 1
+        else if (self.check(.kw_end))
+            self.pos
+        else
+            return false;
+
+        // Check if the token after END is TRY.
+        if (end_pos + 1 < self.tokens.len and self.tokens[end_pos + 1].tag == .kw_try) {
+            return true;
+        }
+        return false;
     }
 
     /// If the current token is a line number and the token after it
@@ -1027,14 +1109,35 @@ pub const Parser = struct {
 
         while (!self.isAtEnd()) {
             self.skipBlankLines();
-            if (self.check(.kw_endcase)) {
+
+            // In line-numbered BASIC, peek past optional line number
+            // to find the actual keyword (CASE, END SELECT, etc.).
+            const effective_tag = self.peekPastLineNumber();
+
+            if (effective_tag == .kw_endcase) {
+                self.skipLineNumberBefore(.kw_endcase);
                 _ = self.advance();
                 break;
             }
-            if (self.check(.kw_end)) break;
+            // END SELECT: the lexer may not always collapse it to
+            // kw_endcase — handle bare END followed by SELECT too.
+            if (effective_tag == .kw_end) {
+                self.skipLineNumberBefore(.kw_end);
+                // Check if it's END SELECT (two tokens).
+                if (self.pos + 1 < self.tokens.len and
+                    (self.tokens[self.pos + 1].tag == .kw_select or self.tokens[self.pos + 1].tag == .kw_case))
+                {
+                    _ = self.advance(); // consume END
+                    _ = self.advance(); // consume SELECT/CASE
+                    break;
+                }
+                break;
+            }
 
-            if (self.check(.kw_case) or self.check(.kw_when)) {
-                _ = self.advance();
+            if (effective_tag == .kw_case or effective_tag == .kw_when) {
+                self.skipLineNumberBefore(.kw_case);
+                self.skipLineNumberBefore(.kw_when);
+                _ = self.advance(); // consume CASE / WHEN
 
                 // Check for CASE ELSE / OTHERWISE.
                 if (self.check(.kw_else) or self.check(.kw_otherwise)) {
@@ -1043,7 +1146,8 @@ pub const Parser = struct {
 
                     while (!self.isAtEnd()) {
                         self.skipBlankLines();
-                        if (self.check(.kw_case) or self.check(.kw_when) or self.check(.kw_endcase) or self.check(.kw_end)) break;
+                        const inner_tag = self.peekPastLineNumber();
+                        if (inner_tag == .kw_case or inner_tag == .kw_when or inner_tag == .kw_endcase or inner_tag == .kw_end) break;
                         const line = try self.parseProgramLine();
                         for (line.statements) |s| {
                             try otherwise_stmts.append(self.allocator, s);
@@ -1112,7 +1216,8 @@ pub const Parser = struct {
 
                 while (!self.isAtEnd()) {
                     self.skipBlankLines();
-                    if (self.check(.kw_case) or self.check(.kw_when) or self.check(.kw_otherwise) or self.check(.kw_endcase) or self.check(.kw_end)) break;
+                    const body_tag = self.peekPastLineNumber();
+                    if (body_tag == .kw_case or body_tag == .kw_when or body_tag == .kw_otherwise or body_tag == .kw_endcase or body_tag == .kw_end) break;
                     const line = try self.parseProgramLine();
                     for (line.statements) |s| {
                         try case_body.append(self.allocator, s);
@@ -1149,7 +1254,10 @@ pub const Parser = struct {
         defer arrays.deinit(self.allocator);
 
         while (true) {
-            if (!self.check(.identifier)) {
+            // Accept identifiers AND keywords as variable names, because
+            // BASIC variable names like "local", "item", "error" etc. may
+            // collide with keyword tags in the lexer.
+            if (!self.check(.identifier) and !self.current().isKeyword()) {
                 try self.addError("Expected variable name after DIM");
                 return error.ParseError;
             }
@@ -1190,7 +1298,31 @@ pub const Parser = struct {
                 if (self.isTypeKeyword()) {
                     as_type_keyword = self.current().tag;
                     _ = self.advance();
-                } else if (self.check(.identifier)) {
+                    // Handle LIST OF <type> / HASHMAP OF <type>
+                    if ((as_type_keyword == .kw_list or as_type_keyword == .kw_hashmap) and self.check(.kw_of)) {
+                        _ = self.advance(); // consume OF
+                        // Consume the element type (keyword or identifier).
+                        // For full generality we accept LIST OF ANY etc.
+                        if (self.isTypeKeyword()) {
+                            // e.g. LIST OF INTEGER — store the container type
+                            // as the main type; element type info is in as_type_name.
+                            as_type_name = self.current().lexeme;
+                            _ = self.advance();
+                        } else if (self.check(.identifier) or self.current().isKeyword()) {
+                            // Accept identifiers and keywords as element types
+                            // (e.g. LIST OF ANY, LIST OF Item)
+                            as_type_name = self.current().lexeme;
+                            _ = self.advance();
+                        } else if (self.check(.kw_of)) {
+                            // nested OF — skip for now
+                            _ = self.advance();
+                        }
+                        // Accept optional key type for HASHMAP: HASHMAP OF STRING TO INTEGER
+                        // (simplified: just skip TO <type> if present)
+                    }
+                } else if (self.check(.identifier) or self.current().isKeyword()) {
+                    // Accept identifiers AND keywords as type names
+                    // (e.g. DIM circ AS Circle — "Circle" is .kw_circle).
                     as_type_name = self.current().lexeme;
                     _ = self.advance();
                 } else {
@@ -1587,7 +1719,10 @@ pub const Parser = struct {
             }
 
             // Parse field: name AS Type
-            if (self.check(.identifier)) {
+            // Accept identifiers and keywords as field names, because
+            // BASIC field names like "Data", "Size", "Error" etc. may
+            // collide with keyword tags in the lexer.
+            if (self.check(.identifier) or self.current().isKeyword()) {
                 const field_name = self.current().lexeme;
                 _ = self.advance();
                 self.skipTypeSuffix();
@@ -1918,9 +2053,15 @@ pub const Parser = struct {
 
     fn parseCallStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
-        _ = self.advance(); // consume CALL
 
-        if (!self.check(.identifier)) {
+        // Only consume CALL keyword if present — this function is also
+        // invoked from parseIdentifierStatement where the current token
+        // is the sub name itself (implicit call without CALL keyword).
+        if (self.check(.kw_call)) {
+            _ = self.advance(); // consume CALL
+        }
+
+        if (!self.check(.identifier) and !self.current().isKeyword()) {
             try self.addError("Expected sub name after CALL");
             return error.ParseError;
         }
@@ -2083,7 +2224,8 @@ pub const Parser = struct {
             }
 
             // Field declaration: FieldName AS Type
-            if (self.check(.identifier)) {
+            // Accept keywords as field names (e.g. Error, Data, Value).
+            if (self.check(.identifier) or self.current().isKeyword()) {
                 const field_name = self.current().lexeme;
                 _ = self.advance();
                 self.skipTypeSuffix();
@@ -2134,7 +2276,7 @@ pub const Parser = struct {
     fn parseMethodDeclaration(self: *Parser) ExprError!*ast.MethodStmt {
         _ = self.advance(); // consume METHOD
 
-        if (!self.check(.identifier)) {
+        if (!self.check(.identifier) and !self.current().isKeyword()) {
             try self.addError("Expected method name after METHOD");
             return error.ParseError;
         }
@@ -2154,7 +2296,7 @@ pub const Parser = struct {
                 return_type_suffix = self.current().tag;
                 return_type_as_name = self.current().lexeme;
                 _ = self.advance();
-            } else if (self.check(.identifier)) {
+            } else if (self.check(.identifier) or self.current().isKeyword()) {
                 return_type_as_name = self.current().lexeme;
                 _ = self.advance();
             }
@@ -2420,7 +2562,12 @@ pub const Parser = struct {
 
         while (!self.isAtEnd()) {
             self.skipBlankLines();
-            if (self.check(.kw_catch) or self.check(.kw_finally) or self.check(.kw_end)) break;
+            const try_tag = self.peekPastLineNumber();
+            if (try_tag == .kw_catch or try_tag == .kw_finally) break;
+            // Only break on END if it is followed by TRY (i.e. "END TRY").
+            // A bare END is a valid statement (program termination) inside
+            // TRY/CATCH blocks.
+            if (try_tag == .kw_end and self.isEndTry()) break;
             const line = try self.parseProgramLine();
             for (line.statements) |s| try try_block.append(self.allocator, s);
         }
@@ -2428,8 +2575,24 @@ pub const Parser = struct {
         var catch_clauses: std.ArrayList(ast.TryCatchStmt.CatchClause) = .empty;
         defer catch_clauses.deinit(self.allocator);
 
-        while (self.check(.kw_catch)) {
-            _ = self.advance();
+        while (self.peekPastLineNumber() == .kw_catch) {
+            self.skipLineNumberBefore(.kw_catch);
+            _ = self.advance(); // consume CATCH
+
+            // Parse optional error code(s) after CATCH (e.g. CATCH 100).
+            var error_codes: std.ArrayList(i32) = .empty;
+            defer error_codes.deinit(self.allocator);
+            while (self.check(.number)) {
+                const code: i32 = @intFromFloat(self.current().number_value);
+                try error_codes.append(self.allocator, code);
+                _ = self.advance();
+                if (self.check(.comma)) {
+                    _ = self.advance();
+                } else {
+                    break;
+                }
+            }
+
             if (self.check(.end_of_line)) _ = self.advance();
 
             var block: std.ArrayList(ast.StmtPtr) = .empty;
@@ -2437,7 +2600,9 @@ pub const Parser = struct {
 
             while (!self.isAtEnd()) {
                 self.skipBlankLines();
-                if (self.check(.kw_catch) or self.check(.kw_finally) or self.check(.kw_end)) break;
+                const catch_inner_tag = self.peekPastLineNumber();
+                if (catch_inner_tag == .kw_catch or catch_inner_tag == .kw_finally) break;
+                if (catch_inner_tag == .kw_end and self.isEndTry()) break;
                 const line = try self.parseProgramLine();
                 for (line.statements) |s| try block.append(self.allocator, s);
             }
@@ -2451,20 +2616,22 @@ pub const Parser = struct {
         defer finally_block.deinit(self.allocator);
         var has_finally = false;
 
-        if (self.check(.kw_finally)) {
+        if (self.peekPastLineNumber() == .kw_finally) {
             has_finally = true;
+            self.skipLineNumberBefore(.kw_finally);
             _ = self.advance();
             if (self.check(.end_of_line)) _ = self.advance();
 
             while (!self.isAtEnd()) {
                 self.skipBlankLines();
-                if (self.check(.kw_end)) break;
+                if (self.peekPastLineNumber() == .kw_end and self.isEndTry()) break;
                 const line = try self.parseProgramLine();
                 for (line.statements) |s| try finally_block.append(self.allocator, s);
             }
         }
 
         // Consume END TRY.
+        self.skipLineNumberBefore(.kw_end);
         if (self.check(.kw_end)) {
             _ = self.advance();
             if (self.check(.kw_try)) _ = self.advance();
@@ -2630,12 +2797,148 @@ pub const Parser = struct {
     fn parseMatchTypeStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume MATCH
-        // Simplified stub.
-        self.skipToEndOfLine();
-        const dummy_expr = try self.builder.numberExpr(loc, 0);
+
+        // Consume optional TYPE keyword after MATCH.
+        if (self.check(.kw_type)) {
+            _ = self.advance();
+        }
+
+        // Parse the expression being matched.
+        const match_expr = try self.parseExpression();
+        if (self.check(.end_of_line)) _ = self.advance();
+
+        var case_arms: std.ArrayList(ast.MatchTypeStmt.CaseArm) = .empty;
+        defer case_arms.deinit(self.allocator);
+
+        var case_else_body: []ast.StmtPtr = @constCast(&.{});
+
+        while (!self.isAtEnd()) {
+            self.skipBlankLines();
+
+            // Check for END MATCH / ENDMATCH
+            if (self.check(.kw_endmatch)) {
+                _ = self.advance();
+                break;
+            }
+            if (self.check(.kw_end)) {
+                // Peek: END MATCH
+                if (self.pos + 1 < self.tokens.len) {
+                    const next = self.tokens[self.pos + 1];
+                    if (next.tag == .kw_match) {
+                        _ = self.advance(); // consume END
+                        _ = self.advance(); // consume MATCH
+                        break;
+                    }
+                }
+                // Bare END — might be end of program
+                break;
+            }
+
+            // Parse CASE arm
+            if (self.check(.kw_case)) {
+                _ = self.advance(); // consume CASE
+
+                // CASE ELSE
+                if (self.check(.kw_else)) {
+                    _ = self.advance();
+                    if (self.check(.end_of_line)) _ = self.advance();
+
+                    var else_stmts: std.ArrayList(ast.StmtPtr) = .empty;
+                    defer else_stmts.deinit(self.allocator);
+
+                    while (!self.isAtEnd()) {
+                        self.skipBlankLines();
+                        if (self.check(.kw_case) or self.check(.kw_endmatch) or self.check(.kw_end)) break;
+                        try else_stmts.append(self.allocator, try self.parseStatement());
+                        if (self.check(.end_of_line)) _ = self.advance();
+                    }
+                    case_else_body = try self.allocator.dupe(ast.StmtPtr, else_stmts.items);
+                    continue;
+                }
+
+                // CASE <type> [binding_var]
+                var type_keyword: []const u8 = "";
+                var atom_type_tag: i32 = 0;
+                var binding_variable: []const u8 = "";
+                var binding_suffix: ?Tag = null;
+                var is_class_match = false;
+                var match_class_name: []const u8 = "";
+                var is_udt_match = false;
+                var udt_type_name: []const u8 = "";
+
+                if (self.isTypeKeyword()) {
+                    type_keyword = self.current().lexeme;
+                    atom_type_tag = @intFromEnum(self.current().tag);
+                    _ = self.advance();
+                } else if (self.check(.identifier)) {
+                    // Could be a class name or UDT name
+                    const type_name = self.current().lexeme;
+                    _ = self.advance();
+
+                    // Determine if it's a class or UDT match
+                    is_class_match = true;
+                    match_class_name = type_name;
+                    is_udt_match = false;
+                    udt_type_name = type_name;
+                } else {
+                    try self.addError("Expected type name after CASE in MATCH TYPE");
+                    return error.ParseError;
+                }
+
+                // Optional binding variable name
+                if (self.check(.identifier)) {
+                    binding_variable = self.current().lexeme;
+                    _ = self.advance();
+                    if (self.isTypeSuffix()) {
+                        binding_suffix = self.current().tag;
+                        _ = self.advance();
+                    }
+                } else if (self.current().isKeyword() and !self.check(.end_of_line) and !self.check(.kw_case) and !self.check(.kw_end)) {
+                    // Accept keywords as binding variable names
+                    binding_variable = self.current().lexeme;
+                    _ = self.advance();
+                    if (self.isTypeSuffix()) {
+                        binding_suffix = self.current().tag;
+                        _ = self.advance();
+                    }
+                }
+
+                if (self.check(.end_of_line)) _ = self.advance();
+
+                // Parse body statements for this CASE arm.
+                var body: std.ArrayList(ast.StmtPtr) = .empty;
+                defer body.deinit(self.allocator);
+
+                while (!self.isAtEnd()) {
+                    self.skipBlankLines();
+                    if (self.check(.kw_case) or self.check(.kw_endmatch) or self.check(.kw_end)) break;
+                    try body.append(self.allocator, try self.parseStatement());
+                    if (self.check(.end_of_line)) _ = self.advance();
+                }
+
+                try case_arms.append(self.allocator, .{
+                    .type_keyword = type_keyword,
+                    .atom_type_tag = atom_type_tag,
+                    .binding_variable = binding_variable,
+                    .binding_suffix = binding_suffix,
+                    .body = try self.allocator.dupe(ast.StmtPtr, body.items),
+                    .is_class_match = is_class_match,
+                    .match_class_name = match_class_name,
+                    .is_udt_match = is_udt_match,
+                    .udt_type_name = udt_type_name,
+                });
+            } else {
+                // Skip unexpected content
+                _ = self.advance();
+            }
+        }
+
+        if (self.check(.end_of_line)) _ = self.advance();
+
         return self.builder.stmt(loc, .{ .match_type = .{
-            .match_expression = dummy_expr,
-            .case_arms = &.{},
+            .match_expression = match_expr,
+            .case_arms = try self.allocator.dupe(ast.MatchTypeStmt.CaseArm, case_arms.items),
+            .case_else_body = case_else_body,
         } });
     }
 
@@ -2678,6 +2981,124 @@ pub const Parser = struct {
 
         return self.builder.stmt(loc, .{ .let = .{
             .variable = "ME",
+            .member_chain = try self.allocator.dupe([]const u8, member_chain.items),
+            .value = value,
+        } });
+    }
+
+    /// Handle SUPER.Method() calls at statement start.
+    fn parseSuperStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+
+        // SUPER should always be followed by .Method() in statement context.
+        // Parse the full expression (parsePrimary emits a variable "SUPER",
+        // parsePostfix handles the .Method(args) chain).
+        const expr = try self.parseExpression();
+        return self.builder.stmt(loc, .{ .call = .{
+            .sub_name = "SUPER",
+            .arguments = &.{},
+            .method_call_expr = expr,
+        } });
+    }
+
+    /// Handle keywords that can appear as variable names or method-call
+    /// targets at the start of a statement (e.g. `left = 7`, `left$ = "x"`).
+    /// The keyword token is re-interpreted as an identifier and delegated
+    /// to the same logic as parseIdentifierStatement / parseAssignment.
+    fn parseKeywordAsIdentifierStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+
+        if (!self.allow_implicit_let) {
+            try self.addError("Unexpected token at start of statement");
+            return error.ParseError;
+        }
+
+        // Detect method-call pattern: keyword[suffix].name(
+        // We peek ahead past the keyword and optional suffix to check for dot.
+        var peek_offset: usize = 1;
+        if (self.pos + peek_offset < self.tokens.len and
+            self.tokens[self.pos + peek_offset].isTypeSuffix())
+        {
+            peek_offset += 1;
+        }
+        const has_dot = (self.pos + peek_offset < self.tokens.len and
+            self.tokens[self.pos + peek_offset].tag == .dot);
+
+        if (has_dot) {
+            // Could be method call (keyword.method(args)) or member assignment.
+            // Check further: dot + name + lparen → method call statement.
+            const has_method_call = (self.pos + peek_offset + 2 < self.tokens.len and
+                (self.tokens[self.pos + peek_offset + 1].tag == .identifier or
+                    self.tokens[self.pos + peek_offset + 1].isKeyword()) and
+                self.tokens[self.pos + peek_offset + 2].tag == .lparen);
+
+            if (has_method_call) {
+                const name = self.current().lexeme;
+                const expr = try self.parseExpression();
+                return self.builder.stmt(loc, .{ .call = .{
+                    .sub_name = name,
+                    .arguments = &.{},
+                    .method_call_expr = expr,
+                } });
+            }
+        }
+
+        // Otherwise treat as implicit LET assignment.
+        return self.parseKeywordAssignment(loc);
+    }
+
+    /// Parse an assignment where the variable name is a keyword token
+    /// (e.g. `left$ = "hello"`, `mid = 5`).  Mirrors parseAssignment
+    /// but reads the variable name from a keyword token.
+    fn parseKeywordAssignment(self: *Parser, loc: SourceLocation) ExprError!ast.StmtPtr {
+        const name = self.current().lexeme;
+        _ = self.advance(); // consume keyword token
+
+        var type_suffix: ?Tag = null;
+        if (self.isTypeSuffix()) {
+            type_suffix = self.current().tag;
+            _ = self.advance();
+        }
+
+        // Parse optional array indices.
+        var indices: std.ArrayList(ast.ExprPtr) = .empty;
+        defer indices.deinit(self.allocator);
+
+        if (self.check(.lparen)) {
+            _ = self.advance();
+            if (!self.check(.rparen)) {
+                try indices.append(self.allocator, try self.parseExpression());
+                while (self.check(.comma)) {
+                    _ = self.advance();
+                    try indices.append(self.allocator, try self.parseExpression());
+                }
+            }
+            _ = try self.consume(.rparen, "Expected ')' after indices");
+        }
+
+        // Parse optional member chain: .field1.field2 ...
+        var member_chain: std.ArrayList([]const u8) = .empty;
+        defer member_chain.deinit(self.allocator);
+
+        while (self.check(.dot)) {
+            _ = self.advance();
+            if (self.check(.identifier) or self.current().isKeyword()) {
+                try member_chain.append(self.allocator, self.current().lexeme);
+                _ = self.advance();
+                self.skipTypeSuffix();
+            } else {
+                try self.addError("Expected member name after '.'");
+                return error.ParseError;
+            }
+        }
+
+        _ = try self.consume(.equal, "Expected '=' in assignment");
+        const value = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{ .let = .{
+            .variable = name,
+            .type_suffix = type_suffix,
+            .indices = try self.allocator.dupe(ast.ExprPtr, indices.items),
             .member_chain = try self.allocator.dupe([]const u8, member_chain.items),
             .value = value,
         } });
@@ -2731,6 +3152,55 @@ pub const Parser = struct {
     /// Parse an assignment: variable = expression (with optional member chain
     /// and array indices).
     fn parseAssignment(self: *Parser, loc: SourceLocation) ExprError!ast.StmtPtr {
+        // Slice assignment detection: name$(expr TO expr) = value
+        // Check ahead for the pattern: identifier [suffix] ( expr TO expr )
+        if (self.check(.identifier)) {
+            // Peek for TO inside parens to detect slice pattern
+            var peek_pos = self.pos + 1;
+            // Skip optional suffix
+            if (peek_pos < self.tokens.len and self.tokens[peek_pos].isTypeSuffix()) {
+                peek_pos += 1;
+            }
+            // Check for lparen
+            if (peek_pos < self.tokens.len and self.tokens[peek_pos].tag == .lparen) {
+                // Scan forward to find TO at depth 1 before rparen
+                var scan = peek_pos + 1;
+                var depth: u32 = 1;
+                var found_to = false;
+                while (scan < self.tokens.len and depth > 0) {
+                    if (self.tokens[scan].tag == .lparen) depth += 1;
+                    if (self.tokens[scan].tag == .rparen) {
+                        depth -= 1;
+                        if (depth == 0) break;
+                    }
+                    if (self.tokens[scan].tag == .kw_to and depth == 1) {
+                        found_to = true;
+                        break;
+                    }
+                    scan += 1;
+                }
+                if (found_to) {
+                    const saved_name = self.current().lexeme;
+                    _ = self.advance(); // consume identifier
+                    // Skip optional suffix
+                    if (self.isTypeSuffix()) _ = self.advance();
+                    _ = self.advance(); // consume '('
+                    const start_expr = try self.parseExpression();
+                    _ = try self.consume(.kw_to, "Expected TO in slice");
+                    const end_expr = try self.parseExpression();
+                    _ = try self.consume(.rparen, "Expected ')' after slice range");
+                    _ = try self.consume(.equal, "Expected '=' in slice assignment");
+                    const replacement = try self.parseExpression();
+                    return self.builder.stmt(loc, .{ .slice_assign = .{
+                        .variable = saved_name,
+                        .start = start_expr,
+                        .end_expr = end_expr,
+                        .replacement = replacement,
+                    } });
+                }
+            }
+        }
+
         if (!self.check(.identifier)) {
             try self.addError("Expected variable name in assignment");
             return error.ParseError;
@@ -2868,12 +3338,40 @@ pub const Parser = struct {
 
     fn parseComparison(self: *Parser) ExprError!ast.ExprPtr {
         var expr = try self.parseAdditive();
-        while (self.current().isComparison()) {
+        while (self.current().isComparison() or self.check(.kw_is)) {
             const loc = self.currentLocation();
-            const op = self.current().tag;
-            _ = self.advance();
-            const right = try self.parseAdditive();
-            expr = try self.builder.binaryExpr(loc, expr, op, right);
+            if (self.check(.kw_is)) {
+                _ = self.advance(); // consume IS
+
+                // IS NOTHING — null check
+                if (self.check(.kw_nothing)) {
+                    _ = self.advance();
+                    expr = try self.builder.expr(loc, .{ .is_type = .{
+                        .object = expr,
+                        .class_name = "",
+                        .is_nothing_check = true,
+                    } });
+                } else {
+                    // IS ClassName — type check
+                    // Accept identifier or keyword as class/type name.
+                    if (!self.check(.identifier) and !self.current().isKeyword()) {
+                        try self.addError("Expected type name or NOTHING after IS");
+                        return error.ParseError;
+                    }
+                    const class_name = self.current().lexeme;
+                    _ = self.advance();
+                    expr = try self.builder.expr(loc, .{ .is_type = .{
+                        .object = expr,
+                        .class_name = class_name,
+                        .is_nothing_check = false,
+                    } });
+                }
+            } else {
+                const op = self.current().tag;
+                _ = self.advance();
+                const right = try self.parseAdditive();
+                expr = try self.builder.binaryExpr(loc, expr, op, right);
+            }
         }
         return expr;
     }
@@ -3005,8 +3503,66 @@ pub const Parser = struct {
                     _ = self.advance();
                 }
 
-                // Function call: name(args...)
+                // Function call, array access, or string slice: name(args...)
                 if (self.check(.lparen)) {
+                    // ── String slice detection ──────────────────────────
+                    // Check for the pattern name$(start TO end) which is a
+                    // string slice expression.  Peek ahead for TO at depth 1.
+                    {
+                        var scan_pos = self.pos + 1; // past '('
+                        var scan_depth: u32 = 1;
+                        var found_to = false;
+                        while (scan_pos < self.tokens.len and scan_depth > 0) {
+                            if (self.tokens[scan_pos].tag == .lparen) scan_depth += 1;
+                            if (self.tokens[scan_pos].tag == .rparen) {
+                                scan_depth -= 1;
+                                if (scan_depth == 0) break;
+                            }
+                            if (self.tokens[scan_pos].tag == .kw_to and scan_depth == 1) {
+                                found_to = true;
+                                break;
+                            }
+                            scan_pos += 1;
+                        }
+                        if (found_to) {
+                            // Parse as string slice: name$(start TO end)
+                            // Also handles: name$(TO end)  — start defaults to 1
+                            //               name$(start TO) — end defaults to LEN
+                            _ = self.advance(); // consume '('
+
+                            // Check for (TO end) form — no start expression
+                            var start_expr: ast.ExprPtr = undefined;
+                            if (self.check(.kw_to)) {
+                                // No start expression — default to 1
+                                start_expr = try self.builder.numberExpr(loc, 1.0);
+                            } else {
+                                start_expr = try self.parseExpression();
+                            }
+
+                            _ = try self.consume(.kw_to, "Expected TO in slice expression");
+
+                            // Check for (start TO) form — no end expression
+                            var end_expr: ast.ExprPtr = undefined;
+                            if (self.check(.rparen)) {
+                                // No end expression — default to -1 (meaning
+                                // LEN; the codegen/runtime interprets -1 as end).
+                                end_expr = try self.builder.numberExpr(loc, -1.0);
+                            } else {
+                                end_expr = try self.parseExpression();
+                            }
+
+                            _ = try self.consume(.rparen, "Expected ')' after slice range");
+                            // Emit as a function call to MID$ with the variable
+                            // as first argument and start/end as 2nd/3rd.
+                            // The codegen maps this to the runtime slice function.
+                            const var_expr = try self.builder.variableExpr(loc, name, type_suffix);
+                            return self.builder.expr(loc, .{ .function_call = .{
+                                .name = "MID",
+                                .arguments = try self.allocator.dupe(ast.ExprPtr, &.{ var_expr, start_expr, end_expr }),
+                            } });
+                        }
+                    }
+
                     // Determine if this is a function call or array access.
                     // If the name is a known function, treat as function call.
                     var is_function = self.isBuiltinFunction(name);
@@ -3071,7 +3627,7 @@ pub const Parser = struct {
             },
             .kw_new => {
                 _ = self.advance(); // consume NEW
-                if (!self.check(.identifier)) {
+                if (!self.check(.identifier) and !self.current().isKeyword()) {
                     try self.addError("Expected class name after NEW");
                     return error.ParseError;
                 }
@@ -3119,29 +3675,50 @@ pub const Parser = struct {
                 const operand = try self.parsePrimary();
                 return self.builder.expr(loc, .{ .unary = .{ .op = .minus, .operand = operand } });
             },
-            // Built-in functions that are also keywords: MID, LEFT, RIGHT, etc.
+            // Built-in functions that are also keywords: MID, LEFT, RIGHT.
+            // When followed by '(' they are function calls; otherwise they
+            // are treated as plain variables (e.g. `left = 7`).
             .kw_mid, .kw_left, .kw_right => {
                 const fname = tok.lexeme;
                 _ = self.advance();
-                _ = try self.consume(.lparen, "Expected '(' after built-in function");
-                var args: std.ArrayList(ast.ExprPtr) = .empty;
-                defer args.deinit(self.allocator);
 
-                if (!self.check(.rparen)) {
-                    try args.append(self.allocator, try self.parseExpression());
-                    while (self.check(.comma)) {
-                        _ = self.advance();
-                        try args.append(self.allocator, try self.parseExpression());
-                    }
+                // Consume optional type suffix (shouldn't normally appear
+                // after the bare keyword, but handle gracefully).
+                var type_suffix: ?Tag = null;
+                if (self.isTypeSuffix()) {
+                    type_suffix = self.current().tag;
+                    _ = self.advance();
                 }
-                _ = try self.consume(.rparen, "Expected ')' after built-in function arguments");
-                return self.builder.expr(loc, .{ .function_call = .{
-                    .name = fname,
-                    .arguments = try self.allocator.dupe(ast.ExprPtr, args.items),
-                } });
+
+                if (self.check(.lparen)) {
+                    _ = self.advance(); // consume '('
+                    var args: std.ArrayList(ast.ExprPtr) = .empty;
+                    defer args.deinit(self.allocator);
+
+                    if (!self.check(.rparen)) {
+                        try args.append(self.allocator, try self.parseExpression());
+                        while (self.check(.comma)) {
+                            _ = self.advance();
+                            try args.append(self.allocator, try self.parseExpression());
+                        }
+                    }
+                    _ = try self.consume(.rparen, "Expected ')' after built-in function arguments");
+                    return self.builder.expr(loc, .{ .function_call = .{
+                        .name = fname,
+                        .arguments = try self.allocator.dupe(ast.ExprPtr, args.items),
+                    } });
+                }
+
+                // No '(' follows — treat as a variable reference.
+                return self.builder.variableExpr(loc, fname, type_suffix);
             },
             .kw_err => {
                 _ = self.advance();
+                // Consume optional trailing () — ERR and ERR() are equivalent.
+                if (self.check(.lparen)) {
+                    _ = self.advance();
+                    if (self.check(.rparen)) _ = self.advance();
+                }
                 return self.builder.expr(loc, .{ .function_call = .{
                     .name = "ERR",
                     .arguments = &.{},
@@ -3149,10 +3726,44 @@ pub const Parser = struct {
             },
             .kw_erl => {
                 _ = self.advance();
+                // Consume optional trailing () — ERL and ERL() are equivalent.
+                if (self.check(.lparen)) {
+                    _ = self.advance();
+                    if (self.check(.rparen)) _ = self.advance();
+                }
                 return self.builder.expr(loc, .{ .function_call = .{
                     .name = "ERL",
                     .arguments = &.{},
                 } });
+            },
+            .kw_super => {
+                // SUPER in expression context — typically SUPER.Method().
+                // Emit as a variable so parsePostfix can handle the dot chain.
+                _ = self.advance();
+                return self.builder.variableExpr(loc, "SUPER", null);
+            },
+            .kw_list => {
+                // LIST(expr, expr, ...) — list constructor expression.
+                _ = self.advance(); // consume LIST
+                if (self.check(.lparen)) {
+                    _ = self.advance(); // consume '('
+                    var elements: std.ArrayList(ast.ExprPtr) = .empty;
+                    defer elements.deinit(self.allocator);
+
+                    if (!self.check(.rparen)) {
+                        try elements.append(self.allocator, try self.parseExpression());
+                        while (self.check(.comma)) {
+                            _ = self.advance();
+                            try elements.append(self.allocator, try self.parseExpression());
+                        }
+                    }
+                    _ = try self.consume(.rparen, "Expected ')' after LIST elements");
+                    return self.builder.expr(loc, .{ .list_constructor = .{
+                        .elements = try self.allocator.dupe(ast.ExprPtr, elements.items),
+                    } });
+                }
+                // Bare LIST without parens — treat as variable.
+                return self.builder.variableExpr(loc, "LIST", null);
             },
             .kw_fn => {
                 // FN user-defined function call: FN MyFunc(args)
@@ -3185,6 +3796,66 @@ pub const Parser = struct {
             },
 
             else => {
+                // ── General keyword-as-identifier fallback ──────────
+                // Many BASIC programs use variable names that collide
+                // with keywords (e.g. `local`, `append`, `error`, `item`,
+                // `color`, `circle`, `stop`, `timer`, etc.).  When a
+                // keyword appears in expression context and is not one of
+                // the specifically handled keywords above, treat it as
+                // an identifier so that `local.GetID()`, `Append = expr`,
+                // `circle.Area()`, etc. work.
+                if (tok.isKeyword()) {
+                    const kw_name = tok.lexeme;
+                    _ = self.advance();
+
+                    var type_suffix: ?Tag = null;
+                    if (self.isTypeSuffix()) {
+                        type_suffix = self.current().tag;
+                        _ = self.advance();
+                    }
+
+                    // Function/array call: keyword(args...)
+                    if (self.check(.lparen)) {
+                        var is_function = self.isBuiltinFunction(kw_name);
+                        if (!is_function) {
+                            var buf3: [128]u8 = undefined;
+                            const ulen3 = @min(kw_name.len, buf3.len);
+                            for (0..ulen3) |i| buf3[i] = std.ascii.toUpper(kw_name[i]);
+                            is_function = self.user_functions.contains(buf3[0..ulen3]) or
+                                self.user_functions.contains(kw_name);
+                        }
+
+                        _ = self.advance(); // consume '('
+                        var args: std.ArrayList(ast.ExprPtr) = .empty;
+                        defer args.deinit(self.allocator);
+
+                        if (!self.check(.rparen)) {
+                            try args.append(self.allocator, try self.parseExpression());
+                            while (self.check(.comma)) {
+                                _ = self.advance();
+                                try args.append(self.allocator, try self.parseExpression());
+                            }
+                        }
+                        _ = try self.consume(.rparen, "Expected ')' after arguments");
+
+                        if (is_function) {
+                            return self.builder.expr(loc, .{ .function_call = .{
+                                .name = kw_name,
+                                .arguments = try self.allocator.dupe(ast.ExprPtr, args.items),
+                            } });
+                        } else {
+                            return self.builder.expr(loc, .{ .array_access = .{
+                                .name = kw_name,
+                                .type_suffix = type_suffix,
+                                .indices = try self.allocator.dupe(ast.ExprPtr, args.items),
+                            } });
+                        }
+                    }
+
+                    // Plain variable reference (e.g. `local`, `local.GetID()`)
+                    return self.builder.variableExpr(loc, kw_name, type_suffix);
+                }
+
                 try self.addError("Unexpected token in expression");
                 return error.ParseError;
             },
@@ -3424,8 +4095,14 @@ pub const Parser = struct {
     /// identifier, possibly followed by `(`).  Used to distinguish
     /// `d.CLEAR()` (method call statement) from `d = expr` (assignment).
     fn isMethodCallStatement(self: *Parser) bool {
-        // Walk ahead from current position, looking for the pattern:
-        //   (identifier|ME) [suffix] [( ... )] . (identifier|keyword) (
+        // Walk ahead from current position, scanning through ALL chained
+        // dot-members (e.g. obj.inner.field or obj.inner.method()) to
+        // reach the FINAL token after the last dotted name.  Only then
+        // decide: if '(' follows → method call; if '=' follows → assignment.
+        //
+        // This prevents multi-dot member assignments like O.I.V = 99 from
+        // being misclassified as method calls (the old code only looked one
+        // dot deep and treated the second dot as "end of statement").
         var p = self.pos;
         if (p >= self.tokens.len) return false;
 
@@ -3447,26 +4124,71 @@ pub const Parser = struct {
             }
         }
 
-        // Now expect '.'
-        if (p >= self.tokens.len or self.tokens[p].tag != .dot) return false;
-        p += 1;
+        // Now walk through ALL chained dot-members:
+        //   .name [suffix] [(...)] .name [suffix] [(...)] ...
+        // After this loop, p points to the token AFTER the final member name.
+        while (true) {
+            // Expect '.'
+            if (p >= self.tokens.len or self.tokens[p].tag != .dot) return false;
+            p += 1;
 
-        // After '.', expect identifier or keyword (method name).
-        if (p >= self.tokens.len) return false;
-        if (self.tokens[p].tag != .identifier and !self.tokens[p].isKeyword()) return false;
-        p += 1;
+            // After '.', expect identifier or keyword (member/method name).
+            if (p >= self.tokens.len) return false;
+            if (self.tokens[p].tag != .identifier and !self.tokens[p].isKeyword()) return false;
+            p += 1;
 
-        // After the method name, expect '(' (it's a method call, not a field
-        // assignment like obj.field = value).
+            // Skip optional type suffix after member name.
+            if (p < self.tokens.len and self.tokens[p].isTypeSuffix()) p += 1;
+
+            // Skip optional parenthesized arguments (e.g., .method(args)).
+            if (p < self.tokens.len and self.tokens[p].tag == .lparen) {
+                var depth: u32 = 1;
+                p += 1;
+                while (p < self.tokens.len and depth > 0) {
+                    if (self.tokens[p].tag == .lparen) depth += 1;
+                    if (self.tokens[p].tag == .rparen) depth -= 1;
+                    p += 1;
+                }
+            }
+
+            // If the next token is another '.', continue scanning the chain.
+            // Otherwise break out and inspect what follows the final member.
+            if (p < self.tokens.len and self.tokens[p].tag == .dot) {
+                continue;
+            }
+            break;
+        }
+
+        // p is now past the final member name (and any suffix / parens).
+        // If '(' follows → it's a method call (the final member has args).
+        // Note: we already consumed parens above when they were present, so
+        // if we reach here the final member did NOT have parens.  Check if
+        // the token at the saved position (before any paren skip) was '('.
+        // Actually, if the final member already had parens we consumed them,
+        // so by definition it was a method call.  But the loop consumed them
+        // and advanced p past them — let's check what's at p now.
+
+        // If '(' is here, it means there's a call at the end we didn't
+        // consume (shouldn't happen given the loop above, but be safe).
         if (p < self.tokens.len and self.tokens[p].tag == .lparen) return true;
 
-        // Also accept no-arg method call without parens if at end of statement.
-        // But for safety, only if no '=' follows (which would be assignment).
+        // If '=' follows → this is an assignment (e.g. O.I.V = 99), NOT a
+        // method call.
         if (p < self.tokens.len and self.tokens[p].tag == .equal) return false;
 
-        // Dot-member without parens and without '=' — could be a void method
-        // call or a member read as a statement (unusual but harmless).
-        return true;
+        // Check: did the final member in the chain have parenthesized args?
+        // If so, it was a method call like obj.method() — we already consumed
+        // the parens in the loop.  Detect this by checking whether the token
+        // just before p is ')'.
+        if (p >= 2 and self.tokens[p - 1].tag == .rparen) return true;
+
+        // At end of statement (newline/colon/eof) with no parens and no '='
+        // — could be a void method call without parens.  Only treat as method
+        // call if there was exactly one dot-member (no nested chain), since
+        // multi-level chains without parens are field accesses, not calls.
+        // However, being conservative: return false to let the caller parse
+        // it as an assignment/expression, which is safer.
+        return false;
     }
 
     fn isTypeSuffix(self: *Parser) bool {
@@ -3496,8 +4218,20 @@ pub const Parser = struct {
             "PEEK", "POKE",  "STRING", "INKEY", "POINT",
         };
 
+        // Strip trailing type suffix ($, %, !, #, &, @, ^) before
+        // comparison so that e.g. "LEFT$" matches builtin "LEFT".
+        var base_name = name;
+        if (base_name.len > 0) {
+            const last = base_name[base_name.len - 1];
+            if (last == '$' or last == '%' or last == '!' or last == '#' or
+                last == '&' or last == '@' or last == '^')
+            {
+                base_name = base_name[0 .. base_name.len - 1];
+            }
+        }
+
         for (builtins) |builtin| {
-            if (std.ascii.eqlIgnoreCase(name, builtin)) return true;
+            if (std.ascii.eqlIgnoreCase(base_name, builtin)) return true;
         }
         return false;
     }

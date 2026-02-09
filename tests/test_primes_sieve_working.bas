@@ -1,11 +1,11 @@
 REM Sieve of Eratosthenes - Prime Number Generator
 REM Working version using GOTO to avoid nested WHILE inside IF bug
 
-DIM sieve(10000) AS INT
-DIM i AS INT
-DIM j AS INT
-DIM count AS INT
-DIM limit AS INT
+DIM sieve(10000) AS INTEGER
+DIM i AS INTEGER
+DIM j AS INTEGER
+DIM count AS INTEGER
+DIM limit AS INTEGER
 
 REM Initialize all numbers as potentially prime (1 = prime, 0 = composite)
 i = 2

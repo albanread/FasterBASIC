@@ -327,21 +327,51 @@ pub fn descriptorFromSuffix(suffix: ?Tag) TypeDescriptor {
 }
 
 /// Convert an AS type keyword tag to a TypeDescriptor.
+/// Map an element type name (e.g. "INTEGER", "STRING") to a BaseType.
+/// Used when parsing LIST OF <type> / HASHMAP OF <type>.
+pub fn elementTypeFromName(name: []const u8) BaseType {
+    // Case-insensitive compare via uppercase buffer
+    var buf: [32]u8 = undefined;
+    const len = @min(name.len, buf.len);
+    for (0..len) |i| buf[i] = std.ascii.toUpper(name[i]);
+    const upper = buf[0..len];
+    if (std.mem.eql(u8, upper, "INTEGER")) return .integer;
+    if (std.mem.eql(u8, upper, "INT")) return .integer;
+    if (std.mem.eql(u8, upper, "LONG")) return .long;
+    if (std.mem.eql(u8, upper, "ULONG")) return .ulong;
+    if (std.mem.eql(u8, upper, "DOUBLE")) return .double;
+    if (std.mem.eql(u8, upper, "SINGLE")) return .single;
+    if (std.mem.eql(u8, upper, "FLOAT")) return .single;
+    if (std.mem.eql(u8, upper, "STRING")) return .string;
+    if (std.mem.eql(u8, upper, "BYTE")) return .byte;
+    if (std.mem.eql(u8, upper, "UBYTE")) return .ubyte;
+    if (std.mem.eql(u8, upper, "SHORT")) return .short;
+    if (std.mem.eql(u8, upper, "USHORT")) return .ushort;
+    if (std.mem.eql(u8, upper, "OBJECT")) return .object;
+    if (std.mem.eql(u8, upper, "ANY")) return .unknown;
+    // Unknown element type name — could be a class/UDT name; treat as object
+    return .object;
+}
+
 pub fn descriptorFromKeyword(kw: Tag) TypeDescriptor {
-    return TypeDescriptor.fromBase(switch (kw) {
-        .kw_integer => .integer,
-        .kw_uinteger => .uinteger,
-        .kw_double => .double,
-        .kw_single => .single,
-        .kw_string_type => .string,
-        .kw_long => .long,
-        .kw_ulong => .ulong,
-        .kw_byte => .byte,
-        .kw_ubyte => .ubyte,
-        .kw_short => .short,
-        .kw_ushort => .ushort,
-        else => .unknown,
-    });
+    return switch (kw) {
+        .kw_hashmap => TypeDescriptor.fromObject("HASHMAP"),
+        .kw_list => TypeDescriptor.fromObject("LIST"),
+        else => TypeDescriptor.fromBase(switch (kw) {
+            .kw_integer => .integer,
+            .kw_uinteger => .uinteger,
+            .kw_double => .double,
+            .kw_single => .single,
+            .kw_string_type => .string,
+            .kw_long => .long,
+            .kw_ulong => .ulong,
+            .kw_byte => .byte,
+            .kw_ubyte => .ubyte,
+            .kw_short => .short,
+            .kw_ushort => .ushort,
+            else => .unknown,
+        }),
+    };
 }
 
 /// Convert a legacy VariableType to a TypeDescriptor.
@@ -630,6 +660,7 @@ pub const ClassSymbol = struct {
     name: []const u8,
     class_id: i32 = 0,
     parent_class: ?*ClassSymbol = null,
+    parent_class_name: []const u8 = "",
     declaration: SourceLocation = .{},
     is_declared: bool = false,
 
@@ -840,13 +871,25 @@ pub const SymbolTable = struct {
     }
 
     /// Look up a type (UDT) symbol.
+    /// Look up a type (UDT) symbol (case-insensitive).
     pub fn lookupType(self: *const SymbolTable, type_name: []const u8) ?*const TypeSymbol {
-        return self.types.getPtr(type_name);
+        // Types are stored with uppercased keys — uppercase before lookup.
+        var buf: [128]u8 = undefined;
+        const len = @min(type_name.len, buf.len);
+        for (0..len) |i| {
+            buf[i] = std.ascii.toUpper(type_name[i]);
+        }
+        return self.types.getPtr(buf[0..len]);
     }
 
-    /// Look up a type (UDT) symbol (mutable).
+    /// Look up a type (UDT) symbol (mutable, case-insensitive).
     pub fn lookupTypeMut(self: *SymbolTable, type_name: []const u8) ?*TypeSymbol {
-        return self.types.getPtr(type_name);
+        var buf: [128]u8 = undefined;
+        const len = @min(type_name.len, buf.len);
+        for (0..len) |i| {
+            buf[i] = std.ascii.toUpper(type_name[i]);
+        }
+        return self.types.getPtr(buf[0..len]);
     }
 
     /// Look up a class symbol (case-insensitive).
@@ -1036,6 +1079,12 @@ pub const SemanticAnalyzer = struct {
         // Pass 1: collect all declarations
         try self.pass1CollectDeclarations(program);
 
+        // Pass 1b: fixup parent_class pointers now that all classes are
+        // registered.  We cannot store stable pointers during pass 1
+        // because each HashMap.put may grow the table and invalidate
+        // every previously obtained pointer.
+        self.fixupClassParentPointers();
+
         // Pass 2: validate all code
         try self.pass2Validate(program);
 
@@ -1078,6 +1127,75 @@ pub const SemanticAnalyzer = struct {
 
     /// Explicit error set to break recursive inference in collectDeclaration cycle.
     const AnalyzeError = error{OutOfMemory};
+
+    /// After all CLASS declarations have been collected, walk the class
+    /// table and resolve every `parent_class` pointer.  This is safe
+    /// because no more puts will happen until pass 2.
+    fn fixupClassParentPointers(self: *SemanticAnalyzer) void {
+        // First pass: collect parent-name → child-key pairs so we don't
+        // iterate and mutate the same map simultaneously.
+        // We just iterate the values and patch in-place (getPtr is stable
+        // as long as we don't insert/remove).
+        var it = self.symbol_table.classes.iterator();
+        while (it.next()) |entry| {
+            const cls = entry.value_ptr;
+            // If parent_class is already set (shouldn't be after our
+            // null-init strategy, but guard anyway) skip.
+            if (cls.parent_class != null) continue;
+
+            // Check if the ClassSymbol's AST-level parent name was
+            // recorded.  We stored it as an inherited field list —
+            // but we need the original parent name.  We can recover it
+            // by checking if inherited fields exist but parent_class is
+            // null.  Instead, let's just iterate the AST again… but we
+            // don't have the AST here.
+            //
+            // Simpler: we stored fields with `inherited = true`.  Walk
+            // all OTHER classes to find one whose non-inherited fields
+            // match our inherited fields (expensive but correct).
+            //
+            // Even simpler: during collectClassDeclaration we can stash
+            // the parent name.  For now, iterate all classes and match
+            // by class_id on inherited method origin.
+        }
+
+        // Better approach: iterate all classes, for each one that has
+        // inherited fields/methods, find the parent by matching the
+        // origin_class of the first inherited method, or by matching
+        // field offsets.  But this is fragile.
+        //
+        // The cleanest fix: store the parent class name alongside the
+        // ClassSymbol during collectClassDeclaration and use it here.
+        // We'll piggy-back on the destructor_mangled_name field... no,
+        // let's just do a second scan of the program AST from analyze().
+        // But we don't have the program pointer here.
+        //
+        // Actually the simplest: just iterate the class map and for each
+        // class, check every other class to see if it should be the parent
+        // (by checking inherited fields/methods).
+        //
+        // EVEN SIMPLER: we already set parent_class = null during put.
+        // Let's just add a `parent_class_name` field to ClassSymbol so
+        // we can resolve it here.
+
+        // Use the parent_class_name stored in ClassSymbol (we'll add it).
+        var it2 = self.symbol_table.classes.iterator();
+        while (it2.next()) |entry| {
+            const cls = entry.value_ptr;
+            if (cls.parent_class != null) continue;
+            if (cls.parent_class_name.len == 0) continue;
+
+            var pu_buf: [128]u8 = undefined;
+            const pname = cls.parent_class_name;
+            const pu_len = @min(pname.len, pu_buf.len);
+            for (0..pu_len) |i| pu_buf[i] = std.ascii.toUpper(pname[i]);
+            const pu_upper = pu_buf[0..pu_len];
+
+            if (self.symbol_table.classes.getPtr(pu_upper)) |parent_ptr| {
+                cls.parent_class = parent_ptr;
+            }
+        }
+    }
 
     fn pass1CollectDeclarations(self: *SemanticAnalyzer, program: *const ast.Program) AnalyzeError!void {
         for (program.lines) |line| {
@@ -1130,6 +1248,23 @@ pub const SemanticAnalyzer = struct {
             .for_stmt => |fs| {
                 try self.autoRegisterForVariable(fs.variable, stmt.loc);
                 for (fs.body) |s| try self.collectDeclaration(s);
+            },
+            // Auto-register READ target variables (READ A%, B%, C%).
+            .read_stmt => |rs| {
+                for (rs.variables) |var_name| {
+                    // Extract suffix from variable name (e.g. "A%" → .percent).
+                    const suffix: ?Tag = if (var_name.len > 0) switch (var_name[var_name.len - 1]) {
+                        '%' => @as(?Tag, .percent),
+                        '$' => @as(?Tag, .type_string),
+                        '#' => @as(?Tag, .hash),
+                        '!' => @as(?Tag, .exclamation),
+                        '&' => @as(?Tag, .ampersand),
+                        '^' => @as(?Tag, .caret),
+                        '@' => @as(?Tag, .at_suffix),
+                        else => @as(?Tag, null),
+                    } else null;
+                    try self.autoRegisterVariable(var_name, suffix, stmt.loc);
+                }
             },
             // Auto-register INC/DEC target variables.
             .inc, .dec => |id| {
@@ -1321,14 +1456,233 @@ pub const SemanticAnalyzer = struct {
 
         const class_id = self.symbol_table.allocateClassId();
 
-        try self.symbol_table.classes.put(try self.allocator.dupe(u8, upper_name), .{
+        // ── Resolve parent class ────────────────────────────────────────
+        var parent_class: ?*ClassSymbol = null;
+        if (cls.parent_class_name.len > 0) {
+            var parent_upper_buf: [128]u8 = undefined;
+            const parent_upper = upperBuf(cls.parent_class_name, &parent_upper_buf) orelse cls.parent_class_name;
+            if (self.symbol_table.classes.getPtr(parent_upper)) |p| {
+                parent_class = p;
+            } else {
+                try self.addError(.undefined_class, "Parent CLASS not defined", loc);
+            }
+        }
+
+        // ── Inherit fields from parent ──────────────────────────────────
+        var fields_list: std.ArrayList(ClassSymbol.FieldInfo) = .empty;
+
+        if (parent_class) |parent| {
+            for (parent.fields) |pf| {
+                try fields_list.append(self.allocator, .{
+                    .name = pf.name,
+                    .type_desc = pf.type_desc,
+                    .offset = pf.offset,
+                    .inherited = true,
+                });
+            }
+        }
+
+        // ── Compute field offsets for own fields ────────────────────────
+        var current_offset: i32 = ClassSymbol.header_size; // Start after vtable_ptr + class_id
+        if (parent_class) |parent| {
+            current_offset = parent.object_size;
+        }
+
+        for (cls.fields) |field| {
+            // Determine field type from the AST TypeField
+            const field_type_desc: TypeDescriptor = if (field.is_built_in) blk: {
+                if (field.built_in_type) |bt| {
+                    break :blk descriptorFromKeyword(bt);
+                }
+                break :blk TypeDescriptor.fromBase(.double);
+            } else blk: {
+                // Check if it's a CLASS type
+                var ft_upper_buf: [128]u8 = undefined;
+                const ft_upper = upperBuf(field.type_name, &ft_upper_buf) orelse field.type_name;
+                if (self.symbol_table.classes.contains(ft_upper)) {
+                    break :blk TypeDescriptor.fromClass(field.type_name);
+                }
+                // Otherwise it's a UDT
+                const tid = self.symbol_table.getTypeId(field.type_name) orelse -1;
+                break :blk TypeDescriptor.fromUDT(field.type_name, tid);
+            };
+
+            // Compute size and alignment
+            var field_size: i32 = 8; // Default: pointer-sized (strings, objects, class instances)
+            var alignment: i32 = 8;
+            switch (field_type_desc.base_type) {
+                .integer, .uinteger, .single => {
+                    field_size = 4;
+                    alignment = 4;
+                },
+                .byte, .ubyte => {
+                    field_size = 1;
+                    alignment = 1;
+                },
+                .short, .ushort => {
+                    field_size = 2;
+                    alignment = 2;
+                },
+                else => {}, // 8 bytes for double, string, long, pointers, etc.
+            }
+
+            // Align offset
+            if (alignment > 0 and @mod(current_offset, alignment) != 0) {
+                current_offset += alignment - @mod(current_offset, alignment);
+            }
+
+            try fields_list.append(self.allocator, .{
+                .name = field.name,
+                .type_desc = field_type_desc,
+                .offset = current_offset,
+                .inherited = false,
+            });
+
+            current_offset += field_size;
+        }
+
+        // Pad to 8-byte alignment
+        if (@mod(current_offset, 8) != 0) {
+            current_offset += 8 - @mod(current_offset, 8);
+        }
+        const object_size = current_offset;
+
+        // ── Inherit method slots from parent ────────────────────────────
+        var methods_list: std.ArrayList(ClassSymbol.MethodInfo) = .empty;
+        if (parent_class) |parent| {
+            for (parent.methods) |pm| {
+                try methods_list.append(self.allocator, pm);
+            }
+        }
+
+        // ── Process own methods — assign vtable slots ───────────────────
+        for (cls.methods) |method| {
+            // Check if this overrides a parent method
+            var is_override = false;
+            var existing_slot: ?usize = null;
+
+            for (methods_list.items, 0..) |existing, i| {
+                if (std.ascii.eqlIgnoreCase(existing.name, method.method_name)) {
+                    is_override = true;
+                    existing_slot = i;
+                    break;
+                }
+            }
+
+            const mangled_name = try std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ cls.class_name, method.method_name });
+
+            // Build parameter type list
+            var param_types_list: std.ArrayList(TypeDescriptor) = .empty;
+            for (method.parameter_types, 0..) |pt, pi| {
+                if (pt) |tag| {
+                    _ = tag;
+                    try param_types_list.append(self.allocator, descriptorFromSuffix(pt));
+                } else if (pi < method.parameter_as_types.len and method.parameter_as_types[pi].len > 0) {
+                    const as_name = method.parameter_as_types[pi];
+                    var as_upper_buf: [128]u8 = undefined;
+                    const as_upper = upperBuf(as_name, &as_upper_buf) orelse as_name;
+                    if (self.symbol_table.classes.contains(as_upper)) {
+                        try param_types_list.append(self.allocator, TypeDescriptor.fromClass(as_name));
+                    } else {
+                        try param_types_list.append(self.allocator, descriptorFromKeyword(.kw_double));
+                    }
+                } else {
+                    try param_types_list.append(self.allocator, descriptorFromKeyword(.kw_double));
+                }
+            }
+
+            // Return type
+            const return_type: TypeDescriptor = if (method.has_return_type) blk: {
+                if (method.return_type_as_name.len > 0) {
+                    var rt_upper_buf: [128]u8 = undefined;
+                    const rt_upper = upperBuf(method.return_type_as_name, &rt_upper_buf) orelse method.return_type_as_name;
+                    if (self.symbol_table.classes.contains(rt_upper)) {
+                        break :blk TypeDescriptor.fromClass(method.return_type_as_name);
+                    }
+                }
+                if (method.return_type_suffix) |rts| {
+                    break :blk descriptorFromKeyword(rts);
+                }
+                break :blk descriptorFromKeyword(.kw_double);
+            } else TypeDescriptor.fromBase(.void);
+
+            const mi = ClassSymbol.MethodInfo{
+                .name = method.method_name,
+                .mangled_name = mangled_name,
+                .vtable_slot = if (is_override and existing_slot != null)
+                    methods_list.items[existing_slot.?].vtable_slot
+                else
+                    @intCast(methods_list.items.len),
+                .is_override = is_override,
+                .origin_class = cls.class_name,
+                .parameter_types = try self.allocator.dupe(TypeDescriptor, param_types_list.items),
+                .return_type = return_type,
+            };
+
+            if (is_override and existing_slot != null) {
+                // Override existing slot — replace the method info
+                methods_list.items[existing_slot.?] = mi;
+            } else {
+                // New method — append to vtable
+                try methods_list.append(self.allocator, mi);
+            }
+        }
+
+        // ── Process constructor parameter types ─────────────────────────
+        var ctor_param_types: []const TypeDescriptor = &.{};
+        if (cls.constructor) |ctor| {
+            var ctor_params: std.ArrayList(TypeDescriptor) = .empty;
+            for (ctor.parameter_types, 0..) |pt, pi| {
+                if (pt) |_| {
+                    try ctor_params.append(self.allocator, descriptorFromSuffix(pt));
+                } else if (pi < ctor.parameter_as_types.len and ctor.parameter_as_types[pi].len > 0) {
+                    const as_name = ctor.parameter_as_types[pi];
+                    var as_upper_buf2: [128]u8 = undefined;
+                    const as_upper2 = upperBuf(as_name, &as_upper_buf2) orelse as_name;
+                    if (self.symbol_table.classes.contains(as_upper2)) {
+                        try ctor_params.append(self.allocator, TypeDescriptor.fromClass(as_name));
+                    } else {
+                        try ctor_params.append(self.allocator, descriptorFromKeyword(.kw_double));
+                    }
+                } else {
+                    try ctor_params.append(self.allocator, descriptorFromKeyword(.kw_double));
+                }
+            }
+            ctor_param_types = try self.allocator.dupe(TypeDescriptor, ctor_params.items);
+        }
+
+        const ctor_mangled = if (cls.constructor != null)
+            try std.fmt.allocPrint(self.allocator, "{s}__CONSTRUCTOR", .{cls.class_name})
+        else
+            "";
+        const dtor_mangled = if (cls.destructor != null)
+            try std.fmt.allocPrint(self.allocator, "{s}__DESTRUCTOR", .{cls.class_name})
+        else
+            "";
+
+        // Store with null parent_class first — the put may grow the
+        // HashMap and invalidate any pointers previously obtained via
+        // getPtr().  fixupClassParentPointers() resolves them after
+        // all classes are registered.
+        const duped_key = try self.allocator.dupe(u8, upper_name);
+        try self.symbol_table.classes.put(duped_key, .{
             .name = cls.class_name,
             .class_id = class_id,
+            .parent_class = null, // resolved by fixupClassParentPointers
+            .parent_class_name = cls.parent_class_name,
             .declaration = loc,
             .is_declared = true,
+            .object_size = object_size,
+            .fields = try self.allocator.dupe(ClassSymbol.FieldInfo, fields_list.items),
+            .methods = try self.allocator.dupe(ClassSymbol.MethodInfo, methods_list.items),
             .has_constructor = cls.constructor != null,
+            .constructor_mangled_name = ctor_mangled,
+            .constructor_param_types = ctor_param_types,
             .has_destructor = cls.destructor != null,
+            .destructor_mangled_name = dtor_mangled,
         });
+
+        // parent_class pointer is resolved later by fixupClassParentPointers()
     }
 
     fn collectFunctionDeclaration(self: *SemanticAnalyzer, func: *const ast.FunctionStmt, loc: SourceLocation) AnalyzeError!void {
@@ -1343,11 +1697,56 @@ pub const SemanticAnalyzer = struct {
         // Build parameter type descriptors
         var param_descs: std.ArrayList(TypeDescriptor) = .empty;
         defer param_descs.deinit(self.allocator);
-        for (func.parameter_types) |pt| {
-            try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+        for (func.parameter_types, 0..) |pt, pi| {
+            // Check if the parameter has an AS <TypeName> that refers to
+            // a CLASS or UDT (e.g. "a AS Animal").
+            if (pi < func.parameter_as_types.len and func.parameter_as_types[pi].len > 0) {
+                const as_name = func.parameter_as_types[pi];
+                // Check if pt is a real type suffix/keyword (not .identifier,
+                // which the parser sets when AS is followed by a user-defined
+                // name like "Animal").  If it IS a known type tag, use it
+                // directly; otherwise fall through to CLASS/UDT lookup.
+                const is_real_type_tag = if (pt) |tag| switch (tag) {
+                    .type_int, .percent, .type_float, .exclamation, .type_double, .hash, .type_string, .type_byte, .at_suffix, .type_short, .caret, .ampersand, .kw_integer, .kw_uinteger, .kw_long, .kw_ulong, .kw_short, .kw_ushort, .kw_byte, .kw_ubyte, .kw_single, .kw_double, .kw_string_type => true,
+                    else => false,
+                } else false;
+
+                if (is_real_type_tag) {
+                    try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                } else if (self.symbol_table.lookupClass(as_name) != null) {
+                    // It's a CLASS name → class_instance pointer
+                    try param_descs.append(self.allocator, TypeDescriptor.fromClass(as_name));
+                } else {
+                    const tid = self.symbol_table.getTypeId(as_name) orelse -1;
+                    if (tid >= 0) {
+                        // It's a UDT name
+                        try param_descs.append(self.allocator, TypeDescriptor.fromUDT(as_name, tid));
+                    } else {
+                        // Unknown type name — fall back to suffix (may produce .unknown)
+                        try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                    }
+                }
+            } else {
+                try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+            }
         }
 
-        const return_desc = if (func.has_return_as_type)
+        const return_desc = if (func.return_type_as_name.len > 0) blk_ret: {
+            // Check if the return type AS name is a CLASS or UDT
+            const ret_as = func.return_type_as_name;
+            if (self.symbol_table.lookupClass(ret_as) != null) {
+                break :blk_ret TypeDescriptor.fromClass(ret_as);
+            }
+            const ret_tid = self.symbol_table.getTypeId(ret_as) orelse -1;
+            if (ret_tid >= 0) {
+                break :blk_ret TypeDescriptor.fromUDT(ret_as, ret_tid);
+            }
+            // Fall back to keyword-based resolution
+            if (func.has_return_as_type)
+                break :blk_ret descriptorFromKeyword(func.return_type_suffix orelse .kw_double)
+            else
+                break :blk_ret descriptorFromSuffix(func.return_type_suffix);
+        } else if (func.has_return_as_type)
             descriptorFromKeyword(func.return_type_suffix orelse .kw_double)
         else
             descriptorFromSuffix(func.return_type_suffix);
@@ -1388,8 +1787,29 @@ pub const SemanticAnalyzer = struct {
 
         var param_descs: std.ArrayList(TypeDescriptor) = .empty;
         defer param_descs.deinit(self.allocator);
-        for (sub.parameter_types) |pt| {
-            try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+        for (sub.parameter_types, 0..) |pt, pi| {
+            if (pi < sub.parameter_as_types.len and sub.parameter_as_types[pi].len > 0) {
+                const as_name = sub.parameter_as_types[pi];
+                const is_real_type_tag = if (pt) |tag| switch (tag) {
+                    .type_int, .percent, .type_float, .exclamation, .type_double, .hash, .type_string, .type_byte, .at_suffix, .type_short, .caret, .ampersand, .kw_integer, .kw_uinteger, .kw_long, .kw_ulong, .kw_short, .kw_ushort, .kw_byte, .kw_ubyte, .kw_single, .kw_double, .kw_string_type => true,
+                    else => false,
+                } else false;
+
+                if (is_real_type_tag) {
+                    try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                } else if (self.symbol_table.lookupClass(as_name) != null) {
+                    try param_descs.append(self.allocator, TypeDescriptor.fromClass(as_name));
+                } else {
+                    const tid = self.symbol_table.getTypeId(as_name) orelse -1;
+                    if (tid >= 0) {
+                        try param_descs.append(self.allocator, TypeDescriptor.fromUDT(as_name, tid));
+                    } else {
+                        try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                    }
+                }
+            } else {
+                try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+            }
         }
 
         try self.symbol_table.functions.put(try self.allocator.dupe(u8, upper_name), .{
@@ -1463,10 +1883,28 @@ pub const SemanticAnalyzer = struct {
                     continue;
                 }
 
-                const elem_type = if (arr.has_as_type)
-                    descriptorFromKeyword(arr.as_type_keyword orelse .kw_double)
-                else
-                    descriptorFromSuffix(arr.type_suffix);
+                const elem_type = if (arr.has_as_type) blk: {
+                    if (arr.as_type_keyword) |kw| {
+                        // For LIST OF <type> / HASHMAP OF <type> in array context,
+                        // set element_type from as_type_name.
+                        if ((kw == .kw_list or kw == .kw_hashmap) and arr.as_type_name.len > 0) {
+                            var desc = descriptorFromKeyword(kw);
+                            desc.element_type = elementTypeFromName(arr.as_type_name);
+                            break :blk desc;
+                        }
+                        break :blk descriptorFromKeyword(kw);
+                    }
+                    // No keyword tag — user-defined type name (e.g. DIM a(10) AS MyType)
+                    if (arr.as_type_name.len > 0) {
+                        // Check if it's a known class
+                        if (self.symbol_table.lookupClass(arr.as_type_name) != null) {
+                            break :blk TypeDescriptor.fromClass(arr.as_type_name);
+                        }
+                        const tid = self.symbol_table.getTypeId(arr.as_type_name) orelse -1;
+                        break :blk TypeDescriptor.fromUDT(arr.as_type_name, tid);
+                    }
+                    break :blk descriptorFromKeyword(.kw_double);
+                } else descriptorFromSuffix(arr.type_suffix);
 
                 try self.symbol_table.arrays.put(try self.allocator.dupe(u8, upper_name), .{
                     .name = arr.name,
@@ -1477,10 +1915,30 @@ pub const SemanticAnalyzer = struct {
                 });
             } else {
                 // Scalar variable declaration
-                const var_type = if (arr.has_as_type)
-                    descriptorFromKeyword(arr.as_type_keyword orelse .kw_double)
-                else
-                    descriptorFromSuffix(arr.type_suffix);
+                const var_type = if (arr.has_as_type) blk: {
+                    if (arr.as_type_keyword) |kw| {
+                        // For LIST OF <type> / HASHMAP OF <type>, set the element_type
+                        // from the as_type_name which the parser stored as the element
+                        // type keyword lexeme (e.g. "INTEGER", "STRING", "DOUBLE").
+                        if ((kw == .kw_list or kw == .kw_hashmap) and arr.as_type_name.len > 0) {
+                            var desc = descriptorFromKeyword(kw);
+                            desc.element_type = elementTypeFromName(arr.as_type_name);
+                            break :blk desc;
+                        }
+                        break :blk descriptorFromKeyword(kw);
+                    }
+                    // No keyword tag — user-defined type/class name
+                    // (e.g. DIM box AS StringBox, DIM p AS Point)
+                    if (arr.as_type_name.len > 0) {
+                        // Check if it's a known class
+                        if (self.symbol_table.lookupClass(arr.as_type_name) != null) {
+                            break :blk TypeDescriptor.fromClass(arr.as_type_name);
+                        }
+                        const tid2 = self.symbol_table.getTypeId(arr.as_type_name) orelse -1;
+                        break :blk TypeDescriptor.fromUDT(arr.as_type_name, tid2);
+                    }
+                    break :blk descriptorFromKeyword(.kw_double);
+                } else descriptorFromSuffix(arr.type_suffix);
 
                 const key = if (self.in_function) blk: {
                     break :blk try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ self.current_function_name, upper_name });
