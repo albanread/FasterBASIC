@@ -5645,6 +5645,26 @@ pub const BlockEmitter = struct {
             // source and target are pointer-sized (l).
             if (arr_bt == .class_instance or arr_bt == .object) {
                 try self.builder.emitStore(arr_store_type, val, elem_addr);
+            } else if (arr_bt == .user_defined) {
+                // UDT array element copy: use blit to copy the struct data
+                // instead of storing a pointer.
+                var udt_name_buf: [128]u8 = undefined;
+                const udt_name_len = @min(lt.variable.len, udt_name_buf.len);
+                for (0..udt_name_len) |ui| udt_name_buf[ui] = std.ascii.toUpper(lt.variable[ui]);
+                const udt_sz: u32 = if (self.symbol_table.lookupArray(udt_name_buf[0..udt_name_len])) |asym|
+                    if (asym.element_type_desc.udt_name.len > 0)
+                        self.type_manager.sizeOfUDT(asym.element_type_desc.udt_name)
+                    else
+                        0
+                else
+                    0;
+                if (udt_sz > 0) {
+                    // val is the source element address (pointer to struct)
+                    try self.builder.emitBlit(val, elem_addr, udt_sz);
+                } else {
+                    // Fallback: store as pointer if UDT size unknown
+                    try self.builder.emitStore("l", val, elem_addr);
+                }
             } else {
                 const expr_type = self.expr_emitter.inferExprType(lt.value);
                 const effective_val = try self.emitTypeConversion(val, expr_type, arr_bt);
@@ -5925,7 +5945,10 @@ pub const BlockEmitter = struct {
                     }
                     break :blk semantic.baseTypeFromSuffix(null);
                 } else semantic.baseTypeFromSuffix(arr.type_suffix);
-                const elem_size = self.type_manager.sizeOf(bt);
+                const elem_size = if (bt == .user_defined and arr.as_type_name.len > 0)
+                    self.type_manager.sizeOfUDT(arr.as_type_name)
+                else
+                    self.type_manager.sizeOf(bt);
                 const actual_elem_size: u32 = if (elem_size == 0) 8 else elem_size;
 
                 // Get the array descriptor global address.
