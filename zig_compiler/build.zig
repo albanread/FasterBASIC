@@ -165,6 +165,8 @@ pub fn build(b: *std.Build) void {
         "basic_data",
         "fbc_bridge",
         "io_ops_format",
+        "io_ops",
+        "array_ops",
     };
 
     var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;
