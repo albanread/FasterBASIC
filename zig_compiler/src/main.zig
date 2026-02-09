@@ -1016,47 +1016,11 @@ pub fn main() !void {
                 defer allocator.free(exe_path);
 
                 if (std.fs.path.dirname(exe_path)) |exe_dir| {
-                    const samm_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_pool.a", .{exe_dir}) catch {
-                        stderr.print("Error: out of memory\n", .{}) catch {};
-                        std.process.exit(1);
-                    };
-                    if (fileExists(samm_lib_path)) {
-                        try link_args.append(allocator, samm_lib_path);
-                        if (opts.verbose) {
-                            stderr.print("  Using Zig SAMM pool: {s}\n", .{samm_lib_path}) catch {};
-                        }
-                    } else {
-                        allocator.free(samm_lib_path);
-                    }
-
-                    const samm_scope_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_scope.a", .{exe_dir}) catch {
-                        stderr.print("Error: out of memory\n", .{}) catch {};
-                        std.process.exit(1);
-                    };
-                    if (fileExists(samm_scope_lib_path)) {
-                        try link_args.append(allocator, samm_scope_lib_path);
-                        if (opts.verbose) {
-                            stderr.print("  Using Zig SAMM scope: {s}\n", .{samm_scope_lib_path}) catch {};
-                        }
-                    } else {
-                        allocator.free(samm_scope_lib_path);
-                    }
-
-                    const samm_core_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_core.a", .{exe_dir}) catch {
-                        stderr.print("Error: out of memory\n", .{}) catch {};
-                        std.process.exit(1);
-                    };
-                    if (fileExists(samm_core_lib_path)) {
-                        try link_args.append(allocator, samm_core_lib_path);
-                        if (opts.verbose) {
-                            stderr.print("  Using Zig SAMM core: {s}\n", .{samm_core_lib_path}) catch {};
-                        }
-                    } else {
-                        allocator.free(samm_core_lib_path);
-                    }
-
-                    // Tier 1+2 Zig runtime libraries
+                    // All Zig runtime libraries (SAMM + runtime ports)
                     const zig_runtime_libs = [_][]const u8{
+                        "samm_pool",
+                        "samm_scope",
+                        "samm_core",
                         "memory_mgmt",
                         "class_runtime",
                         "conversion_ops",

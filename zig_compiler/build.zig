@@ -105,11 +105,7 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
-    // ── Zig SAMM Pool Runtime Library ──────────────────────────────────
-    //
-    // Compile samm_pool.zig → libsamm_pool.a via custom build step.
-    // This replaces samm_pool.c with a type-safe Zig implementation while
-    // maintaining C ABI compatibility.
+    // ── Zig Runtime Libraries ─────────────────────────────────────────
 
     // Create zig-out/lib directory first
     const mkdir_cmd = b.addSystemCommand(&[_][]const u8{
@@ -118,41 +114,10 @@ pub fn build(b: *std.Build) void {
         "zig-out/lib",
     });
 
-    const samm_pool_build = b.addSystemCommand(&[_][]const u8{
-        "zig",
-        "build-lib",
-        "runtime/samm_pool.zig",
-        "-lc",
-        "-O",
-        "ReleaseFast",
-        "-femit-bin=zig-out/lib/libsamm_pool.a",
-    });
-    samm_pool_build.step.dependOn(&mkdir_cmd.step);
-
-    const samm_scope_build = b.addSystemCommand(&[_][]const u8{
-        "zig",
-        "build-lib",
-        "runtime/samm_scope.zig",
-        "-lc",
-        "-O",
-        "ReleaseFast",
-        "-femit-bin=zig-out/lib/libsamm_scope.a",
-    });
-    samm_scope_build.step.dependOn(&mkdir_cmd.step);
-
-    const samm_core_build = b.addSystemCommand(&[_][]const u8{
-        "zig",
-        "build-lib",
-        "runtime/samm_core.zig",
-        "-lc",
-        "-O",
-        "ReleaseFast",
-        "-femit-bin=zig-out/lib/libsamm_core.a",
-    });
-    samm_core_build.step.dependOn(&mkdir_cmd.step);
-
-    // ── Tier 1+2 Runtime Libraries (Zig ports) ─────────────────────────
     const zig_runtime_libs = [_][]const u8{
+        "samm_pool",
+        "samm_scope",
+        "samm_core",
         "memory_mgmt",
         "class_runtime",
         "conversion_ops",
@@ -185,9 +150,6 @@ pub fn build(b: *std.Build) void {
         zig_rt_steps[i].step.dependOn(&mkdir_cmd.step);
     }
 
-    b.getInstallStep().dependOn(&samm_pool_build.step);
-    b.getInstallStep().dependOn(&samm_scope_build.step);
-    b.getInstallStep().dependOn(&samm_core_build.step);
     for (&zig_rt_steps) |*step| {
         b.getInstallStep().dependOn(&step.step);
     }
