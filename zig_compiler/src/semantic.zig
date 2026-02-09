@@ -804,6 +804,11 @@ pub const SymbolTable = struct {
         self.labels.deinit();
         self.constants.deinit();
         self.data_segment.deinit();
+        // Free owned keys allocated by allocateTypeId before releasing the map.
+        var it = self.type_name_to_id.keyIterator();
+        while (it.next()) |key_ptr| {
+            self.allocator.free(key_ptr.*);
+        }
         self.type_name_to_id.deinit();
     }
 
