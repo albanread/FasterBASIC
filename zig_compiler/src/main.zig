@@ -1006,6 +1006,55 @@ pub fn main() !void {
                     };
                     try link_args.append(allocator, inc_flag);
                 }
+
+                // Check for Zig-compiled SAMM pool library in zig-out/lib
+                // (relative to executable directory, not runtime directory)
+                const exe_path = std.fs.selfExePathAlloc(allocator) catch {
+                    stderr.print("Error: cannot determine exe path\n", .{}) catch {};
+                    std.process.exit(1);
+                };
+                defer allocator.free(exe_path);
+
+                if (std.fs.path.dirname(exe_path)) |exe_dir| {
+                    const samm_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_pool.a", .{exe_dir}) catch {
+                        stderr.print("Error: out of memory\n", .{}) catch {};
+                        std.process.exit(1);
+                    };
+                    if (fileExists(samm_lib_path)) {
+                        try link_args.append(allocator, samm_lib_path);
+                        if (opts.verbose) {
+                            stderr.print("  Using Zig SAMM pool: {s}\n", .{samm_lib_path}) catch {};
+                        }
+                    } else {
+                        allocator.free(samm_lib_path);
+                    }
+
+                    const samm_scope_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_scope.a", .{exe_dir}) catch {
+                        stderr.print("Error: out of memory\n", .{}) catch {};
+                        std.process.exit(1);
+                    };
+                    if (fileExists(samm_scope_lib_path)) {
+                        try link_args.append(allocator, samm_scope_lib_path);
+                        if (opts.verbose) {
+                            stderr.print("  Using Zig SAMM scope: {s}\n", .{samm_scope_lib_path}) catch {};
+                        }
+                    } else {
+                        allocator.free(samm_scope_lib_path);
+                    }
+
+                    const samm_core_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/libsamm_core.a", .{exe_dir}) catch {
+                        stderr.print("Error: out of memory\n", .{}) catch {};
+                        std.process.exit(1);
+                    };
+                    if (fileExists(samm_core_lib_path)) {
+                        try link_args.append(allocator, samm_core_lib_path);
+                        if (opts.verbose) {
+                            stderr.print("  Using Zig SAMM core: {s}\n", .{samm_core_lib_path}) catch {};
+                        }
+                    } else {
+                        allocator.free(samm_core_lib_path);
+                    }
+                }
             }
 
             // Always link libm (math functions used by runtime)

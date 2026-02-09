@@ -50,7 +50,7 @@ extern "C" {
 // all pointers NULL, dirty=1).
 //
 static inline StringDescriptor* string_desc_alloc(void) {
-    StringDescriptor* desc = (StringDescriptor*)samm_slab_pool_alloc(&g_string_desc_pool);
+    StringDescriptor* desc = (StringDescriptor*)samm_slab_pool_alloc(g_string_desc_pool);
     if (desc) {
         // samm_slab_pool_alloc returns zeroed memory — set non-zero defaults
         desc->refcount = 1;
@@ -78,7 +78,7 @@ static inline void string_desc_free(StringDescriptor* desc) {
         free(desc->utf8_cache);
         desc->utf8_cache = NULL;
     }
-    samm_slab_pool_free(&g_string_desc_pool, desc);
+    samm_slab_pool_free(g_string_desc_pool, desc);
 }
 
 /* ========================================================================= */
@@ -216,29 +216,29 @@ static inline void string_pool_stats(const StringDescriptorPool* pool,
                                      size_t* out_peak_usage,
                                      size_t* out_slabs) {
     (void)pool;
-    samm_slab_pool_stats(&g_string_desc_pool,
+    samm_slab_pool_stats(g_string_desc_pool,
                          out_allocated, out_capacity, out_peak_usage,
                          out_slabs, NULL, NULL);
 }
 
 static inline bool string_pool_validate(const StringDescriptorPool* pool) {
     (void)pool;
-    return samm_slab_pool_validate(&g_string_desc_pool);
+    return samm_slab_pool_validate(g_string_desc_pool);
 }
 
 static inline void string_pool_print_stats(const StringDescriptorPool* pool) {
     (void)pool;
-    samm_slab_pool_print_stats(&g_string_desc_pool);
+    samm_slab_pool_print_stats(g_string_desc_pool);
 }
 
 static inline void string_pool_check_leaks(const StringDescriptorPool* pool) {
     (void)pool;
-    samm_slab_pool_check_leaks(&g_string_desc_pool);
+    samm_slab_pool_check_leaks(g_string_desc_pool);
 }
 
 static inline double string_pool_usage_percent(const StringDescriptorPool* pool) {
     (void)pool;
-    return samm_slab_pool_usage_percent(&g_string_desc_pool);
+    return samm_slab_pool_usage_percent(g_string_desc_pool);
 }
 
 // No-ops for features not applicable to generic pool

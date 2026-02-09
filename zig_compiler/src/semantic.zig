@@ -814,7 +814,9 @@ pub const SymbolTable = struct {
         }
         const id = self.next_type_id;
         self.next_type_id += 1;
-        try self.type_name_to_id.put(type_name, id);
+        // Dupe the key so we own the memory (callers may pass stack buffers).
+        const owned_key = try self.allocator.dupe(u8, type_name);
+        try self.type_name_to_id.put(owned_key, id);
         return id;
     }
 
@@ -1892,7 +1894,10 @@ pub const SemanticAnalyzer = struct {
                     // It's a CLASS name → class_instance pointer
                     try param_descs.append(self.allocator, TypeDescriptor.fromClass(as_name));
                 } else {
-                    const tid = self.symbol_table.getTypeId(as_name) orelse -1;
+                    // Uppercase the type name for UDT lookup (types are stored uppercase)
+                    var as_upper_buf: [128]u8 = undefined;
+                    const as_upper = upperBuf(as_name, &as_upper_buf) orelse as_name;
+                    const tid = self.symbol_table.getTypeId(as_upper) orelse -1;
                     if (tid >= 0) {
                         // It's a UDT name
                         try param_descs.append(self.allocator, TypeDescriptor.fromUDT(as_name, tid));
@@ -1975,7 +1980,10 @@ pub const SemanticAnalyzer = struct {
                 } else if (self.symbol_table.lookupClass(as_name) != null) {
                     try param_descs.append(self.allocator, TypeDescriptor.fromClass(as_name));
                 } else {
-                    const tid = self.symbol_table.getTypeId(as_name) orelse -1;
+                    // Uppercase the type name for UDT lookup (types are stored uppercase)
+                    var as_upper_buf: [128]u8 = undefined;
+                    const as_upper = upperBuf(as_name, &as_upper_buf) orelse as_name;
+                    const tid = self.symbol_table.getTypeId(as_upper) orelse -1;
                     if (tid >= 0) {
                         try param_descs.append(self.allocator, TypeDescriptor.fromUDT(as_name, tid));
                     } else {
@@ -2301,6 +2309,11 @@ pub const SemanticAnalyzer = struct {
                 try self.repeat_stack.append(self.allocator, stmt.loc);
                 for (rs.body) |s| try self.validateStatement(s);
                 if (rs.condition) |cond| try self.validateExpression(cond);
+                // The UNTIL keyword is now consumed inside parseRepeatStatement,
+                // so pop the repeat_stack here instead of in until_stmt handling.
+                if (self.repeat_stack.items.len > 0) {
+                    _ = self.repeat_stack.pop();
+                }
             },
             .until_stmt => |us| {
                 if (self.repeat_stack.items.len == 0) {
@@ -2315,6 +2328,11 @@ pub const SemanticAnalyzer = struct {
                 if (ds.pre_condition) |pc| try self.validateExpression(pc);
                 for (ds.body) |s| try self.validateStatement(s);
                 if (ds.post_condition) |pc| try self.validateExpression(pc);
+                // The LOOP keyword is now consumed inside parseDoStatement,
+                // so pop the do_stack here instead of in loop_stmt handling.
+                if (self.do_stack.items.len > 0) {
+                    _ = self.do_stack.pop();
+                }
             },
             .loop_stmt => |ls| {
                 if (self.do_stack.items.len == 0) {

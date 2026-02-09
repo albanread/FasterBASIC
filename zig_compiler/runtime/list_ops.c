@@ -51,7 +51,7 @@ static ListAtom* atom_alloc(void) {
         atom = (ListAtom*)samm_alloc_list_atom();
     } else {
         /* Pool alloc only (no tracking) */
-        atom = (ListAtom*)samm_slab_pool_alloc(&g_list_atom_pool);
+        atom = (ListAtom*)samm_slab_pool_alloc(g_list_atom_pool);
     }
 
     if (!atom) {
@@ -120,7 +120,7 @@ static void atom_free(ListAtom* atom) {
     /* Record bytes freed for SAMM accounting */
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
     /* Return atom shell to pool */
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
 }
 
 /**
@@ -235,7 +235,7 @@ ListHeader* list_create(void) {
         h = (ListHeader*)samm_alloc_list();
     } else {
         /* Pool alloc only (no tracking) */
-        h = (ListHeader*)samm_slab_pool_alloc(&g_list_header_pool);
+        h = (ListHeader*)samm_slab_pool_alloc(g_list_header_pool);
     }
 
     if (!h) {
@@ -291,7 +291,7 @@ void list_free(ListHeader* list) {
     /* Record bytes freed for SAMM accounting */
     samm_record_bytes_freed((uint64_t)sizeof(ListHeader));
     /* Return header shell to pool */
-    samm_slab_pool_free(&g_list_header_pool, list);
+    samm_slab_pool_free(g_list_header_pool, list);
 }
 
 /* ========================================================================= */
@@ -478,7 +478,7 @@ int64_t list_shift_int(ListHeader* list) {
     /* Don't release payload for INT — just return shell to pool */
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -488,7 +488,7 @@ double list_shift_float(ListHeader* list) {
     double val = atom->value.float_value;
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -499,7 +499,7 @@ void* list_shift_ptr(ListHeader* list) {
     /* Don't release the string/list — caller now owns the reference */
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -557,7 +557,7 @@ int64_t list_pop_int(ListHeader* list) {
     int64_t val = atom->value.int_value;
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -567,7 +567,7 @@ double list_pop_float(ListHeader* list) {
     double val = atom->value.float_value;
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -578,7 +578,7 @@ void* list_pop_ptr(ListHeader* list) {
     /* Caller now owns the reference */
     if (samm_is_enabled()) samm_untrack(atom);
     samm_record_bytes_freed((uint64_t)sizeof(ListAtom));
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
     return val;
 }
 
@@ -1083,7 +1083,7 @@ void list_free_from_samm(void* header_ptr) {
     list->head   = NULL;
     list->tail   = NULL;
     list->length = 0;
-    samm_slab_pool_free(&g_list_header_pool, list);
+    samm_slab_pool_free(g_list_header_pool, list);
 }
 
 void list_atom_free_from_samm(void* atom_ptr) {
@@ -1102,7 +1102,7 @@ void list_atom_free_from_samm(void* atom_ptr) {
     atom_release_payload(atom);
 
     /* Return atom shell to pool (Phase 2: pool-based recycling) */
-    samm_slab_pool_free(&g_list_atom_pool, atom);
+    samm_slab_pool_free(g_list_atom_pool, atom);
 }
 
 /* ========================================================================= */

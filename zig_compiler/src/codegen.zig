@@ -286,7 +286,17 @@ pub const QBEBuilder = struct {
 
     /// Emit a load instruction.
     pub fn emitLoad(self: *QBEBuilder, dest: []const u8, qbe_type: []const u8, addr: []const u8) !void {
-        try self.emit("    {s} ={s} load{s} {s}\n", .{ dest, qbe_type, qbe_type, addr });
+        // QBE requires result types to be w, l, s, or d.
+        // Sub-word loads (ub, sb, uh, sh) produce a "w" result but
+        // use the sub-word suffix for the load instruction.
+        const result_type: []const u8 = if (std.mem.eql(u8, qbe_type, "ub") or
+            std.mem.eql(u8, qbe_type, "sb") or
+            std.mem.eql(u8, qbe_type, "uh") or
+            std.mem.eql(u8, qbe_type, "sh"))
+            "w"
+        else
+            qbe_type;
+        try self.emit("    {s} ={s} load{s} {s}\n", .{ dest, result_type, qbe_type, addr });
     }
 
     /// Emit a store instruction.
@@ -857,6 +867,7 @@ pub const RuntimeLibrary = struct {
         try self.declare("samm_shutdown", "");
         try self.declare("samm_enter_scope", "");
         try self.declare("samm_exit_scope", "");
+        try self.declare("samm_retain", "l %ptr, w %offset");
         try self.declare("samm_register_cleanup", "l %ptr, l %dtor");
 
         // Error handling  (runtime: basic_runtime.c)
@@ -1226,6 +1237,38 @@ pub const ExprEmitter = struct {
                     break :blk ExprType.double;
                 }
 
+                // Array reduction functions: SUM, MAX, MIN, AVG, DOT
+                // Return type matches the array element type.
+                {
+                    const is_reduction = std.mem.eql(u8, fc_upper, "SUM") or
+                        std.mem.eql(u8, fc_upper, "MAX") or
+                        std.mem.eql(u8, fc_upper, "MIN") or
+                        std.mem.eql(u8, fc_upper, "AVG") or
+                        std.mem.eql(u8, fc_upper, "DOT");
+                    if (is_reduction and fc.arguments.len > 0 and self.isWholeArrayArg(fc.arguments[0])) {
+                        const arr_name = getWholeArrayName(fc.arguments[0]);
+                        if (arr_name) |aname| {
+                            var arb: [128]u8 = undefined;
+                            const ar_base = SymbolMapper.stripSuffix(aname);
+                            const ar_len = @min(ar_base.len, arb.len);
+                            for (0..ar_len) |ari| arb[ari] = std.ascii.toUpper(ar_base[ari]);
+                            if (self.symbol_table.lookupArray(arb[0..ar_len])) |arr_sym| {
+                                const ebt = arr_sym.element_type_desc.base_type;
+                                if (ebt.isInteger()) break :blk ExprType.integer;
+                                if (ebt.isFloat() or ebt == .single) break :blk ExprType.double;
+                            }
+                        }
+                    }
+                }
+
+                // Scalar MAX/MIN (2-argument): return type matches args
+                if ((std.mem.eql(u8, fc_upper, "MAX") or std.mem.eql(u8, fc_upper, "MIN")) and fc.arguments.len == 2) {
+                    const lt = self.inferExprType(fc.arguments[0]);
+                    const rt = self.inferExprType(fc.arguments[1]);
+                    if (lt == .integer and rt == .integer) break :blk ExprType.integer;
+                    break :blk ExprType.double;
+                }
+
                 // Check builtin function mapping first (LEN, ASC, STR$, etc.)
                 if (mapBuiltinFunction(fc_upper)) |bi| {
                     if (std.mem.eql(u8, bi.ret_type, "w")) break :blk ExprType.integer;
@@ -1293,6 +1336,15 @@ pub const ExprEmitter = struct {
             .array_access => |aa| blk_aa: {
                 // Hashmap subscript returns string (values are StringDescriptor*)
                 if (self.isHashmapVariable(aa.name)) break :blk_aa ExprType.string;
+
+                // LIST subscript: infer from declared element type
+                if (self.isListVariable(aa.name)) {
+                    const elt = self.listElementType(aa.name);
+                    if (elt.isInteger()) break :blk_aa ExprType.integer;
+                    if (elt.isString()) break :blk_aa ExprType.string;
+                    if (elt.isFloat()) break :blk_aa ExprType.double;
+                    break :blk_aa ExprType.double;
+                }
 
                 // Check symbol table for the actual array element type.
                 // This is essential for typed arrays (DIM a(10) AS MyClass).
@@ -1386,7 +1438,22 @@ pub const ExprEmitter = struct {
             .me, .nothing, .super_call => .double,
             .is_type => .integer,
             .list_constructor => .double,
-            .array_binop => .double,
+            .array_binop => |ab| {
+                // Infer type from the left array operand
+                if (ab.left_array.data == .array_access) {
+                    const aa = ab.left_array.data.array_access;
+                    if (aa.type_suffix != null) return typeFromSuffix(aa.type_suffix);
+                    // Look up array element type in symbol table
+                    var abn_buf: [128]u8 = undefined;
+                    const abn_base = SymbolMapper.stripSuffix(aa.name);
+                    const abn_len = @min(abn_base.len, abn_buf.len);
+                    for (0..abn_len) |abi| abn_buf[abi] = std.ascii.toUpper(abn_base[abi]);
+                    if (self.symbol_table.lookupArray(abn_buf[0..abn_len])) |arr_sym| {
+                        if (arr_sym.element_type_desc.base_type.isInteger()) return .integer;
+                    }
+                }
+                return .double;
+            },
             .registry_function => .double,
         };
     }
@@ -1552,11 +1619,12 @@ pub const ExprEmitter = struct {
 
             if (fctx.resolve(upper_base)) |rv| {
                 const dest = try self.builder.newTemp();
-                // For user_defined (UDT) locals stored inline on the stack,
-                // the stack slot address IS the UDT address — return it
-                // directly instead of loading from it.
+                // For user_defined (UDT) params and locals, the stack slot
+                // stores a POINTER to the UDT struct (allocated via
+                // basic_malloc or passed as a parameter).  Load the pointer
+                // from the stack slot so we get the actual struct address.
                 if (rv.base_type == .user_defined) {
-                    try self.builder.emit("    {s} =l copy {s}\n", .{ dest, rv.addr });
+                    try self.builder.emitLoad(dest, "l", rv.addr);
                 } else {
                     try self.builder.emitLoad(dest, rv.qbe_type, rv.addr);
                 }
@@ -1989,6 +2057,95 @@ pub const ExprEmitter = struct {
         for (0..name_len) |i| name_upper_buf[i] = std.ascii.toUpper(name[i]);
         const name_upper = name_upper_buf[0..name_len];
 
+        // ── Array reduction functions: SUM(A()), MAX(A()), MIN(A()), AVG(A()), DOT(A(),B()) ──
+        // These must be checked before the scalar MAX/MIN builtins.
+        {
+            const is_sum = std.mem.eql(u8, name_upper, "SUM");
+            const is_max = std.mem.eql(u8, name_upper, "MAX");
+            const is_min = std.mem.eql(u8, name_upper, "MIN");
+            const is_avg = std.mem.eql(u8, name_upper, "AVG");
+            const is_dot = std.mem.eql(u8, name_upper, "DOT");
+
+            const is_single_arg_reduction = is_sum or is_max or is_min or is_avg;
+
+            if (is_single_arg_reduction and arguments.len == 1) {
+                // Check if argument is a whole-array reference (empty indices)
+                if (self.isWholeArrayArg(arguments[0])) {
+                    return self.emitArrayReduction(name_upper, arguments, is_sum, is_max, is_min, is_avg, false);
+                }
+            }
+            if (is_dot and arguments.len == 2) {
+                if (self.isWholeArrayArg(arguments[0]) and self.isWholeArrayArg(arguments[1])) {
+                    return self.emitArrayReduction(name_upper, arguments, false, false, false, false, true);
+                }
+            }
+        }
+
+        // ── Scalar MAX/MIN intrinsic (2-argument form) ─────────────────
+        // MAX(a, b) and MIN(a, b) are inlined as branchless compare+select.
+        if ((std.mem.eql(u8, name_upper, "MAX") or std.mem.eql(u8, name_upper, "MIN")) and arguments.len == 2) {
+            const a_val = try self.emitExpression(arguments[0]);
+            const b_val = try self.emitExpression(arguments[1]);
+            const a_type = self.inferExprType(arguments[0]);
+            const b_type = self.inferExprType(arguments[1]);
+            const is_max = std.mem.eql(u8, name_upper, "MAX");
+
+            if (a_type == .integer and b_type == .integer) {
+                // Integer path: compare + conditional select
+                const cmp = try self.builder.newTemp();
+                if (is_max) {
+                    try self.builder.emit("    {s} =w csgtw {s}, {s}\n", .{ cmp, a_val, b_val });
+                } else {
+                    try self.builder.emit("    {s} =w csltw {s}, {s}\n", .{ cmp, a_val, b_val });
+                }
+                // Branchless select: result = cmp ? a : b
+                const id = self.builder.nextLabelId();
+                const pick_a = try std.fmt.allocPrint(self.allocator, "sel_a_{d}", .{id});
+                const pick_b = try std.fmt.allocPrint(self.allocator, "sel_b_{d}", .{id});
+                const sel_done = try std.fmt.allocPrint(self.allocator, "sel_d_{d}", .{id});
+                try self.builder.emitBranch(cmp, pick_a, pick_b);
+                try self.builder.emitLabel(pick_a);
+                const va = try self.builder.newTemp();
+                try self.builder.emit("    {s} =w copy {s}\n", .{ va, a_val });
+                try self.builder.emitJump(sel_done);
+                try self.builder.emitLabel(pick_b);
+                const vb = try self.builder.newTemp();
+                try self.builder.emit("    {s} =w copy {s}\n", .{ vb, b_val });
+                try self.builder.emitJump(sel_done);
+                try self.builder.emitLabel(sel_done);
+                const result = try self.builder.newTemp();
+                try self.builder.emit("    {s} =w phi @{s} {s}, @{s} {s}\n", .{ result, pick_a, va, pick_b, vb });
+                return result;
+            } else {
+                // Double path: promote integers to double, then compare+select
+                const da = if (a_type == .integer) try self.emitIntToDouble(a_val) else a_val;
+                const db = if (b_type == .integer) try self.emitIntToDouble(b_val) else b_val;
+                const cmp = try self.builder.newTemp();
+                if (is_max) {
+                    try self.builder.emit("    {s} =w cgtd {s}, {s}\n", .{ cmp, da, db });
+                } else {
+                    try self.builder.emit("    {s} =w cltd {s}, {s}\n", .{ cmp, da, db });
+                }
+                const id = self.builder.nextLabelId();
+                const pick_a = try std.fmt.allocPrint(self.allocator, "sel_a_{d}", .{id});
+                const pick_b = try std.fmt.allocPrint(self.allocator, "sel_b_{d}", .{id});
+                const sel_done = try std.fmt.allocPrint(self.allocator, "sel_d_{d}", .{id});
+                try self.builder.emitBranch(cmp, pick_a, pick_b);
+                try self.builder.emitLabel(pick_a);
+                const va = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d copy {s}\n", .{ va, da });
+                try self.builder.emitJump(sel_done);
+                try self.builder.emitLabel(pick_b);
+                const vb = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d copy {s}\n", .{ vb, db });
+                try self.builder.emitJump(sel_done);
+                try self.builder.emitLabel(sel_done);
+                const result = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d phi @{s} {s}, @{s} {s}\n", .{ result, pick_a, va, pick_b, vb });
+                return result;
+            }
+        }
+
         // ── LEN intrinsic ──────────────────────────────────────────────
         // LEN(s$) is just descriptor->length at offset 8.  Emit an inline
         // field load instead of a function call.
@@ -2161,6 +2318,15 @@ pub const ExprEmitter = struct {
             }
             try self.builder.emitCall(dest, ret_type, rt_name, args_buf.items);
             return dest;
+        }
+
+        // ── Self-method call inside class body ─────────────────────────
+        // If we're inside a class method and the function name matches
+        // a method of the current class, emit it as ME.Method(args).
+        if (self.class_ctx) |cls| {
+            if (cls.findMethod(name_upper)) |_| {
+                return self.emitMethodCallOnPtr("%me", name_upper, name, arguments, cls);
+            }
         }
 
         // ── User-defined function ──────────────────────────────────────
@@ -2407,26 +2573,18 @@ pub const ExprEmitter = struct {
     fn inferClassName(self: *ExprEmitter, expr: *const ast.Expression) ?[]const u8 {
         switch (expr.data) {
             .variable => |v| {
-                if (self.symbol_table.lookupVariable(v.name)) |vsym| {
-                    if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type) {
-                        return vsym.type_desc.class_name;
-                    }
-                }
-                // Also try with uppercase key
+                // Uppercase the variable name once for all lookups.
                 var vu_buf: [128]u8 = undefined;
                 const vu_len = @min(v.name.len, vu_buf.len);
                 for (0..vu_len) |i| vu_buf[i] = std.ascii.toUpper(v.name[i]);
                 const vu_upper = vu_buf[0..vu_len];
-                if (self.symbol_table.lookupVariable(vu_upper)) |vsym| {
-                    if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type) {
-                        return vsym.type_desc.class_name;
-                    }
-                }
-                // Try function-scoped key: FUNCNAME.VARNAME
+
+                // ── Check function-scoped key FIRST: FUNCNAME.VARNAME ───
                 // Local class instance variables inside METHOD/FUNCTION
                 // bodies are registered with a scoped key in the symbol
-                // table (e.g. "MAKEWRAPPER.W" for DIM w AS Wrapper
-                // inside METHOD MakeWrapper).
+                // table (e.g. "BUILDITEM.C" for DIM c AS Container
+                // inside METHOD BuildItem).  These must take precedence
+                // over global variables with the same name.
                 if (self.func_ctx) |fctx| {
                     var scoped_buf: [256]u8 = undefined;
                     const scoped = std.fmt.bufPrint(&scoped_buf, "{s}.{s}", .{ fctx.upper_name, vu_upper }) catch null;
@@ -2439,7 +2597,8 @@ pub const ExprEmitter = struct {
                     }
                 }
                 // Also try with the class_ctx method name as scope
-                // (for locals inside CLASS METHOD bodies)
+                // (for locals inside CLASS METHOD bodies where the
+                // method name may differ from func_ctx.upper_name)
                 if (self.method_name.len > 0) {
                     const mname = self.method_name;
                     var mu_buf: [128]u8 = undefined;
@@ -2453,6 +2612,19 @@ pub const ExprEmitter = struct {
                                 return vsym.type_desc.class_name;
                             }
                         }
+                    }
+                }
+
+                // ── Fall back to global symbol table ────────────────────
+                if (self.symbol_table.lookupVariable(v.name)) |vsym| {
+                    if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type) {
+                        return vsym.type_desc.class_name;
+                    }
+                }
+                // Also try with uppercase key
+                if (self.symbol_table.lookupVariable(vu_upper)) |vsym| {
+                    if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type) {
+                        return vsym.type_desc.class_name;
                     }
                 }
             },
@@ -2537,6 +2709,34 @@ pub const ExprEmitter = struct {
                         if (self.symbol_table.lookupVariable(sk)) |vsym| {
                             if (vsym.type_desc.base_type == .user_defined) {
                                 return vsym.type_desc.udt_name;
+                            }
+                        }
+                    }
+
+                    // Check function parameter type descriptors.
+                    // Parameters are not stored in the variable symbol table,
+                    // so we look up the enclosing function's declared param types.
+                    var fn_upper_buf2: [128]u8 = undefined;
+                    const fn_len2 = @min(fctx.func_name.len, fn_upper_buf2.len);
+                    for (0..fn_len2) |fi| fn_upper_buf2[fi] = std.ascii.toUpper(fctx.func_name[fi]);
+                    const fn_upper2 = fn_upper_buf2[0..fn_len2];
+                    if (self.symbol_table.lookupFunction(fn_upper2)) |fsym| {
+                        const param_base = SymbolMapper.stripSuffix(v.name);
+                        for (fsym.parameters, 0..) |param, pi| {
+                            const p_base = SymbolMapper.stripSuffix(param);
+                            var pu_buf: [128]u8 = undefined;
+                            const pu_len = @min(p_base.len, pu_buf.len);
+                            for (0..pu_len) |pj| pu_buf[pj] = std.ascii.toUpper(p_base[pj]);
+                            var vb_buf: [128]u8 = undefined;
+                            const vb_len = @min(param_base.len, vb_buf.len);
+                            for (0..vb_len) |vj| vb_buf[vj] = std.ascii.toUpper(param_base[vj]);
+                            if (pu_len == vb_len and std.mem.eql(u8, pu_buf[0..pu_len], vb_buf[0..vb_len])) {
+                                if (pi < fsym.parameter_type_descs.len) {
+                                    const pd = fsym.parameter_type_descs[pi];
+                                    if (pd.base_type == .user_defined and pd.udt_name.len > 0) {
+                                        return pd.udt_name;
+                                    }
+                                }
                             }
                         }
                     }
@@ -3054,7 +3254,7 @@ pub const ExprEmitter = struct {
 
         const dest = try self.builder.newTemp();
         try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unresolved method call .{s}", .{method_name}));
-        try self.builder.emit("    {s} =d copy d_0.0\n", .{dest});
+        try self.builder.emit("    {s} =l copy 0\n", .{dest});
         return dest;
     }
 
@@ -3063,6 +3263,80 @@ pub const ExprEmitter = struct {
             const dest = try self.builder.newTemp();
             try self.builder.emit("    {s} =d copy d_0.0\n", .{dest});
             return dest;
+        }
+
+        // ── List subscript sugar: myList(n) → list_get_* ────────────
+        if (self.isListVariable(name)) {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LIST subscript: {s}(...)", .{name}));
+
+            // Load the list pointer from the global or local variable
+            var list_ptr: []const u8 = undefined;
+            if (self.func_ctx) |fctx| {
+                var fup_buf: [128]u8 = undefined;
+                const fbase = SymbolMapper.stripSuffix(name);
+                const flen = @min(fbase.len, fup_buf.len);
+                for (0..flen) |fi| fup_buf[fi] = std.ascii.toUpper(fbase[fi]);
+                if (fctx.resolve(fup_buf[0..flen])) |rv| {
+                    list_ptr = try self.builder.newTemp();
+                    try self.builder.emitLoad(list_ptr, "l", rv.addr);
+                } else {
+                    const var_name = try self.symbol_mapper.globalVarName(name, null);
+                    list_ptr = try self.builder.newTemp();
+                    try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                }
+            } else {
+                const var_name = try self.symbol_mapper.globalVarName(name, null);
+                list_ptr = try self.builder.newTemp();
+                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            }
+
+            // Evaluate the index expression
+            const idx_val = try self.emitExpression(indices[0]);
+            const idx_type = self.inferExprType(indices[0]);
+            // Convert index to long (list positions are int64_t)
+            const idx_l = if (idx_type == .integer) blk: {
+                const ext = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, idx_val });
+                break :blk ext;
+            } else if (idx_type == .double) blk: {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "w", "dtosi", idx_val);
+                const ext = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, cvt });
+                break :blk ext;
+            } else idx_val;
+
+            const elt = self.listElementType(name);
+            if (elt.isString()) {
+                const dest = try self.builder.newTemp();
+                try self.builder.emitCall(dest, "l", "list_get_ptr", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                return dest;
+            } else if (elt.isFloat() or elt == .single) {
+                const dest = try self.builder.newTemp();
+                try self.builder.emitCall(dest, "d", "list_get_float", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                return dest;
+            } else {
+                const raw = try self.builder.newTemp();
+                try self.builder.emitCall(raw, "l", "list_get_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                const dest = try self.builder.newTemp();
+                try self.builder.emitTrunc(dest, "w", raw);
+                return dest;
+            }
+        }
+
+        // ── Self-method call: Build(x) inside a class method → ME.Build(x) ──
+        if (self.class_ctx) |cls| {
+            var mup_buf: [128]u8 = undefined;
+            const mbase = SymbolMapper.stripSuffix(name);
+            const mlen = @min(mbase.len, mup_buf.len);
+            for (0..mlen) |mi| mup_buf[mi] = std.ascii.toUpper(mbase[mi]);
+            if (cls.findMethod(mup_buf[0..mlen])) |_| {
+                // This is a method of the current class — emit as ME.Method(args)
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Self-method call: {s}(...) → ME.{s}(...)", .{ name, name }));
+                // Build a synthetic ME expression for the object
+                const me_result = try self.emitMe();
+                return self.emitMethodCallOnPtr(me_result, mup_buf[0..mlen], name, indices, cls);
+            }
         }
 
         // ── Hashmap subscript: dict("key") → hashmap_lookup ─────────
@@ -3315,6 +3589,321 @@ pub const ExprEmitter = struct {
         return "%me";
     }
 
+    /// Check if an expression argument is a whole-array reference (for reduction detection).
+    fn isWholeArrayArg(self: *ExprEmitter, expr: *const ast.Expression) bool {
+        _ = self;
+        return switch (expr.data) {
+            .array_access => |aa| aa.indices.len == 0,
+            else => false,
+        };
+    }
+
+    /// Get the array name from a whole-array reference expression.
+    fn getWholeArrayName(expr: *const ast.Expression) ?[]const u8 {
+        return switch (expr.data) {
+            .array_access => |aa| if (aa.indices.len == 0) aa.name else null,
+            else => null,
+        };
+    }
+
+    /// Emit an array reduction function (SUM, MAX, MIN, AVG, DOT).
+    /// Returns the QBE temporary holding the scalar result.
+    fn emitArrayReduction(self: *ExprEmitter, func_name: []const u8, arguments: []const ast.ExprPtr, is_sum: bool, is_max: bool, is_min: bool, is_avg: bool, is_dot: bool) EmitError![]const u8 {
+        const src_name = getWholeArrayName(arguments[0]) orelse return self.emitNothing();
+
+        // Look up source array
+        var su_buf: [128]u8 = undefined;
+        const su_base = SymbolMapper.stripSuffix(src_name);
+        const su_len = @min(su_base.len, su_buf.len);
+        for (0..su_len) |i| su_buf[i] = std.ascii.toUpper(su_base[i]);
+        const arr_sym = self.symbol_table.lookupArray(su_buf[0..su_len]) orelse return self.emitNothing();
+
+        const elem_bt = arr_sym.element_type_desc.base_type;
+        const is_float = (elem_bt == .single or elem_bt == .double);
+        const elem_size: u32 = switch (elem_bt) {
+            .byte, .ubyte => 1,
+            .short, .ushort => 2,
+            .integer, .uinteger, .single => 4,
+            .long, .ulong, .double => 8,
+            else => 4,
+        };
+        // QBE type for loads/stores and arithmetic
+        const qbe_type: []const u8 = switch (elem_bt) {
+            .single => "s",
+            .double => "d",
+            .long, .ulong => "l",
+            else => "w",
+        };
+        const load_op: []const u8 = switch (elem_bt) {
+            .byte => "loadsb",
+            .ubyte => "loadub",
+            .short => "loadsh",
+            .ushort => "loaduh",
+            .integer, .uinteger => "loadw",
+            .single => "loads",
+            .long, .ulong => "loadl",
+            .double => "loadd",
+            else => "loadw",
+        };
+
+        // DOT: check second array
+        var src2_name: ?[]const u8 = null;
+        if (is_dot and arguments.len >= 2) {
+            src2_name = getWholeArrayName(arguments[1]);
+        }
+
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array reduction: {s}({s}(){s})", .{
+            func_name,                                                                                             src_name,
+            if (src2_name) |s2| try std.fmt.allocPrint(self.allocator, ", {s}()", .{s2}) else @as([]const u8, ""),
+        }));
+
+        // Get source array data pointer
+        const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
+        const src_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ src_desc, src_desc_name });
+        const src_data = try self.builder.newTemp();
+        try self.builder.emitLoad(src_data, "l", src_desc);
+
+        // Get upper bound from descriptor (offset 16)
+        const upper_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(upper_ptr, "l", "add", src_desc, "16");
+        const upper_val = try self.builder.newTemp();
+        try self.builder.emitLoad(upper_val, "l", upper_ptr);
+        // num_elements = upper_bound + 1
+        const num_elements = try self.builder.newTemp();
+        try self.builder.emitBinary(num_elements, "l", "add", upper_val, "1");
+        // total_bytes = num_elements * elem_size
+        const total_bytes = try self.builder.newTemp();
+        try self.builder.emitBinary(total_bytes, "l", "mul", num_elements, try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size}));
+
+        // DOT: get second source data pointer
+        var src2_data: []const u8 = "";
+        if (is_dot) {
+            if (src2_name) |s2n| {
+                const s2_desc_name = try self.symbol_mapper.arrayDescName(s2n);
+                const s2_desc = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l copy ${s}\n", .{ s2_desc, s2_desc_name });
+                src2_data = try self.builder.newTemp();
+                try self.builder.emitLoad(src2_data, "l", s2_desc);
+            }
+        }
+
+        // Accumulator slot
+        const acc_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{acc_slot});
+
+        // Initialise accumulator
+        if (is_sum or is_dot or is_avg) {
+            if (is_float) {
+                if (elem_bt == .single) {
+                    try self.builder.emit("    stores s_0.0, {s}\n", .{acc_slot});
+                } else {
+                    try self.builder.emit("    stored d_0.0, {s}\n", .{acc_slot});
+                }
+            } else {
+                try self.builder.emit("    storew 0, {s}\n", .{acc_slot});
+            }
+        } else {
+            // MAX/MIN: start with first element
+            const first_val = try self.builder.newTemp();
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ first_val, qbe_type, load_op, src_data });
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, first_val, acc_slot });
+        }
+
+        // Cursor offset slot
+        const cur_off_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{cur_off_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{cur_off_slot});
+
+        const loop_id = self.builder.nextLabelId();
+        const hdr_lbl = try std.fmt.allocPrint(self.allocator, "reduce_hdr_{d}", .{loop_id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "reduce_body_{d}", .{loop_id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "reduce_done_{d}", .{loop_id});
+
+        try self.builder.emitJump(hdr_lbl);
+        try self.builder.emitLabel(hdr_lbl);
+
+        const cur_off = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_off, "l", cur_off_slot);
+        const done_check = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w cugel {s}, {s}\n", .{ done_check, cur_off, total_bytes });
+        try self.builder.emitBranch(done_check, done_lbl, body_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        const off = try self.builder.newTemp();
+        try self.builder.emitLoad(off, "l", cur_off_slot);
+
+        // Load element
+        const elem_addr = try self.builder.newTemp();
+        try self.builder.emitBinary(elem_addr, "l", "add", src_data, off);
+        const elem_val = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}\n", .{ elem_val, qbe_type, load_op, elem_addr });
+
+        // For DOT: load second array element and multiply
+        var op_val = elem_val;
+        if (is_dot and src2_data.len > 0) {
+            const elem2_addr = try self.builder.newTemp();
+            try self.builder.emitBinary(elem2_addr, "l", "add", src2_data, off);
+            const elem2_val = try self.builder.newTemp();
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ elem2_val, qbe_type, load_op, elem2_addr });
+            op_val = try self.builder.newTemp();
+            try self.builder.emitBinary(op_val, qbe_type, "mul", elem_val, elem2_val);
+        }
+
+        // Load current accumulator
+        const cur_acc = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} load{s} {s}\n", .{ cur_acc, qbe_type, qbe_type, acc_slot });
+
+        // Update accumulator
+        if (is_sum or is_dot or is_avg) {
+            const new_acc = try self.builder.newTemp();
+            try self.builder.emitBinary(new_acc, qbe_type, "add", cur_acc, op_val);
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, new_acc, acc_slot });
+        } else if (is_max) {
+            // max: curAcc >= elemVal ? curAcc : elemVal
+            const cmp_res = try self.builder.newTemp();
+            if (is_float) {
+                const cmp_op: []const u8 = if (elem_bt == .single) "cges" else "cged";
+                try self.builder.emit("    {s} =w {s} {s}, {s}\n", .{ cmp_res, cmp_op, cur_acc, op_val });
+            } else {
+                try self.builder.emit("    {s} =w csgew {s}, {s}\n", .{ cmp_res, cur_acc, op_val });
+            }
+            const max_id = self.builder.nextLabelId();
+            const max_then = try std.fmt.allocPrint(self.allocator, "rmax_t_{d}", .{max_id});
+            const max_end = try std.fmt.allocPrint(self.allocator, "rmax_e_{d}", .{max_id});
+            // Store opVal as default, conditionally overwrite with curAcc
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, op_val, acc_slot });
+            try self.builder.emitBranch(cmp_res, max_then, max_end);
+            try self.builder.emitLabel(max_then);
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, cur_acc, acc_slot });
+            try self.builder.emitJump(max_end);
+            try self.builder.emitLabel(max_end);
+        } else if (is_min) {
+            // min: curAcc <= elemVal ? curAcc : elemVal
+            const cmp_res = try self.builder.newTemp();
+            if (is_float) {
+                const cmp_op: []const u8 = if (elem_bt == .single) "cles" else "cled";
+                try self.builder.emit("    {s} =w {s} {s}, {s}\n", .{ cmp_res, cmp_op, cur_acc, op_val });
+            } else {
+                try self.builder.emit("    {s} =w cslew {s}, {s}\n", .{ cmp_res, cur_acc, op_val });
+            }
+            const min_id = self.builder.nextLabelId();
+            const min_then = try std.fmt.allocPrint(self.allocator, "rmin_t_{d}", .{min_id});
+            const min_end = try std.fmt.allocPrint(self.allocator, "rmin_e_{d}", .{min_id});
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, op_val, acc_slot });
+            try self.builder.emitBranch(cmp_res, min_then, min_end);
+            try self.builder.emitLabel(min_then);
+            try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, cur_acc, acc_slot });
+            try self.builder.emitJump(min_end);
+            try self.builder.emitLabel(min_end);
+        }
+
+        // Advance offset
+        const next_off = try self.builder.newTemp();
+        try self.builder.emitBinary(next_off, "l", "add", off, try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size}));
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_off, cur_off_slot });
+        try self.builder.emitJump(hdr_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+
+        // Load final accumulator value
+        var result = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} load{s} {s}\n", .{ result, qbe_type, qbe_type, acc_slot });
+
+        // AVG: divide by count
+        if (is_avg) {
+            if (is_float) {
+                const count_f = try self.builder.newTemp();
+                if (elem_bt == .single) {
+                    try self.builder.emit("    {s} =s swtof {s}\n", .{ count_f, num_elements });
+                } else {
+                    try self.builder.emit("    {s} =d sltof {s}\n", .{ count_f, num_elements });
+                }
+                const avg_result = try self.builder.newTemp();
+                try self.builder.emitBinary(avg_result, qbe_type, "div", result, count_f);
+                result = avg_result;
+            } else {
+                // Integer average: truncating division
+                const count_w = try self.builder.newTemp();
+                try self.builder.emit("    {s} =w copy {s}\n", .{ count_w, num_elements });
+                const avg_result = try self.builder.newTemp();
+                try self.builder.emitBinary(avg_result, "w", "div", result, count_w);
+                result = avg_result;
+            }
+        }
+
+        // Convert result type to match expression system expectations:
+        // - SINGLE (s) → promote to double (d)
+        // - BYTE/SHORT (w from loadsb/loadsh) → already w, fine
+        if (elem_bt == .single) {
+            const promoted = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ promoted, result });
+            return promoted;
+        }
+
+        return result;
+    }
+
+    /// Emit a method call on a given object pointer (used for self-method
+    /// calls like `Build(x)` inside a class method → `ME.Build(x)`).
+    fn emitMethodCallOnPtr(self: *ExprEmitter, obj_ptr: []const u8, method_upper: []const u8, _: []const u8, arguments: []const ast.ExprPtr, cls: *const semantic.ClassSymbol) EmitError![]const u8 {
+        if (cls.findMethod(method_upper)) |method_info| {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Self-method call: {s}.{s}()", .{ cls.name, method_upper }));
+
+            var call_args: std.ArrayList(u8) = .empty;
+            defer call_args.deinit(self.allocator);
+            try std.fmt.format(call_args.writer(self.allocator), "l {s}", .{obj_ptr});
+
+            for (arguments, 0..) |arg, ai| {
+                try call_args.appendSlice(self.allocator, ", ");
+                var arg_val = try self.emitExpression(arg);
+                const arg_type = if (ai < method_info.parameter_types.len)
+                    method_info.parameter_types[ai].toQBEType()
+                else
+                    "l";
+                // Convert argument to match declared parameter type
+                const expr_et = self.inferExprType(arg);
+                if (std.mem.eql(u8, arg_type, "d") and expr_et == .integer) {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
+                    arg_val = cvt;
+                } else if (std.mem.eql(u8, arg_type, "w") and expr_et == .double) {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "w", "dtosi", arg_val);
+                    arg_val = cvt;
+                } else if (std.mem.eql(u8, arg_type, "l") and expr_et == .integer) {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitExtend(cvt, "l", "extsw", arg_val);
+                    arg_val = cvt;
+                }
+                try std.fmt.format(call_args.writer(self.allocator), "{s} {s}", .{ arg_type, arg_val });
+            }
+
+            const ret_type = if (method_info.return_type.base_type != .void)
+                method_info.return_type.toQBEType()
+            else
+                "";
+
+            if (ret_type.len > 0) {
+                const dest = try self.builder.newTemp();
+                try self.builder.emitCall(dest, ret_type, method_info.mangled_name, call_args.items);
+                return dest;
+            } else {
+                try self.builder.emitCall("", "", method_info.mangled_name, call_args.items);
+                const dest = try self.builder.newTemp();
+                try self.builder.emit("    {s} =w copy 0\n", .{dest});
+                return dest;
+            }
+        }
+
+        // Fallback: method not found, return 0
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: self-method {s} not found in class {s}", .{ method_upper, cls.name }));
+        const dest = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy 0\n", .{dest});
+        return dest;
+    }
+
     fn emitNothing(self: *ExprEmitter) EmitError![]const u8 {
         const dest = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy 0\n", .{dest});
@@ -3417,11 +4006,13 @@ pub const ExprEmitter = struct {
     }
 
     fn emitArrayBinop(self: *ExprEmitter, left: *const ast.Expression, operation: ast.ArrayBinopExpr.OpType, right: *const ast.Expression) EmitError![]const u8 {
+        // Array binop expressions are handled at the statement level in
+        // emitWholeArrayAssignment. If we reach here, it means the expression
+        // is used in a non-assignment context. Return a dummy value.
         _ = operation;
         _ = left;
         _ = right;
         const dest = try self.builder.newTemp();
-        try self.builder.emitComment("TODO: array binary operation");
         try self.builder.emit("    {s} =l copy 0\n", .{dest});
         return dest;
     }
@@ -3739,6 +4330,7 @@ pub const BlockEmitter = struct {
             .swap => |sw| try self.emitSwapStatement(&sw),
             .local => |loc_stmt| try self.emitLocalStatement(&loc_stmt),
             .shared => |sh_stmt| try self.emitSharedStatement(&sh_stmt),
+            .erase => |er| try self.emitEraseStatement(&er),
 
             // ── Control-flow statements: handle structurally ────────────
             //
@@ -3941,6 +4533,42 @@ pub const BlockEmitter = struct {
             // Fallback: if we have match but no next, just jump to match
             if (case_match_target) |t| {
                 try self.builder.emitJump(try blockLabel(self.cfg, t, self.allocator));
+                return;
+            }
+        }
+
+        // ── Post-test loop conditional back-edge ────────────────────────
+        // DO...LOOP WHILE uses back_edge (continue) + branch_false (exit).
+        // DO...LOOP UNTIL uses branch_true (exit) + back_edge (continue).
+        // The standard conditional-branch handler above requires both
+        // branch_true and branch_false, so these cases fall through.
+        // Handle them here before the unconditional back-edge fallback.
+        if (back_edge_target != null and block.branch_condition != null) {
+            const cond = block.branch_condition.?;
+            if (false_target != null or true_target != null) {
+                const cond_val = try self.expr_emitter.emitExpression(cond);
+                const cond_type = self.expr_emitter.inferExprType(cond);
+                const cond_int = if (cond_type == .double) blk: {
+                    const t = try self.builder.newTemp();
+                    try self.builder.emitConvert(t, "w", "dtosi", cond_val);
+                    break :blk t;
+                } else cond_val;
+
+                if (false_target) |ft| {
+                    // DO...LOOP WHILE: back_edge when true, branch_false when false
+                    try self.builder.emitBranch(
+                        cond_int,
+                        try blockLabel(self.cfg, back_edge_target.?, self.allocator),
+                        try blockLabel(self.cfg, ft, self.allocator),
+                    );
+                } else if (true_target) |tt| {
+                    // DO...LOOP UNTIL: branch_true when true, back_edge when false
+                    try self.builder.emitBranch(
+                        cond_int,
+                        try blockLabel(self.cfg, tt, self.allocator),
+                        try blockLabel(self.cfg, back_edge_target.?, self.allocator),
+                    );
+                }
                 return;
             }
         }
@@ -5127,6 +5755,1138 @@ pub const BlockEmitter = struct {
         return true;
     }
 
+    // ═══════════════════════════════════════════════════════════════════
+    // Whole-Array Expression Support
+    // ═══════════════════════════════════════════════════════════════════
+    //
+    // Handles statements of the form:
+    //   C() = A() + B()    — element-wise binary operation
+    //   B() = A()          — whole-array copy
+    //   A() = 42           — fill with scalar
+    //   B() = -A()         — unary negate
+    //   B() = A() * 2.0    — scalar broadcast
+    //   B() = 100.0 - A()  — left-side scalar broadcast
+    //
+    // Generates an inline loop over all elements. For NEON-eligible types
+    // and sizes, uses vectorized operations; otherwise scalar fallback.
+
+    /// Returns true if the whole-array assignment was handled.
+    fn emitWholeArrayAssignment(self: *BlockEmitter, lt: *const ast.LetStmt, target_arr: *const semantic.ArraySymbol) EmitError!bool {
+        const elem_bt = target_arr.element_type_desc.base_type;
+        // Only handle primitive numeric array element types
+        if (elem_bt != .integer and elem_bt != .single and elem_bt != .double and
+            elem_bt != .byte and elem_bt != .short and elem_bt != .long)
+        {
+            return false;
+        }
+
+        // Determine QBE type info for element operations
+        const elem_qbe_type: []const u8 = switch (elem_bt) {
+            .byte, .ubyte => "w",
+            .short, .ushort => "w",
+            .integer, .uinteger, .single => "w",
+            .long, .ulong, .double => "l",
+            else => "w",
+        };
+        const elem_store_op: []const u8 = switch (elem_bt) {
+            .byte, .ubyte => "storeb",
+            .short, .ushort => "storeh",
+            .integer, .uinteger => "storew",
+            .single => "stores",
+            .long, .ulong => "storel",
+            .double => "stored",
+            else => "storew",
+        };
+        // For arithmetic operations, SINGLE arrays use DOUBLE precision
+        // internally (matching BASIC semantics where all arithmetic is
+        // done in DOUBLE), then truncate back when storing.
+        const elem_arith_type: []const u8 = switch (elem_bt) {
+            .single => "d",
+            .double => "d",
+            .long, .ulong => "l",
+            else => "w",
+        };
+        const is_float = (elem_bt == .single or elem_bt == .double);
+        // The load op for arithmetic: SINGLE loads as 's' then extends to 'd'
+        const arith_load_op: []const u8 = switch (elem_bt) {
+            .byte => "loadsb",
+            .ubyte => "loadub",
+            .short => "loadsh",
+            .ushort => "loaduh",
+            .integer, .uinteger => "loadw",
+            .single => "loads",
+            .long, .ulong => "loadl",
+            .double => "loadd",
+            else => "loadw",
+        };
+        const elem_size: u32 = self.type_manager.sizeOf(elem_bt);
+        if (elem_size == 0) return false;
+
+        // Classify the RHS expression
+        const pattern = self.classifyWholeArrayRHS(lt.value);
+
+        if (pattern == .unknown) return false;
+
+        // Get target descriptor address
+        const target_desc_name = try self.symbol_mapper.arrayDescName(lt.variable);
+        const target_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ target_desc, target_desc_name });
+
+        // Load data pointer (offset 0) and upper bound (offset 16) from descriptor
+        const target_data = try self.builder.newTemp();
+        try self.builder.emitLoad(target_data, "l", target_desc);
+        const target_upper_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(target_upper_ptr, "l", "add", target_desc, "16");
+        const target_upper = try self.builder.newTemp();
+        try self.builder.emitLoad(target_upper, "l", target_upper_ptr);
+        // num_elements = upper_bound + 1 (lower bound is always 0)
+        const num_elements = try self.builder.newTemp();
+        try self.builder.emitBinary(num_elements, "l", "add", target_upper, "1");
+
+        // Total byte count = num_elements * elem_size
+        const total_bytes = try self.builder.newTemp();
+        const elem_size_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(total_bytes, "l", "mul", num_elements, elem_size_str);
+
+        switch (pattern) {
+            .fill_scalar => {
+                try self.emitArrayFill(lt, target_data, num_elements, elem_bt, elem_arith_type, elem_store_op, elem_size, is_float);
+            },
+            .copy_array => {
+                try self.emitArrayCopy(lt, target_data, total_bytes);
+            },
+            .negate_array => {
+                try self.emitArrayNegate(lt, target_data, num_elements, elem_bt, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float);
+            },
+            .binary_arrays => {
+                try self.emitArrayBinaryOp(lt, target_data, num_elements, elem_bt, elem_qbe_type, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float);
+            },
+            .broadcast_right => {
+                try self.emitArrayBroadcast(lt, target_data, num_elements, elem_bt, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float, false);
+            },
+            .broadcast_left => {
+                try self.emitArrayBroadcast(lt, target_data, num_elements, elem_bt, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float, true);
+            },
+            .compound_fma => {
+                try self.emitCompoundFMA(lt, target_data, num_elements, elem_bt, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float);
+            },
+            .unary_func_array => {
+                try self.emitArrayUnaryFunc(lt, target_data, num_elements, elem_bt, elem_arith_type, arith_load_op, elem_store_op, elem_size, is_float);
+            },
+            .unknown => return false,
+        }
+
+        return true;
+    }
+
+    const WholeArrayPattern = enum {
+        fill_scalar,
+        copy_array,
+        negate_array,
+        binary_arrays,
+        broadcast_right,
+        broadcast_left,
+        compound_fma,
+        unary_func_array,
+        unknown,
+    };
+
+    /// Check if an expression is a whole-array reference (empty-index array access
+    /// or a variable name that is a declared array).
+    fn isWholeArrayExpr(self: *BlockEmitter, expr: *const ast.Expression) bool {
+        return switch (expr.data) {
+            .array_access => |aa| aa.indices.len == 0,
+            .variable => |v| blk: {
+                var buf: [128]u8 = undefined;
+                const base_name = SymbolMapper.stripSuffix(v.name);
+                const len = @min(base_name.len, buf.len);
+                for (0..len) |i| buf[i] = std.ascii.toUpper(base_name[i]);
+                break :blk self.symbol_table.lookupArray(buf[0..len]) != null;
+            },
+            else => false,
+        };
+    }
+
+    /// Classify what kind of whole-array operation the RHS expression represents.
+    fn classifyWholeArrayRHS(self: *BlockEmitter, value: *const ast.Expression) WholeArrayPattern {
+        switch (value.data) {
+            .number => return .fill_scalar,
+            .function_call => |fc| {
+                // Check for element-wise array functions: ABS(A()), SQR(A())
+                if (fc.arguments.len == 1) {
+                    var fu_buf: [64]u8 = undefined;
+                    const fu_len = @min(fc.name.len, fu_buf.len);
+                    for (0..fu_len) |i| fu_buf[i] = std.ascii.toUpper(fc.name[i]);
+                    const fu = fu_buf[0..fu_len];
+                    if (std.mem.eql(u8, fu, "ABS") or std.mem.eql(u8, fu, "SQR")) {
+                        if (self.isWholeArrayExpr(fc.arguments[0])) {
+                            return .unary_func_array;
+                        }
+                    }
+                }
+                return .unknown;
+            },
+            .variable => |v| {
+                // Check if this variable is actually an array reference
+                var buf: [128]u8 = undefined;
+                const base_name = SymbolMapper.stripSuffix(v.name);
+                const len = @min(base_name.len, buf.len);
+                for (0..len) |i| buf[i] = std.ascii.toUpper(base_name[i]);
+                if (self.symbol_table.lookupArray(buf[0..len])) |_| {
+                    return .copy_array;
+                }
+                return .fill_scalar;
+            },
+            .array_access => |aa| {
+                if (aa.indices.len == 0) return .copy_array;
+                return .unknown;
+            },
+            .unary => |un| {
+                if (un.op == .minus) {
+                    if (un.operand.data == .array_access) {
+                        const inner = un.operand.data.array_access;
+                        if (inner.indices.len == 0) return .negate_array;
+                    }
+                    if (un.operand.data == .variable) {
+                        const v = un.operand.data.variable;
+                        var buf: [128]u8 = undefined;
+                        const base_name = SymbolMapper.stripSuffix(v.name);
+                        const len = @min(base_name.len, buf.len);
+                        for (0..len) |i| buf[i] = std.ascii.toUpper(base_name[i]);
+                        if (self.symbol_table.lookupArray(buf[0..len])) |_| {
+                            return .negate_array;
+                        }
+                    }
+                    // Negative scalar literal: -99.5, -42, etc.
+                    if (un.operand.data == .number or un.operand.data == .variable) {
+                        return .fill_scalar;
+                    }
+                }
+                return .unknown;
+            },
+            .binary => |bin| {
+                const left_is_array = self.isWholeArrayExpr(bin.left);
+                const right_is_array = self.isWholeArrayExpr(bin.right);
+
+                // Check for FMA pattern: D() = A() + B() * C()
+                // Top-level op must be + (addition)
+                if (bin.op == .plus) {
+                    // Check: left is array, right is binary * of two arrays
+                    if (left_is_array and bin.right.data == .binary) {
+                        const rbin = bin.right.data.binary;
+                        if (rbin.op == .multiply and self.isWholeArrayExpr(rbin.left) and self.isWholeArrayExpr(rbin.right)) {
+                            return .compound_fma;
+                        }
+                    }
+                    // Check: right is array, left is binary * of two arrays
+                    if (right_is_array and bin.left.data == .binary) {
+                        const lbin = bin.left.data.binary;
+                        if (lbin.op == .multiply and self.isWholeArrayExpr(lbin.left) and self.isWholeArrayExpr(lbin.right)) {
+                            return .compound_fma;
+                        }
+                    }
+                }
+
+                if (left_is_array and right_is_array) return .binary_arrays;
+                if (left_is_array and !right_is_array) return .broadcast_right;
+                if (!left_is_array and right_is_array) return .broadcast_left;
+                return .unknown;
+            },
+            .array_binop => return .binary_arrays,
+            else => return .unknown,
+        }
+    }
+
+    /// Get the binary op tag from the RHS value expression.
+    fn getArrayBinOp(self: *BlockEmitter, value: *const ast.Expression) ?Tag {
+        _ = self;
+        return switch (value.data) {
+            .binary => |bin| bin.op,
+            .array_binop => |ab| switch (ab.operation) {
+                .add, .add_scalar => .plus,
+                .subtract, .sub_scalar => .minus,
+                .multiply, .mul_scalar => Tag.multiply,
+            },
+            else => null,
+        };
+    }
+
+    /// Get the QBE arithmetic instruction name for a binary op + type.
+    fn arrayArithInstr(self: *BlockEmitter, op: Tag, is_float: bool) []const u8 {
+        _ = self;
+        return switch (op) {
+            .plus => if (is_float) "add" else "add",
+            .minus => if (is_float) "sub" else "sub",
+            .multiply => if (is_float) "mul" else "mul",
+            .divide => if (is_float) "div" else "div",
+            else => "add",
+        };
+    }
+
+    /// Get the source array name from a whole-array reference expression.
+    fn getArrayRefName(self: *BlockEmitter, expr: *const ast.Expression) ?[]const u8 {
+        return switch (expr.data) {
+            .array_access => |aa| if (aa.indices.len == 0) aa.name else null,
+            .variable => |v| blk: {
+                var buf: [128]u8 = undefined;
+                const base_name = SymbolMapper.stripSuffix(v.name);
+                const len = @min(base_name.len, buf.len);
+                for (0..len) |i| buf[i] = std.ascii.toUpper(base_name[i]);
+                if (self.symbol_table.lookupArray(buf[0..len])) |_| {
+                    break :blk v.name;
+                }
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    /// Emit: target_data = memcpy(source_data, total_bytes)
+    fn emitArrayCopy(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, total_bytes: []const u8) EmitError!void {
+        const src_name = switch (lt.value.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array copy: {s}() = {s}()", .{ lt.variable, src_name }));
+
+        const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
+        const src_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ src_desc, src_desc_name });
+        const src_data = try self.builder.newTemp();
+        try self.builder.emitLoad(src_data, "l", src_desc);
+
+        // Use blit for the copy (QBE's memcpy equivalent requires constant size,
+        // so we generate a byte-level loop for dynamic sizes).
+        // Actually use a call to memcpy via the C library which is available.
+        // QBE doesn't have a dynamic blit, so we emit a scalar loop.
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_loop_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_done_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_body_{d}", .{id});
+
+        // Loop index (byte offset)
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, total_bytes });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+        // Load 8 bytes at a time for efficiency (works for any alignment on modern CPUs)
+        const src_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(src_ptr, "l", "add", src_data, cur_idx);
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, cur_idx);
+        const val = try self.builder.newTemp();
+        try self.builder.emitLoad(val, "l", src_ptr);
+        try self.builder.emit("    storel {s}, {s}\n", .{ val, dst_ptr });
+
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "8");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
+    /// Emit: fill all elements with a scalar value
+    fn emitArrayFill(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, _: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array fill: {s}() = scalar", .{lt.variable}));
+
+        // Evaluate the scalar value
+        const scalar_val = try self.expr_emitter.emitExpression(lt.value);
+        const scalar_type = self.expr_emitter.inferExprType(lt.value);
+
+        // Convert to element type if needed
+        // For fill, we store directly in the element type (no SINGLE→DOUBLE promotion)
+        const fill_arith_type: []const u8 = switch (elem_bt) {
+            .single => "s",
+            .double => "d",
+            .long, .ulong => "l",
+            else => "w",
+        };
+        const fill_val = try self.convertToElemType(scalar_val, scalar_type, elem_bt, fill_arith_type, is_float);
+
+        // Generate scalar loop — for fill, use the native element arith type (no promotion)
+        try self.emitScalarLoop(target_data, num_elements, elem_size, fill_arith_type, elem_store_op, fill_val, null, null, null, .fill, false);
+    }
+
+    /// Emit: negate all elements B() = -A()
+    fn emitArrayNegate(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, elem_arith_type: []const u8, elem_load_op: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
+        const needs_trunc = (elem_bt == .single);
+        const src_name = switch (lt.value.data) {
+            .unary => |un| switch (un.operand.data) {
+                .array_access => |aa| aa.name,
+                .variable => |v| v.name,
+                else => return,
+            },
+            else => return,
+        };
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array negate: {s}() = -{s}()", .{ lt.variable, src_name }));
+
+        const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
+        const src_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ src_desc, src_desc_name });
+        const src_data = try self.builder.newTemp();
+        try self.builder.emitLoad(src_data, "l", src_desc);
+
+        // zero value for negation (0 - x)
+        const zero_val = try self.builder.newTemp();
+        if (is_float) {
+            try self.builder.emit("    {s} =d copy d_0.0\n", .{zero_val});
+        } else {
+            try self.builder.emit("    {s} ={s} copy 0\n", .{ zero_val, elem_arith_type });
+        }
+
+        try self.emitScalarLoop(target_data, num_elements, elem_size, elem_arith_type, elem_store_op, null, src_data, elem_load_op, zero_val, .negate, needs_trunc);
+    }
+
+    /// Emit: element-wise binary op C() = A() op B()
+    fn emitArrayBinaryOp(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, elem_qbe_type: []const u8, elem_arith_type: []const u8, elem_load_op: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
+        _ = elem_qbe_type;
+        _ = elem_bt;
+        var left_name: []const u8 = "";
+        var right_name: []const u8 = "";
+        var op: Tag = .plus;
+
+        switch (lt.value.data) {
+            .binary => |bin| {
+                left_name = switch (bin.left.data) {
+                    .array_access => |aa| aa.name,
+                    .variable => |v| v.name,
+                    else => return,
+                };
+                right_name = switch (bin.right.data) {
+                    .array_access => |aa| aa.name,
+                    .variable => |v| v.name,
+                    else => return,
+                };
+                op = bin.op;
+            },
+            .array_binop => |ab| {
+                left_name = switch (ab.left_array.data) {
+                    .array_access => |aa| aa.name,
+                    .variable => |v| v.name,
+                    else => return,
+                };
+                right_name = switch (ab.right_expr.data) {
+                    .array_access => |aa| aa.name,
+                    .variable => |v| v.name,
+                    else => return,
+                };
+                op = switch (ab.operation) {
+                    .add, .add_scalar => .plus,
+                    .subtract, .sub_scalar => .minus,
+                    .multiply, .mul_scalar => Tag.multiply,
+                };
+            },
+            else => return,
+        }
+
+        const op_str: []const u8 = switch (op) {
+            .plus => "+",
+            .minus => "-",
+            .multiply => "*",
+            .divide => "/",
+            else => "?",
+        };
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array binop: {s}() = {s}() {s} {s}()", .{ lt.variable, left_name, op_str, right_name }));
+
+        // Get source array data pointers
+        const left_desc_name = try self.symbol_mapper.arrayDescName(left_name);
+        const left_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ left_desc, left_desc_name });
+        const left_data = try self.builder.newTemp();
+        try self.builder.emitLoad(left_data, "l", left_desc);
+
+        const right_desc_name = try self.symbol_mapper.arrayDescName(right_name);
+        const right_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ right_desc, right_desc_name });
+        const right_data = try self.builder.newTemp();
+        try self.builder.emitLoad(right_data, "l", right_desc);
+
+        const arith_instr = self.arrayArithInstr(op, is_float);
+
+        try self.emitScalarLoopBinop(target_data, left_data, right_data, num_elements, elem_size, elem_arith_type, elem_load_op, elem_store_op, arith_instr);
+    }
+
+    /// Emit: scalar broadcast B() = A() op scalar  or  B() = scalar op A()
+    fn emitArrayBroadcast(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, elem_arith_type: []const u8, elem_load_op: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool, is_left_scalar: bool) EmitError!void {
+        var arr_expr: *const ast.Expression = undefined;
+        var scalar_expr: *const ast.Expression = undefined;
+        var op: Tag = .plus;
+
+        switch (lt.value.data) {
+            .binary => |bin| {
+                op = bin.op;
+                if (is_left_scalar) {
+                    scalar_expr = bin.left;
+                    arr_expr = bin.right;
+                } else {
+                    arr_expr = bin.left;
+                    scalar_expr = bin.right;
+                }
+            },
+            else => return,
+        }
+
+        const arr_name = switch (arr_expr.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+
+        const op_str: []const u8 = switch (op) {
+            .plus => "+",
+            .minus => "-",
+            .multiply => "*",
+            .divide => "/",
+            else => "?",
+        };
+        if (is_left_scalar) {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array broadcast: {s}() = scalar {s} {s}()", .{ lt.variable, op_str, arr_name }));
+        } else {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array broadcast: {s}() = {s}() {s} scalar", .{ lt.variable, arr_name, op_str }));
+        }
+
+        // Get source array data pointer
+        const arr_desc_name = try self.symbol_mapper.arrayDescName(arr_name);
+        const arr_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ arr_desc, arr_desc_name });
+        const arr_data = try self.builder.newTemp();
+        try self.builder.emitLoad(arr_data, "l", arr_desc);
+
+        // Evaluate scalar value
+        const raw_scalar = try self.expr_emitter.emitExpression(scalar_expr);
+        const scalar_type = self.expr_emitter.inferExprType(scalar_expr);
+        const scalar_val_raw = try self.convertToElemType(raw_scalar, scalar_type, elem_bt, elem_arith_type, is_float);
+
+        // For SINGLE arrays: scalar is converted to 's', but arithmetic needs 'd'
+        const needs_scalar_ext = (elem_bt == .single);
+        const scalar_val = if (needs_scalar_ext) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, scalar_val_raw });
+            break :blk ext;
+        } else scalar_val_raw;
+
+        const arith_instr = self.arrayArithInstr(op, is_float);
+
+        try self.emitScalarLoopBroadcast(target_data, arr_data, scalar_val, num_elements, elem_size, elem_arith_type, elem_load_op, elem_store_op, arith_instr, is_left_scalar);
+    }
+
+    /// Emit an element-wise unary function loop: B() = ABS(A()) or B() = SQR(A())
+    fn emitArrayUnaryFunc(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, elem_arith_type: []const u8, elem_load_op: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
+        // Extract function name and source array name from RHS
+        const fc = switch (lt.value.data) {
+            .function_call => |f| f,
+            else => return,
+        };
+        var fu_buf: [64]u8 = undefined;
+        const fu_len = @min(fc.name.len, fu_buf.len);
+        for (0..fu_len) |i| fu_buf[i] = std.ascii.toUpper(fc.name[i]);
+        const func_upper = fu_buf[0..fu_len];
+        const is_abs = std.mem.eql(u8, func_upper, "ABS");
+        const is_sqr = std.mem.eql(u8, func_upper, "SQR");
+        _ = is_sqr;
+
+        const src_expr = fc.arguments[0];
+        const src_name = switch (src_expr.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array expression: {s}() = {s}({s}())", .{ lt.variable, func_upper, src_name }));
+
+        // Get source array data pointer
+        const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
+        const src_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ src_desc, src_desc_name });
+        const src_data = try self.builder.newTemp();
+        try self.builder.emitLoad(src_data, "l", src_desc);
+
+        // Emit scalar loop
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_loop_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_body_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_done_{d}", .{id});
+
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, num_elements });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        const byte_off = try self.builder.newTemp();
+        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
+
+        const needs_promote = (elem_bt == .single);
+
+        // Load source element
+        const src_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(src_ptr, "l", "add", src_data, byte_off);
+        const src_val_raw = try self.builder.newTemp();
+        if (needs_promote) {
+            try self.builder.emit("    {s} =s {s} {s}\n", .{ src_val_raw, elem_load_op, src_ptr });
+        } else {
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ src_val_raw, elem_arith_type, elem_load_op, src_ptr });
+        }
+        const src_val = if (needs_promote) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, src_val_raw });
+            break :blk ext;
+        } else src_val_raw;
+
+        // Apply function
+        var result_val: []const u8 = undefined;
+        if (is_abs) {
+            if (is_float) {
+                // Float ABS: call fabs
+                const arith_t = if (needs_promote) "d" else elem_arith_type;
+                result_val = try self.builder.newTemp();
+                try self.builder.emitCall(result_val, arith_t, "fabs", try std.fmt.allocPrint(self.allocator, "d {s}", .{src_val}));
+            } else {
+                // Integer ABS: (x ^ (x >> 31)) - (x >> 31)
+                const mask = try self.builder.newTemp();
+                try self.builder.emitBinary(mask, elem_arith_type, "sar", src_val, "31");
+                const xored = try self.builder.newTemp();
+                try self.builder.emitBinary(xored, elem_arith_type, "xor", src_val, mask);
+                result_val = try self.builder.newTemp();
+                try self.builder.emitBinary(result_val, elem_arith_type, "sub", xored, mask);
+            }
+        } else {
+            // SQR: call sqrt (always double)
+            if (is_float) {
+                const dval = if (needs_promote) src_val else src_val;
+                result_val = try self.builder.newTemp();
+                try self.builder.emitCall(result_val, "d", "sqrt", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+            } else {
+                // Integer SQR: convert to double, sqrt, convert back
+                const dval = try self.builder.newTemp();
+                try self.builder.emitConvert(dval, "d", "swtof", src_val);
+                result_val = try self.builder.newTemp();
+                try self.builder.emitCall(result_val, "d", "sqrt", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+                const ival = try self.builder.newTemp();
+                try self.builder.emitConvert(ival, "w", "dtosi", result_val);
+                result_val = ival;
+            }
+        }
+
+        // Store result (truncate back to SINGLE if needed)
+        const store_val = if (needs_promote and is_float) blk: {
+            const tr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =s truncd {s}\n", .{ tr, result_val });
+            break :blk tr;
+        } else result_val;
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, byte_off);
+        try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, store_val, dst_ptr });
+
+        // Increment
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "1");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
+    /// Convert a value to the element type of the target array.
+    /// `from_et` is the ExprType returned by inferExprType (double/integer/string).
+    /// Emit a compound FMA loop: D() = A() + B() * C()
+    /// All four arrays must have matching element types.
+    fn emitCompoundFMA(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, elem_arith_type: []const u8, elem_load_op: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
+        // Decompose: value = addend + mulL * mulR  OR  value = mulL * mulR + addend
+        var addend_expr: *const ast.Expression = undefined;
+        var mul_left_expr: *const ast.Expression = undefined;
+        var mul_right_expr: *const ast.Expression = undefined;
+
+        switch (lt.value.data) {
+            .binary => |bin| {
+                // bin.op is .plus (guaranteed by classifier)
+                if (bin.right.data == .binary) {
+                    const rbin = bin.right.data.binary;
+                    if (rbin.op == .multiply and self.isWholeArrayExpr(rbin.left) and self.isWholeArrayExpr(rbin.right)) {
+                        addend_expr = bin.left;
+                        mul_left_expr = rbin.left;
+                        mul_right_expr = rbin.right;
+                    } else {
+                        // left is mul
+                        const lbin = bin.left.data.binary;
+                        addend_expr = bin.right;
+                        mul_left_expr = lbin.left;
+                        mul_right_expr = lbin.right;
+                    }
+                } else {
+                    const lbin = bin.left.data.binary;
+                    addend_expr = bin.right;
+                    mul_left_expr = lbin.left;
+                    mul_right_expr = lbin.right;
+                }
+            },
+            else => return,
+        }
+
+        const addend_name = switch (addend_expr.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+        const mul_l_name = switch (mul_left_expr.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+        const mul_r_name = switch (mul_right_expr.data) {
+            .array_access => |aa| aa.name,
+            .variable => |v| v.name,
+            else => return,
+        };
+
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array expression (FMA): {s}() = {s}() + {s}() * {s}()", .{ lt.variable, addend_name, mul_l_name, mul_r_name }));
+
+        // Get source array data pointers
+        const add_desc_name = try self.symbol_mapper.arrayDescName(addend_name);
+        const add_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ add_desc, add_desc_name });
+        const add_data = try self.builder.newTemp();
+        try self.builder.emitLoad(add_data, "l", add_desc);
+
+        const ml_desc_name = try self.symbol_mapper.arrayDescName(mul_l_name);
+        const ml_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ ml_desc, ml_desc_name });
+        const ml_data = try self.builder.newTemp();
+        try self.builder.emitLoad(ml_data, "l", ml_desc);
+
+        const mr_desc_name = try self.symbol_mapper.arrayDescName(mul_r_name);
+        const mr_desc = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ mr_desc, mr_desc_name });
+        const mr_data = try self.builder.newTemp();
+        try self.builder.emitLoad(mr_data, "l", mr_desc);
+
+        // Emit scalar FMA loop
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_loop_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_body_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_done_{d}", .{id});
+
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, num_elements });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        const byte_off = try self.builder.newTemp();
+        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
+
+        // Determine if we need SINGLE→DOUBLE promotion for arithmetic
+        const needs_promote = (elem_bt == .single);
+
+        // Load addend[i]
+        const add_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(add_ptr, "l", "add", add_data, byte_off);
+        const add_val_raw = try self.builder.newTemp();
+        if (needs_promote) {
+            try self.builder.emit("    {s} =s {s} {s}\n", .{ add_val_raw, elem_load_op, add_ptr });
+        } else {
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ add_val_raw, elem_arith_type, elem_load_op, add_ptr });
+        }
+        const add_val = if (needs_promote) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, add_val_raw });
+            break :blk ext;
+        } else add_val_raw;
+
+        // Load mulL[i]
+        const ml_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(ml_ptr, "l", "add", ml_data, byte_off);
+        const ml_val_raw = try self.builder.newTemp();
+        if (needs_promote) {
+            try self.builder.emit("    {s} =s {s} {s}\n", .{ ml_val_raw, elem_load_op, ml_ptr });
+        } else {
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ ml_val_raw, elem_arith_type, elem_load_op, ml_ptr });
+        }
+        const ml_val = if (needs_promote) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, ml_val_raw });
+            break :blk ext;
+        } else ml_val_raw;
+
+        // Load mulR[i]
+        const mr_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(mr_ptr, "l", "add", mr_data, byte_off);
+        const mr_val_raw = try self.builder.newTemp();
+        if (needs_promote) {
+            try self.builder.emit("    {s} =s {s} {s}\n", .{ mr_val_raw, elem_load_op, mr_ptr });
+        } else {
+            try self.builder.emit("    {s} ={s} {s} {s}\n", .{ mr_val_raw, elem_arith_type, elem_load_op, mr_ptr });
+        }
+        const mr_val = if (needs_promote) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, mr_val_raw });
+            break :blk ext;
+        } else mr_val_raw;
+
+        // Compute product = mulL[i] * mulR[i]
+        const mul_instr: []const u8 = if (is_float) "mul" else "mul";
+        const product = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}, {s}\n", .{ product, elem_arith_type, mul_instr, ml_val, mr_val });
+
+        // Compute result = addend[i] + product
+        const add_instr: []const u8 = if (is_float) "add" else "add";
+        const result_val = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}, {s}\n", .{ result_val, elem_arith_type, add_instr, add_val, product });
+
+        // Store result (truncate back to SINGLE if needed)
+        const store_val = if (needs_promote) blk: {
+            const tr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =s truncd {s}\n", .{ tr, result_val });
+            break :blk tr;
+        } else result_val;
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, byte_off);
+        try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, store_val, dst_ptr });
+
+        // Increment
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "1");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
+    fn convertToElemType(self: *BlockEmitter, val: []const u8, from_et: ExprEmitter.ExprType, to_bt: semantic.BaseType, to_arith_type: []const u8, to_is_float: bool) EmitError![]const u8 {
+        // Map ExprType to a simplified source category
+        const from_is_float = (from_et == .double);
+        const from_is_int = (from_et == .integer);
+
+        // If source and target categories match, often no conversion needed
+        if (from_is_float and to_bt == .double) return val;
+        if (from_is_int and to_bt == .integer) return val;
+
+        const dest = try self.builder.newTemp();
+
+        // double -> single (truncate)
+        if (from_is_float and to_bt == .single) {
+            try self.builder.emit("    {s} =s truncd {s}\n", .{ dest, val });
+            return dest;
+        }
+
+        // double -> integer types (dtosi)
+        if (from_is_float and !to_is_float) {
+            try self.builder.emit("    {s} ={s} dtosi {s}\n", .{ dest, to_arith_type, val });
+            return dest;
+        }
+
+        // integer -> float types (swtof)
+        if (from_is_int and to_is_float) {
+            if (to_bt == .single) {
+                try self.builder.emit("    {s} =s swtof {s}\n", .{ dest, val });
+            } else {
+                try self.builder.emit("    {s} =d swtof {s}\n", .{ dest, val });
+            }
+            return dest;
+        }
+
+        // integer -> long (extsw)
+        if (from_is_int and (to_bt == .long or to_bt == .ulong)) {
+            try self.builder.emit("    {s} =l extsw {s}\n", .{ dest, val });
+            return dest;
+        }
+
+        // Default: copy with target type
+        try self.builder.emit("    {s} ={s} copy {s}\n", .{ dest, to_arith_type, val });
+        return dest;
+    }
+
+    const LoopOp = enum {
+        fill,
+        negate,
+    };
+
+    /// Emit a scalar element-by-element loop for fill/negate operations.
+    fn emitScalarLoop(
+        self: *BlockEmitter,
+        target_data: []const u8,
+        num_elements: []const u8,
+        elem_size: u32,
+        elem_arith_type: []const u8,
+        elem_store_op: []const u8,
+        fill_val: ?[]const u8,
+        src_data: ?[]const u8,
+        elem_load_op: ?[]const u8,
+        zero_val: ?[]const u8,
+        op: LoopOp,
+        needs_trunc: bool,
+    ) EmitError!void {
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_loop_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_body_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_done_{d}", .{id});
+
+        // Loop counter (element index)
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, num_elements });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        // Compute byte offset = cur_idx * elem_size
+        const byte_off = try self.builder.newTemp();
+        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
+
+        // Target element pointer
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, byte_off);
+
+        switch (op) {
+            .fill => {
+                // Store fill value
+                try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, fill_val.?, dst_ptr });
+            },
+            .negate => {
+                // Load source element, negate (0 - val), store
+                const src_ptr = try self.builder.newTemp();
+                try self.builder.emitBinary(src_ptr, "l", "add", src_data.?, byte_off);
+                const src_val_raw = try self.builder.newTemp();
+                const load_result_type_neg: []const u8 = if (needs_trunc) "s" else elem_arith_type;
+                try self.builder.emit("    {s} ={s} {s} {s}\n", .{ src_val_raw, load_result_type_neg, elem_load_op.?, src_ptr });
+                // For SINGLE: extend to DOUBLE for arithmetic
+                const src_val = if (needs_trunc) blk: {
+                    const ext = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =d exts {s}\n", .{ ext, src_val_raw });
+                    break :blk ext;
+                } else src_val_raw;
+                const neg_val = try self.builder.newTemp();
+                try self.builder.emit("    {s} ={s} sub {s}, {s}\n", .{ neg_val, elem_arith_type, zero_val.?, src_val });
+                // For SINGLE: truncate back
+                const store_val = if (needs_trunc) blk: {
+                    const tr = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =s truncd {s}\n", .{ tr, neg_val });
+                    break :blk tr;
+                } else neg_val;
+                try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, store_val, dst_ptr });
+            },
+        }
+
+        // Increment index
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "1");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
+    /// Emit a scalar loop for element-wise binary ops: C[i] = A[i] op B[i]
+    fn emitScalarLoopBinop(
+        self: *BlockEmitter,
+        target_data: []const u8,
+        left_data: []const u8,
+        right_data: []const u8,
+        num_elements: []const u8,
+        elem_size: u32,
+        elem_arith_type: []const u8,
+        elem_load_op: []const u8,
+        elem_store_op: []const u8,
+        arith_instr: []const u8,
+    ) EmitError!void {
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_loop_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_body_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_done_{d}", .{id});
+
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, num_elements });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        const byte_off = try self.builder.newTemp();
+        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
+
+        // Determine if we need SINGLE→DOUBLE promotion
+        const needs_trunc = (std.mem.eql(u8, elem_store_op, "stores"));
+        // For SINGLE: loads returns 's', not 'd'
+        const load_result_type: []const u8 = if (needs_trunc) "s" else elem_arith_type;
+
+        // Load left element
+        const left_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(left_ptr, "l", "add", left_data, byte_off);
+        const left_val_raw = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}\n", .{ left_val_raw, load_result_type, elem_load_op, left_ptr });
+        // For SINGLE: loads returns 's', extend to 'd' for arithmetic
+        const left_val = if (needs_trunc) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, left_val_raw });
+            break :blk ext;
+        } else left_val_raw;
+
+        // Load right element
+        const right_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(right_ptr, "l", "add", right_data, byte_off);
+        const right_val_raw = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}\n", .{ right_val_raw, load_result_type, elem_load_op, right_ptr });
+        const right_val = if (needs_trunc) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, right_val_raw });
+            break :blk ext;
+        } else right_val_raw;
+
+        // Compute result
+        const result_val = try self.builder.newTemp();
+        try self.builder.emit("    {s} ={s} {s} {s}, {s}\n", .{ result_val, elem_arith_type, arith_instr, left_val, right_val });
+
+        // Store result (truncate back to SINGLE if needed)
+        const store_val = if (needs_trunc) blk: {
+            const tr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =s truncd {s}\n", .{ tr, result_val });
+            break :blk tr;
+        } else result_val;
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, byte_off);
+        try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, store_val, dst_ptr });
+
+        // Increment
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "1");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
+    /// Emit a scalar loop for broadcast ops: C[i] = A[i] op scalar  or  C[i] = scalar op A[i]
+    fn emitScalarLoopBroadcast(
+        self: *BlockEmitter,
+        target_data: []const u8,
+        arr_data: []const u8,
+        scalar_val: []const u8,
+        num_elements: []const u8,
+        elem_size: u32,
+        elem_arith_type: []const u8,
+        elem_load_op: []const u8,
+        elem_store_op: []const u8,
+        arith_instr: []const u8,
+        is_left_scalar: bool,
+    ) EmitError!void {
+        const id = self.builder.nextLabelId();
+        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_loop_{d}", .{id});
+        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_body_{d}", .{id});
+        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_done_{d}", .{id});
+
+        const idx_slot = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
+        try self.builder.emit("    storel 0, {s}\n", .{idx_slot});
+
+        try self.builder.emitJump(loop_lbl);
+        try self.builder.emitLabel(loop_lbl);
+
+        const cur_idx = try self.builder.newTemp();
+        try self.builder.emitLoad(cur_idx, "l", idx_slot);
+        const cmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w csltl {s}, {s}\n", .{ cmp, cur_idx, num_elements });
+        try self.builder.emitBranch(cmp, body_lbl, done_lbl);
+
+        try self.builder.emitLabel(body_lbl);
+
+        const byte_off = try self.builder.newTemp();
+        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
+
+        // Determine if we need SINGLE→DOUBLE promotion
+        const needs_trunc = (std.mem.eql(u8, elem_store_op, "stores"));
+
+        // Load array element
+        const arr_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(arr_ptr, "l", "add", arr_data, byte_off);
+        const arr_val_raw = try self.builder.newTemp();
+        const needs_trunc_bc = (std.mem.eql(u8, elem_store_op, "stores"));
+        const load_result_type_bc: []const u8 = if (needs_trunc_bc) "s" else elem_arith_type;
+        try self.builder.emit("    {s} ={s} {s} {s}\n", .{ arr_val_raw, load_result_type_bc, elem_load_op, arr_ptr });
+        // For SINGLE: extend to DOUBLE for arithmetic
+        const arr_val = if (needs_trunc) blk: {
+            const ext = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d exts {s}\n", .{ ext, arr_val_raw });
+            break :blk ext;
+        } else arr_val_raw;
+
+        // Compute result with correct operand order
+        const result_val = try self.builder.newTemp();
+        if (is_left_scalar) {
+            try self.builder.emit("    {s} ={s} {s} {s}, {s}\n", .{ result_val, elem_arith_type, arith_instr, scalar_val, arr_val });
+        } else {
+            try self.builder.emit("    {s} ={s} {s} {s}, {s}\n", .{ result_val, elem_arith_type, arith_instr, arr_val, scalar_val });
+        }
+
+        // Store result (truncate back to SINGLE if needed)
+        const store_val = if (needs_trunc) blk: {
+            const tr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =s truncd {s}\n", .{ tr, result_val });
+            break :blk tr;
+        } else result_val;
+        const dst_ptr = try self.builder.newTemp();
+        try self.builder.emitBinary(dst_ptr, "l", "add", target_data, byte_off);
+        try self.builder.emit("    {s} {s}, {s}\n", .{ elem_store_op, store_val, dst_ptr });
+
+        // Increment
+        const next_idx = try self.builder.newTemp();
+        try self.builder.emitBinary(next_idx, "l", "add", cur_idx, "1");
+        try self.builder.emit("    storel {s}, {s}\n", .{ next_idx, idx_slot });
+        try self.builder.emitJump(loop_lbl);
+
+        try self.builder.emitLabel(done_lbl);
+    }
+
     // ── Leaf Statement Emitters ─────────────────────────────────────────
 
     fn emitPrintStatement(self: *BlockEmitter, pr: *const ast.PrintStmt) EmitError!void {
@@ -5297,6 +7057,65 @@ pub const BlockEmitter = struct {
     }
 
     fn emitLetStatement(self: *BlockEmitter, lt: *const ast.LetStmt) EmitError!void {
+        // ── List subscript assignment: myList(n) = value → list_set_* ──
+        if (lt.indices.len > 0 and lt.member_chain.len == 0 and self.expr_emitter.isListVariable(lt.variable)) {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LIST subscript assign: {s}(...) = ...", .{lt.variable}));
+
+            // Load the list pointer
+            const var_name = try self.symbol_mapper.globalVarName(lt.variable, null);
+            const list_ptr = try self.builder.newTemp();
+            try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+
+            // Evaluate the index expression
+            const idx_val = try self.expr_emitter.emitExpression(lt.indices[0]);
+            const idx_type = self.expr_emitter.inferExprType(lt.indices[0]);
+            const idx_l = if (idx_type == .integer) blk: {
+                const ext = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, idx_val });
+                break :blk ext;
+            } else if (idx_type == .double) blk: {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "w", "dtosi", idx_val);
+                const ext = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, cvt });
+                break :blk ext;
+            } else idx_val;
+
+            // Evaluate the value expression
+            const val = try self.expr_emitter.emitExpression(lt.value);
+            const elt = self.expr_emitter.listElementType(lt.variable);
+
+            if (elt.isString()) {
+                try self.builder.emitCall("", "", "list_set_ptr", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val }));
+            } else if (elt.isFloat() or elt == .single) {
+                try self.builder.emitCall("", "", "list_set_float", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, d {s}", .{ list_ptr, idx_l, val }));
+            } else {
+                // Integer: extend to long for list_set_int
+                const val_l = if (self.expr_emitter.inferExprType(lt.value) == .integer) blk: {
+                    const ext = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, val });
+                    break :blk ext;
+                } else val;
+                try self.builder.emitCall("", "", "list_set_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val_l }));
+            }
+            return;
+        }
+
+        // ── Whole-array expression interception ─────────────────────────
+        // Detect C() = ... where C is a known array and indices are empty.
+        // Handle element-wise ops, copy, fill, negate, scalar broadcast.
+        if (lt.member_chain.len == 0 and lt.indices.len == 0) {
+            var wa_buf: [128]u8 = undefined;
+            const wa_base = SymbolMapper.stripSuffix(lt.variable);
+            const wa_len = @min(wa_base.len, wa_buf.len);
+            for (0..wa_len) |wi| wa_buf[wi] = std.ascii.toUpper(wa_base[wi]);
+            if (self.symbol_table.lookupArray(wa_buf[0..wa_len])) |arr_sym| {
+                if (try self.emitWholeArrayAssignment(lt, arr_sym)) {
+                    return;
+                }
+            }
+        }
+
         // ── UDT arithmetic interception ─────────────────────────────────
         // Before evaluating the RHS expression, check if this is a UDT
         // binary arithmetic assignment (C = A + B where A, B, C are UDTs).
@@ -5419,6 +7238,38 @@ pub const BlockEmitter = struct {
                 const udt_type_name: ?[]const u8 = blk: {
                     if (self.symbol_table.lookupVariable(vlu_upper)) |vsym| {
                         if (vsym.type_desc.udt_name.len > 0) break :blk vsym.type_desc.udt_name;
+                    }
+                    // Check function-scoped local variables (FUNCNAME.VARNAME)
+                    if (self.func_ctx) |fctx| {
+                        var scoped_buf3: [256]u8 = undefined;
+                        const scoped3 = std.fmt.bufPrint(&scoped_buf3, "{s}.{s}", .{ fctx.upper_name, vlu_upper }) catch null;
+                        if (scoped3) |sk3| {
+                            if (self.symbol_table.lookupVariable(sk3)) |vsym| {
+                                if (vsym.type_desc.base_type == .user_defined and vsym.type_desc.udt_name.len > 0) {
+                                    break :blk vsym.type_desc.udt_name;
+                                }
+                            }
+                        }
+                        // Check function parameter type descriptors
+                        var fn_ub3: [128]u8 = undefined;
+                        const fn_l3 = @min(fctx.func_name.len, fn_ub3.len);
+                        for (0..fn_l3) |fi| fn_ub3[fi] = std.ascii.toUpper(fctx.func_name[fi]);
+                        if (self.symbol_table.lookupFunction(fn_ub3[0..fn_l3])) |fsym| {
+                            for (fsym.parameters, 0..) |param, pi| {
+                                const p_base = SymbolMapper.stripSuffix(param);
+                                var pu_b3: [128]u8 = undefined;
+                                const pu_l3 = @min(p_base.len, pu_b3.len);
+                                for (0..pu_l3) |pj| pu_b3[pj] = std.ascii.toUpper(p_base[pj]);
+                                if (pu_l3 == vlu_len and std.mem.eql(u8, pu_b3[0..pu_l3], vlu_upper)) {
+                                    if (pi < fsym.parameter_type_descs.len) {
+                                        const pd = fsym.parameter_type_descs[pi];
+                                        if (pd.base_type == .user_defined and pd.udt_name.len > 0) {
+                                            break :blk pd.udt_name;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                     break :blk null;
                 };
@@ -5760,17 +7611,36 @@ pub const BlockEmitter = struct {
                 }
             }
 
-            // ── UDT member chain store (original behavior) ─────────────
-            // For UDT variables stored inline, we need the ADDRESS of the
-            // variable, not its loaded content.  Use `copy` instead of `loadl`.
-            const var_name = try self.symbol_mapper.globalVarName(lt.variable, lt.type_suffix);
+            // ── UDT member chain store ─────────────────────────────────
+            // Check func_ctx first for params/locals, then fall back to global.
             const base_addr = try self.builder.newTemp();
+            var used_func_ctx_for_store = false;
 
-            // UDT variables store a POINTER to the struct in their
-            // global slot (allocated by CREATE).  Load the pointer
-            // with loadl so we get the actual struct address for
-            // field offset calculations.
-            try self.builder.emitLoad(base_addr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            if (self.func_ctx) |fctx| {
+                var mc_upper_buf: [128]u8 = undefined;
+                const mc_base = SymbolMapper.stripSuffix(lt.variable);
+                const mc_ulen = @min(mc_base.len, mc_upper_buf.len);
+                for (0..mc_ulen) |mi| mc_upper_buf[mi] = std.ascii.toUpper(mc_base[mi]);
+                const mc_upper = mc_upper_buf[0..mc_ulen];
+
+                if (fctx.resolve(mc_upper)) |rv| {
+                    if (rv.base_type == .user_defined) {
+                        // UDT param/local: stack slot stores a POINTER to UDT.
+                        // Load the pointer from the stack slot.
+                        try self.builder.emitLoad(base_addr, "l", rv.addr);
+                        used_func_ctx_for_store = true;
+                    }
+                }
+            }
+
+            if (!used_func_ctx_for_store) {
+                const var_name = try self.symbol_mapper.globalVarName(lt.variable, lt.type_suffix);
+                // UDT variables store a POINTER to the struct in their
+                // global slot (allocated by CREATE).  Load the pointer
+                // with loadl so we get the actual struct address for
+                // field offset calculations.
+                try self.builder.emitLoad(base_addr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            }
 
             // Walk the member chain to compute the final field address.
             var current_addr = base_addr;
@@ -5790,6 +7660,38 @@ pub const BlockEmitter = struct {
                 if (self.symbol_table.lookupVariable(vlu2_upper)) |vsym| {
                     if (vsym.type_desc.base_type == .user_defined) {
                         break :blk vsym.type_desc.udt_name;
+                    }
+                }
+                // Check function parameters for UDT type name
+                if (self.func_ctx) |fctx| {
+                    var fn_ub: [128]u8 = undefined;
+                    const fn_l = @min(fctx.func_name.len, fn_ub.len);
+                    for (0..fn_l) |fi| fn_ub[fi] = std.ascii.toUpper(fctx.func_name[fi]);
+                    if (self.symbol_table.lookupFunction(fn_ub[0..fn_l])) |fsym| {
+                        for (fsym.parameters, 0..) |param, pi| {
+                            const p_base = SymbolMapper.stripSuffix(param);
+                            var pu_b: [128]u8 = undefined;
+                            const pu_l = @min(p_base.len, pu_b.len);
+                            for (0..pu_l) |pj| pu_b[pj] = std.ascii.toUpper(p_base[pj]);
+                            if (pu_l == vlu2_len and std.mem.eql(u8, pu_b[0..pu_l], vlu2_upper)) {
+                                if (pi < fsym.parameter_type_descs.len) {
+                                    const pd = fsym.parameter_type_descs[pi];
+                                    if (pd.base_type == .user_defined and pd.udt_name.len > 0) {
+                                        break :blk pd.udt_name;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Check function-scoped local variables (FUNCNAME.VARNAME)
+                    var scoped_buf2: [256]u8 = undefined;
+                    const scoped2 = std.fmt.bufPrint(&scoped_buf2, "{s}.{s}", .{ fctx.upper_name, vlu2_upper }) catch null;
+                    if (scoped2) |sk2| {
+                        if (self.symbol_table.lookupVariable(sk2)) |vsym| {
+                            if (vsym.type_desc.base_type == .user_defined and vsym.type_desc.udt_name.len > 0) {
+                                break :blk vsym.type_desc.udt_name;
+                            }
+                        }
                     }
                 }
                 break :blk null;
@@ -6189,6 +8091,37 @@ pub const BlockEmitter = struct {
         });
     }
 
+    fn emitEraseStatement(self: *BlockEmitter, er: *const ast.EraseStmt) EmitError!void {
+        for (er.array_names) |arr_name| {
+            // Check if this is a LIST variable
+            if (self.expr_emitter.isListVariable(arr_name)) {
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ERASE LIST: {s}", .{arr_name}));
+                // Load the list pointer
+                const var_name = try self.symbol_mapper.globalVarName(arr_name, null);
+                const list_ptr = try self.builder.newTemp();
+                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                // Call list_clear to empty the list
+                try self.builder.emitCall("", "", "list_clear", try std.fmt.allocPrint(self.allocator, "l {s}", .{list_ptr}));
+            } else {
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ERASE array: {s}", .{arr_name}));
+                const desc_name = try self.symbol_mapper.arrayDescName(arr_name);
+                const desc_addr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
+                try self.builder.emitCall("", "", "array_descriptor_erase", try std.fmt.allocPrint(self.allocator, "l {s}", .{desc_addr}));
+            }
+        }
+    }
+
+    fn emitSharedStatement(self: *BlockEmitter, sh_stmt: *const ast.SharedStmt) EmitError!void {
+        // SHARED declarations make global variables accessible inside a
+        // function by name.  We register them so that resolveVarAddr
+        // skips the function context and falls through to the global.
+        for (sh_stmt.variables) |sv| {
+            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "SHARED {s}", .{sv.name}));
+            try self.symbol_mapper.registerShared(sv.name);
+        }
+    }
+
     fn emitCallStatement(self: *BlockEmitter, cs: *const ast.CallStmt) EmitError!void {
         // If this is a method-call statement (e.g. dict.CLEAR(), list.APPEND(x)),
         // evaluate the method call expression for its side effects and discard
@@ -6198,9 +8131,65 @@ pub const BlockEmitter = struct {
             return;
         }
 
+        // Look up the SUB in the symbol table for declared parameter types.
+        // This is needed so that UDT/class parameters are passed as "l"
+        // (pointer) instead of "d" (double), matching the function signature.
+        var sub_upper_buf: [128]u8 = undefined;
+        const sub_base = SymbolMapper.stripSuffix(cs.sub_name);
+        const sub_ulen = @min(sub_base.len, sub_upper_buf.len);
+        for (0..sub_ulen) |ui| sub_upper_buf[ui] = std.ascii.toUpper(sub_base[ui]);
+        const sub_upper = sub_upper_buf[0..sub_ulen];
+        const sub_sym = self.symbol_table.lookupFunction(sub_upper);
+
         var args_buf: std.ArrayList(u8) = .empty;
         defer args_buf.deinit(self.allocator);
 
+        // When declared parameter types are available, use them to emit
+        // correctly typed arguments (especially for UDT/class pointers).
+        if (sub_sym) |ssym| {
+            if (ssym.parameter_type_descs.len > 0) {
+                for (cs.arguments, 0..) |arg, i| {
+                    if (i > 0) try args_buf.appendSlice(self.allocator, ", ");
+                    const arg_val = try self.expr_emitter.emitExpression(arg);
+                    const declared_type: []const u8 = if (i < ssym.parameter_type_descs.len)
+                        ssym.parameter_type_descs[i].toQBEType()
+                    else
+                        self.expr_emitter.inferExprType(arg).argLetter();
+
+                    // Convert if needed: inferred type differs from declared type.
+                    const expr_et = self.expr_emitter.inferExprType(arg);
+                    var effective_arg = arg_val;
+                    if (std.mem.eql(u8, declared_type, "w") and expr_et == .double) {
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "w", "dtosi", arg_val);
+                        effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "d") and expr_et == .integer) {
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
+                        effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "l") and expr_et == .integer) {
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitExtend(cvt, "l", "extsw", arg_val);
+                        effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "s") and expr_et == .double) {
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "s", "truncd", arg_val);
+                        effective_arg = cvt;
+                    } else if (std.mem.eql(u8, declared_type, "s") and expr_et == .integer) {
+                        const cvt = try self.builder.newTemp();
+                        try self.builder.emitConvert(cvt, "s", "swtof", arg_val);
+                        effective_arg = cvt;
+                    }
+                    try std.fmt.format(args_buf.writer(self.allocator), "{s} {s}", .{ declared_type, effective_arg });
+                }
+
+                const mangled = try self.symbol_mapper.subName(cs.sub_name);
+                try self.builder.emitCall("", "", mangled, args_buf.items);
+                return;
+            }
+        }
+
+        // Fallback: no symbol table info, use inferred argument types.
         for (cs.arguments, 0..) |arg, i| {
             if (i > 0) try args_buf.appendSlice(self.allocator, ", ");
             const arg_val = try self.expr_emitter.emitExpression(arg);
@@ -6326,6 +8315,7 @@ pub const BlockEmitter = struct {
         for (loc_stmt.variables) |lv| {
             // Determine base type: prefer AS keyword if present, then
             // fall back to type suffix.
+            const local_as_type_name: []const u8 = if (lv.has_as_type) lv.as_type_name else "";
             const bt: semantic.BaseType = if (lv.has_as_type and lv.as_type_name.len > 0) blk: {
                 // The parser stores the AS type as a string (e.g.
                 // "INTEGER", "STRING").  Convert it to a BaseType.
@@ -6344,7 +8334,16 @@ pub const BlockEmitter = struct {
             try self.builder.emitAlloc(addr, actual_size, alignment);
 
             // Zero-initialise.
-            if (bt.isNumeric()) {
+            if (bt == .user_defined and local_as_type_name.len > 0) {
+                // UDT local: allocate the struct via basic_malloc and
+                // store the pointer in the stack slot.
+                const udt_size = self.type_manager.sizeOfUDT(local_as_type_name);
+                const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
+                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LOCAL {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ lv.name, local_as_type_name, alloc_size }));
+                const udt_ptr = try self.builder.newTemp();
+                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                try self.builder.emitStore("l", udt_ptr, addr);
+            } else if (bt.isNumeric()) {
                 if (bt.isInteger()) {
                     try self.builder.emitStore(bt.toQBEMemOp(), "0", addr);
                 } else {
@@ -6375,18 +8374,25 @@ pub const BlockEmitter = struct {
                 .base_type = bt,
                 .suffix = lv.type_suffix,
             });
-        }
-    }
 
-    fn emitSharedStatement(self: *BlockEmitter, sh_stmt: *const ast.SharedStmt) EmitError!void {
-        // SHARED declarations make global variables accessible inside a
-        // function by name.  We register them so that resolveVarAddr
-        // skips the function context and falls through to the global.
-        // (Currently the fallback already does this, so we just emit a
-        // comment for documentation.)
-        for (sh_stmt.variables) |sv| {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "SHARED {s}", .{sv.name}));
-            try self.symbol_mapper.registerShared(sv.name);
+            // For UDT locals, register in the symbol table so that
+            // inferUDTName can resolve the UDT type name for member
+            // access (e.g. P.X where P is LOCAL P AS Point).
+            if (bt == .user_defined and local_as_type_name.len > 0) {
+                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                    fctx.upper_name, upper_key,
+                });
+                const mut_st: *semantic.SymbolTable = @constCast(self.symbol_table);
+                try mut_st.insertVariable(var_key, .{
+                    .name = lv.name,
+                    .type_desc = semantic.TypeDescriptor.fromUDT(local_as_type_name, self.symbol_table.getTypeId(local_as_type_name) orelse 0),
+                    .type_name = local_as_type_name,
+                    .is_declared = true,
+                    .first_use = .{},
+                    .scope = .{ .kind = .function, .name = fctx.func_name },
+                    .is_global = false,
+                });
+            }
         }
     }
 };
@@ -6614,6 +8620,25 @@ pub const CFGCodeGenerator = struct {
                         .suffix = p_suffix,
                     });
 
+                    // Register class-instance parameters in the symbol
+                    // table with a scoped key so inferClassName can resolve
+                    // the class name for method calls on them.
+                    if (p_bt == .class_instance and pt_desc.class_name.len > 0) {
+                        const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                            upper_name_stripped, param_key,
+                        });
+                        const mut_st: *semantic.SymbolTable = @constCast(st);
+                        try mut_st.insertVariable(var_key, .{
+                            .name = param,
+                            .type_desc = semantic.TypeDescriptor.fromClass(pt_desc.class_name),
+                            .type_name = pt_desc.class_name,
+                            .is_declared = true,
+                            .first_use = .{},
+                            .scope = .{ .kind = .function, .name = func_name },
+                            .is_global = false,
+                        });
+                    }
+
                     _ = actual_size;
                     _ = alignment;
                 }
@@ -6672,6 +8697,24 @@ pub const CFGCodeGenerator = struct {
                             .base_type = p_bt,
                             .suffix = p_suffix,
                         });
+
+                        // Register class-instance SUB parameters in the
+                        // symbol table so inferClassName can resolve them.
+                        if (p_bt == .class_instance and pt_desc.class_name.len > 0) {
+                            const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                                duped_upper, param_key,
+                            });
+                            const mut_st2: *semantic.SymbolTable = @constCast(st);
+                            try mut_st2.insertVariable(var_key, .{
+                                .name = param,
+                                .type_desc = semantic.TypeDescriptor.fromClass(pt_desc.class_name),
+                                .type_name = pt_desc.class_name,
+                                .is_declared = true,
+                                .first_use = .{},
+                                .scope = .{ .kind = .function, .name = func_name },
+                                .is_global = false,
+                            });
+                        }
                     }
 
                     // Build param string for the SUB signature.
@@ -6852,9 +8895,11 @@ pub const CFGCodeGenerator = struct {
 
         // Special: entry block for main function.
         if (block.kind == .entry and is_main) {
-            if (self.samm_enabled) {
-                try self.runtime.callVoid("samm_init", "");
-            }
+            // Always call samm_init — the string descriptor slab pool
+            // (g_string_desc_pool) is initialised here and is required by
+            // every string operation, even when OPTION SAMM OFF disables
+            // scope-level tracking.
+            try self.runtime.callVoid("samm_init", "");
             // Pre-allocate FOR loop temp slots in the entry block.
             try be.preAllocateForLoopSlots(the_cfg);
         }
@@ -6881,9 +8926,8 @@ pub const CFGCodeGenerator = struct {
         // Special: exit block for main function.
         if (block.kind == .exit_block and is_main) {
             try self.builder.emitComment("Program exit");
-            if (self.samm_enabled) {
-                try self.runtime.callVoid("samm_shutdown", "");
-            }
+            // Always call samm_shutdown to match the unconditional samm_init.
+            try self.runtime.callVoid("samm_shutdown", "");
             try self.builder.emitReturn("0");
             return;
         }
@@ -7314,6 +9358,28 @@ pub const CFGCodeGenerator = struct {
                 .base_type = p_bt,
                 .suffix = p_suffix,
             });
+
+            // Register class-instance METHOD parameters in the symbol
+            // table with a scoped key so inferClassName can resolve the
+            // class name for method calls on them (e.g. obj.GetID()
+            // where obj is a parameter of type Item).
+            if (p_bt == .class_instance and i < method_info.parameter_types.len and
+                method_info.parameter_types[i].class_name.len > 0)
+            {
+                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                    method_upper, param_key,
+                });
+                const mut_st: *semantic.SymbolTable = @constCast(self.semantic.getSymbolTable());
+                try mut_st.insertVariable(var_key, .{
+                    .name = param,
+                    .type_desc = semantic.TypeDescriptor.fromClass(method_info.parameter_types[i].class_name),
+                    .type_name = method_info.parameter_types[i].class_name,
+                    .is_declared = true,
+                    .first_use = .{},
+                    .scope = .{ .kind = .function, .name = method.method_name },
+                    .is_global = false,
+                });
+            }
         }
 
         // Allocate return-value slot for non-void methods
@@ -7375,6 +9441,13 @@ pub const CFGCodeGenerator = struct {
         try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "method_fallback_{d}", .{fallback_id}));
 
         if (self.samm_enabled) {
+            // Retain the returned object so it survives scope cleanup
+            if (method_ret_slot.len > 0 and std.mem.eql(u8, ret_type, "l")) {
+                const ret_ptr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l loadl {s}\n", .{ ret_ptr, method_ret_slot });
+                try self.builder.emitComment("SAMM: Retain returned object before scope exit");
+                try self.builder.emitCall("", "", "samm_retain", try std.fmt.allocPrint(self.allocator, "l {s}, w 1", .{ret_ptr}));
+            }
             try self.builder.emitComment("SAMM: Exit METHOD scope (fallback path)");
             try self.builder.emitCall("", "", "samm_exit_scope", "");
         }
@@ -7437,6 +9510,13 @@ pub const CFGCodeGenerator = struct {
                         }
                     }
                     if (self.samm_enabled) {
+                        // Retain the returned object so it survives scope cleanup
+                        if (self.block_emitter.?.method_ret_slot.len > 0 and std.mem.eql(u8, self.block_emitter.?.method_ret_type.toQBEType(), "l")) {
+                            const ret_ptr2 = try self.builder.newTemp();
+                            try self.builder.emit("    {s} =l loadl {s}\n", .{ ret_ptr2, self.block_emitter.?.method_ret_slot });
+                            try self.builder.emitComment("SAMM: Retain returned object before scope exit");
+                            try self.builder.emitCall("", "", "samm_retain", try std.fmt.allocPrint(self.allocator, "l {s}, w 1", .{ret_ptr2}));
+                        }
                         try self.builder.emitCall("", "", "samm_exit_scope", "");
                     }
                     if (self.block_emitter.?.method_ret_slot.len > 0 and self.block_emitter.?.method_ret_type.base_type != .void) {
@@ -7553,6 +9633,8 @@ pub const CFGCodeGenerator = struct {
         try self.builder.emitBlankLine();
     }
 
+    /// Emit global array descriptors, skipping LIST variables (which use
+    /// runtime list pointers, not static array descriptors).
     fn emitGlobalArrays(self: *CFGCodeGenerator) !void {
         const st = self.semantic.getSymbolTable();
         var it = st.arrays.iterator();

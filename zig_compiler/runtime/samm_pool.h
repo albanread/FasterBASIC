@@ -41,64 +41,13 @@ extern "C" {
 /* ========================================================================= */
 
 /*
- * Each slab is a single allocation: SammSlab header followed by a flexible
- * array of (slots_per_slab * slot_size) bytes.  Slabs are chained via `next`.
+ * Opaque handle to the Zig implementation of the slab pool.
  *
- * Memory layout:
- *   ┌──────────────────┬────────┬────────┬─────┬────────┐
- *   │  SammSlab header │ Slot 0 │ Slot 1 │ ... │ Slot N │
- *   │  (next, counts)  │  S B   │  S B   │     │  S B   │
- *   └──────────────────┴────────┴────────┴─────┴────────┘
- *   S = slot_size bytes per slot
+ * The actual struct is defined in runtime/samm_pool.zig as a union wrapping
+ * the generic SlabPool(S, N) type.
  */
-typedef struct SammSlab SammSlab;
+typedef struct SammSlabPool SammSlabPool;
 
-struct SammSlab {
-    SammSlab*   next;           /* Next slab in chain                       */
-    uint32_t    slot_size;      /* Bytes per slot (copied from pool)        */
-    uint32_t    slot_count;     /* Number of slots in this slab             */
-    uint32_t    used_count;     /* Number of currently allocated slots      */
-    uint32_t    _pad;           /* Alignment padding                        */
-    uint8_t     data[];         /* Flexible array: slot_count * slot_size   */
-};
-
-/* ========================================================================= */
-/* Pool Structure                                                             */
-/* ========================================================================= */
-
-/*
- * SammSlabPool: manages a chain of slabs for one fixed slot size.
- *
- * The free list is intrusive: the first sizeof(void*) bytes of each free
- * slot store a pointer to the next free slot.  This is safe because:
- *   (a) all slot sizes are >= 8 bytes (verified at init)
- *   (b) the overlay is zeroed on alloc before returning to the caller
- */
-typedef struct {
-    void*           free_list;          /* Head of intrusive free list       */
-    SammSlab*       slabs;              /* Chain of slabs (newest first)     */
-    uint32_t        slot_size;          /* Bytes per slot                    */
-    uint32_t        slots_per_slab;     /* Slots allocated per slab          */
-    size_t          total_slabs;        /* Number of slabs allocated         */
-    size_t          total_capacity;     /* Total slots across all slabs      */
-    size_t          in_use;             /* Currently allocated slots         */
-    size_t          peak_use;           /* Peak allocated slots              */
-    size_t          peak_footprint_bytes; /* High-water mark of slab memory  */
-    size_t          total_allocs;       /* Lifetime allocation count         */
-    size_t          total_frees;        /* Lifetime free count               */
-    pthread_mutex_t lock;               /* Thread safety for alloc/free      */
-    const char*     name;               /* Pool name for diagnostics         */
-} SammSlabPool;
-
-/* ========================================================================= */
-/* Configuration                                                              */
-/* ========================================================================= */
-
-/* Maximum number of slabs per pool (safety limit) */
-#define SAMM_SLAB_POOL_MAX_SLABS    1024
-
-/* Initial slabs to pre-allocate at init (1 slab gives immediate capacity) */
-#define SAMM_SLAB_POOL_INITIAL_SLABS  1
 
 /* ========================================================================= */
 /* Pool API                                                                   */
@@ -196,12 +145,20 @@ bool samm_slab_pool_validate(const SammSlabPool* pool);
 void samm_slab_pool_check_leaks(const SammSlabPool* pool);
 
 /**
+ * Get the total_allocs counter for a pool.
+ * This accessor replaces direct field access (pool->total_allocs).
+ */
+size_t samm_slab_pool_total_allocs(const SammSlabPool* pool);
+
+/**
  * Get usage percentage (in_use / capacity * 100).
  */
-static inline double samm_slab_pool_usage_percent(const SammSlabPool* pool) {
-    if (!pool || pool->total_capacity == 0) return 0.0;
-    return (double)pool->in_use / (double)pool->total_capacity * 100.0;
-}
+/**
+ * Get usage percentage (in_use / capacity * 100).
+ * Implemented in samm_pool.zig — cannot inline because the Zig pool
+ * struct layout differs from the C SammSlabPool typedef.
+ */
+double samm_slab_pool_usage_percent(const SammSlabPool* pool);
 
 /* ========================================================================= */
 /* Global Pool Instances for String Descriptors (Phase 4 migration)           */
@@ -214,7 +171,7 @@ static inline double samm_slab_pool_usage_percent(const SammSlabPool* pool) {
 /* samm_slab_pool_destroy().                                                  */
 /* ========================================================================= */
 
-extern SammSlabPool g_string_desc_pool;   /* 40-byte slots, 256/slab */
+extern SammSlabPool* g_string_desc_pool;  /* 40-byte slots, 256/slab (ptr to Zig pool instance) */
 
 #define STRING_DESC_POOL_SLOT_SIZE      40
 #define STRING_DESC_POOL_SLOTS_PER_SLAB 256
@@ -227,8 +184,8 @@ extern SammSlabPool g_string_desc_pool;   /* 40-byte slots, 256/slab */
 /* samm_slab_pool_destroy().                                                  */
 /* ========================================================================= */
 
-extern SammSlabPool g_list_header_pool;   /* 32-byte slots, 256/slab */
-extern SammSlabPool g_list_atom_pool;     /* 24-byte slots, 512/slab */
+extern SammSlabPool* g_list_header_pool;  /* 32-byte slots, 256/slab (ptr to Zig pool instance) */
+extern SammSlabPool* g_list_atom_pool;    /* 24-byte slots, 512/slab (ptr to Zig pool instance) */
 
 /* Convenience sizing constants */
 #define LIST_HEADER_POOL_SLOT_SIZE      32
@@ -305,7 +262,7 @@ static inline uint8_t samm_class_to_u8(int sc) {
 
 /* Global array of object size-class pools.
  * Defined in samm_pool.c, initialised by samm_init(). */
-extern SammSlabPool g_object_pools[SAMM_OBJECT_SIZE_CLASSES];
+extern SammSlabPool* g_object_pools[SAMM_OBJECT_SIZE_CLASSES];
 
 /* ========================================================================= */
 /* Debug Tracing                                                              */

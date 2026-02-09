@@ -990,8 +990,16 @@ pub const Parser = struct {
             }
         }
 
+        // Consume the UNTIL keyword and its condition expression.
+        var condition: ?ast.ExprPtr = null;
+        if (self.check(.kw_until)) {
+            _ = self.advance(); // consume UNTIL
+            condition = try self.parseExpression();
+        }
+
         return self.builder.stmt(loc, .{ .repeat_stmt = .{
             .body = try self.allocator.dupe(ast.StmtPtr, body.items),
+            .condition = condition,
         } });
     }
 
@@ -1039,9 +1047,29 @@ pub const Parser = struct {
             }
         }
 
+        // Consume the LOOP keyword and check for a post-condition
+        // (LOOP WHILE expr / LOOP UNTIL expr).
+        var post_cond_type: ast.DoStmt.ConditionType = .none;
+        var post_cond: ?ast.ExprPtr = null;
+
+        if (self.check(.kw_loop)) {
+            _ = self.advance(); // consume LOOP
+            if (self.check(.kw_while)) {
+                _ = self.advance();
+                post_cond_type = .while_cond;
+                post_cond = try self.parseExpression();
+            } else if (self.check(.kw_until)) {
+                _ = self.advance();
+                post_cond_type = .until_cond;
+                post_cond = try self.parseExpression();
+            }
+        }
+
         return self.builder.stmt(loc, .{ .do_stmt = .{
             .pre_condition_type = pre_cond_type,
             .pre_condition = pre_cond,
+            .post_condition_type = post_cond_type,
+            .post_condition = post_cond,
             .body = try self.allocator.dupe(ast.StmtPtr, body.items),
         } });
     }
@@ -4267,7 +4295,8 @@ pub const Parser = struct {
             "CHR",  "ASC",   "LEN",    "INSTR", "UCASE", "LCASE",
             "TRIM", "LTRIM", "RTRIM",  "SPACE", "TAB",   "HEX",
             "OCT",  "BIN",   "MID",    "LEFT",  "RIGHT", "TIMER",
-            "PEEK", "POKE",  "STRING", "INKEY", "POINT",
+            "PEEK", "POKE",  "STRING", "INKEY", "POINT", "SUM",
+            "MAX",  "MIN",   "AVG",    "DOT",
         };
 
         // Strip trailing type suffix ($, %, !, #, &, @, ^) before

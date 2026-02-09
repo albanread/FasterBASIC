@@ -105,6 +105,56 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ── Zig SAMM Pool Runtime Library ──────────────────────────────────
+    //
+    // Compile samm_pool.zig → libsamm_pool.a via custom build step.
+    // This replaces samm_pool.c with a type-safe Zig implementation while
+    // maintaining C ABI compatibility.
+
+    // Create zig-out/lib directory first
+    const mkdir_cmd = b.addSystemCommand(&[_][]const u8{
+        "mkdir",
+        "-p",
+        "zig-out/lib",
+    });
+
+    const samm_pool_build = b.addSystemCommand(&[_][]const u8{
+        "zig",
+        "build-lib",
+        "runtime/samm_pool.zig",
+        "-lc",
+        "-O",
+        "ReleaseFast",
+        "-femit-bin=zig-out/lib/libsamm_pool.a",
+    });
+    samm_pool_build.step.dependOn(&mkdir_cmd.step);
+
+    const samm_scope_build = b.addSystemCommand(&[_][]const u8{
+        "zig",
+        "build-lib",
+        "runtime/samm_scope.zig",
+        "-lc",
+        "-O",
+        "ReleaseFast",
+        "-femit-bin=zig-out/lib/libsamm_scope.a",
+    });
+    samm_scope_build.step.dependOn(&mkdir_cmd.step);
+
+    const samm_core_build = b.addSystemCommand(&[_][]const u8{
+        "zig",
+        "build-lib",
+        "runtime/samm_core.zig",
+        "-lc",
+        "-O",
+        "ReleaseFast",
+        "-femit-bin=zig-out/lib/libsamm_core.a",
+    });
+    samm_core_build.step.dependOn(&mkdir_cmd.step);
+
+    b.getInstallStep().dependOn(&samm_pool_build.step);
+    b.getInstallStep().dependOn(&samm_scope_build.step);
+    b.getInstallStep().dependOn(&samm_core_build.step);
+
     // ── Run step ───────────────────────────────────────────────────────
 
     const run_cmd = b.addRunArtifact(exe);
@@ -122,6 +172,32 @@ pub fn build(b: *std.Build) void {
     // linked in so the extern symbols resolve.
 
     const test_step = b.step("test", "Run unit tests");
+
+    // Add SAMM pool unit tests
+    const samm_pool_test_mod = b.createModule(.{
+        .root_source_file = b.path("runtime/samm_pool.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const samm_pool_tests = b.addTest(.{
+        .root_module = samm_pool_test_mod,
+    });
+    const run_samm_tests = b.addRunArtifact(samm_pool_tests);
+    test_step.dependOn(&run_samm_tests.step);
+
+    // Add SAMM scope unit tests
+    const samm_scope_test_mod = b.createModule(.{
+        .root_source_file = b.path("runtime/samm_scope.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const samm_scope_tests = b.addTest(.{
+        .root_module = samm_scope_test_mod,
+    });
+    const run_samm_scope_tests = b.addRunArtifact(samm_scope_tests);
+    test_step.dependOn(&run_samm_scope_tests.step);
 
     // Helper: create a test module with QBE C sources linked in
     const TestModuleConfig = struct {
