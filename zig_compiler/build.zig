@@ -151,19 +151,20 @@ pub fn build(b: *std.Build) void {
     });
     samm_core_build.step.dependOn(&mkdir_cmd.step);
 
-    // ── Tier 2 Runtime Libraries (Zig ports) ──────────────────────────
-    const tier2_libs = [_][]const u8{
+    // ── Tier 1+2 Runtime Libraries (Zig ports) ─────────────────────────
+    const zig_runtime_libs = [_][]const u8{
         "memory_mgmt",
         "class_runtime",
         "conversion_ops",
         "string_ops",
+        "string_utf32",
     };
 
-    var tier2_steps: [tier2_libs.len]std.Build.Step.Run = undefined;
-    for (tier2_libs, 0..) |lib_name, i| {
+    var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;
+    for (zig_runtime_libs, 0..) |lib_name, i| {
         const src_path = b.fmt("runtime/{s}.zig", .{lib_name});
         const out_path = b.fmt("zig-out/lib/lib{s}.a", .{lib_name});
-        tier2_steps[i] = b.addSystemCommand(&[_][]const u8{
+        zig_rt_steps[i] = b.addSystemCommand(&[_][]const u8{
             "zig",
             "build-lib",
             src_path,
@@ -172,13 +173,13 @@ pub fn build(b: *std.Build) void {
             "ReleaseFast",
             b.fmt("-femit-bin={s}", .{out_path}),
         }).*;
-        tier2_steps[i].step.dependOn(&mkdir_cmd.step);
+        zig_rt_steps[i].step.dependOn(&mkdir_cmd.step);
     }
 
     b.getInstallStep().dependOn(&samm_pool_build.step);
     b.getInstallStep().dependOn(&samm_scope_build.step);
     b.getInstallStep().dependOn(&samm_core_build.step);
-    for (&tier2_steps) |*step| {
+    for (&zig_rt_steps) |*step| {
         b.getInstallStep().dependOn(&step.step);
     }
 

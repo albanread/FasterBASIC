@@ -1055,14 +1055,15 @@ pub fn main() !void {
                         allocator.free(samm_core_lib_path);
                     }
 
-                    // Tier 2 Zig runtime libraries
-                    const tier2_libs = [_][]const u8{
+                    // Tier 1+2 Zig runtime libraries
+                    const zig_runtime_libs = [_][]const u8{
                         "memory_mgmt",
                         "class_runtime",
                         "conversion_ops",
                         "string_ops",
+                        "string_utf32",
                     };
-                    for (tier2_libs) |lib_name| {
+                    for (zig_runtime_libs) |lib_name| {
                         const zig_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/lib{s}.a", .{ exe_dir, lib_name }) catch {
                             stderr.print("Error: out of memory\n", .{}) catch {};
                             std.process.exit(1);
