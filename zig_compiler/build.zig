@@ -158,6 +158,7 @@ pub fn build(b: *std.Build) void {
         "conversion_ops",
         "string_ops",
         "string_utf32",
+        "list_ops",
     };
 
     var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;
