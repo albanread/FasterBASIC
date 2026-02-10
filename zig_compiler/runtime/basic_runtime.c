@@ -13,6 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
+
+// External SAMM function for printing statistics
+extern void samm_print_stats_always(void);
 
 // =============================================================================
 // Global State
@@ -82,6 +86,12 @@ void basic_runtime_cleanup(void) {
         g_arena = NULL;
     }
     g_arena_offset = 0;
+    
+    // Print memory statistics only if BASIC_MEMORY_STATS environment variable is set
+    if (getenv("BASIC_MEMORY_STATS") != NULL) {
+        basic_mem_stats();
+        samm_print_stats_always();
+    }
 }
 
 // =============================================================================

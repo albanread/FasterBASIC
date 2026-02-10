@@ -71,6 +71,9 @@ void basic_runtime_init(void);
 // Cleanup runtime (call once at program end)
 void basic_runtime_cleanup(void);
 
+// Print memory statistics (if DEBUG_MEMORY enabled)
+void basic_mem_stats(void);
+
 // Arena allocator for temporary values (cleared after each statement)
 void* basic_alloc_temp(size_t size);
 void basic_clear_temps(void);

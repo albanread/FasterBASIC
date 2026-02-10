@@ -31,7 +31,7 @@ extern fn basic_error_msg(msg: [*:0]const u8) void;
 // =========================================================================
 // Debug memory tracking (compile-time optional)
 // =========================================================================
-const DEBUG_MEMORY = false; // Set true for debug builds
+const DEBUG_MEMORY = true; // Set true for debug builds
 
 var g_allocations: usize = 0;
 var g_deallocations: usize = 0;
@@ -119,11 +119,20 @@ export fn basic_strdup(str: ?[*:0]const u8) ?[*]u8 {
 export fn basic_mem_stats() void {
     if (DEBUG_MEMORY) {
         const stdio = @cImport(@cInclude("stdio.h"));
-        _ = stdio.printf("Memory Statistics:\n");
-        _ = stdio.printf("  Allocations:   %zu\n", g_allocations);
-        _ = stdio.printf("  Deallocations: %zu\n", g_deallocations);
-        _ = stdio.printf("  Bytes:         %zu\n", g_bytes_allocated);
-        _ = stdio.printf("  Leaked:        %zu\n", g_allocations - g_deallocations);
+        _ = stdio.printf("\n");
+        _ = stdio.printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        _ = stdio.printf("  Memory Statistics (Runtime Allocator)\n");
+        _ = stdio.printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+        _ = stdio.printf("  Total allocations:   %zu\n", g_allocations);
+        _ = stdio.printf("  Total deallocations: %zu\n", g_deallocations);
+        _ = stdio.printf("  Total bytes:         %zu\n", g_bytes_allocated);
+        _ = stdio.printf("  Leaked objects:      %zu\n", g_allocations - g_deallocations);
+        if (g_allocations > g_deallocations) {
+            _ = stdio.printf("  ⚠️  WARNING: Memory leaks detected!\n");
+        } else {
+            _ = stdio.printf("  ✓ All allocations freed\n");
+        }
+        _ = stdio.printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     }
 }
 

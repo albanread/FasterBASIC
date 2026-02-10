@@ -1,0 +1,90 @@
+=== DEBUGGING TERMINAL APPS ===
+
+The best way to debug terminal apps is to RECORD the session:
+
+METHOD 1: Using 'script' command
+---------------------------------
+script -q session.txt
+./based_editor test_file.bas
+[Use arrow keys, type, etc - see the problem]
+[Press Ctrl+Q to quit]
+exit
+
+Now examine what happened:
+cat session.txt | less
+
+You'll see ALL the output including ANSI escape sequences.
+
+
+METHOD 2: Redirect to see raw escape codes
+-------------------------------------------
+./based_editor test_file.bas 2>&1 | cat -v
+
+This shows escape sequences in readable form (^[ for ESC)
+
+
+METHOD 3: Use 'od' to see exact bytes
+--------------------------------------
+(echo ""; sleep 10) | ./based_editor test_file.bas 2>&1 | od -c | head -100
+
+Shows the exact character codes being sent.
+
+
+METHOD 4: Watch what terminal_io is doing
+------------------------------------------
+Add debugging to terminal_io.zig:
+
+fn writeStdout(bytes: []const u8) void {
+    // Log to file
+    const log_file = std.fs.cwd().createFile("terminal_debug.log", .{ .truncate = false }) catch return;
+    defer log_file.close();
+    log_file.seekFromEnd(0) catch {};
+    var buf: [200]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "WRITE: {s}\n", .{bytes}) catch return;
+    log_file.writeAll(msg) catch {};
+    
+    // Normal output
+    [existing fprintf code]
+}
+
+
+WHAT TO LOOK FOR IN YOUR EDITOR:
+---------------------------------
+You said "down arrow moves whole screen up".
+
+This means:
+1. Either the ANSI sequence is wrong (ESC[1;1H instead of ESC[2;2H?)
+2. Or view_top is changing when it shouldn't
+3. Or the redraw is drawing wrong lines
+
+Expected behavior:
+- edit_height = 24 - 2 - 2 = 20 lines visible
+- Lines 0-19 should show on screen rows 2-21
+- Cursor at line 0 should show at screen row 2
+- Pressing DOWN 20 times should keep cursor on screen until line 19
+- Line 20 should trigger scroll (view_top becomes 1)
+
+
+SIMPLE TEST:
+------------
+Run: ./test_debug
+
+You should see:
+- "Test 1" at row 5, col 10 (indented 10 spaces from left)
+- "Test 2" at row 7, col 20 (indented 20 spaces)
+- Box at rows 15-17
+
+If that works, terminal I/O is fine. Problem is in editor logic.
+
+
+THE REAL ISSUE IS PROBABLY:
+----------------------------
+The editor is calling draw_editor() which redraws ALL visible lines.
+This looks like "scrolling" because the entire content area updates.
+
+When you press DOWN, it:
+1. Changes cursor_y from 0 to 1
+2. Calls draw_editor() which redraws all 20 lines
+3. This LOOKS like the screen scrolled up, but really it's just redrawing
+
+The solution is to NOT redraw everything - just move the cursor!

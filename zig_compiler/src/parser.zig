@@ -33,6 +33,10 @@ const Token = token_mod.Token;
 const Tag = token_mod.Tag;
 const SourceLocation = token_mod.SourceLocation;
 
+comptime {
+    @setEvalBranchQuota(50000);
+}
+
 // ─── Parser Error ───────────────────────────────────────────────────────────
 
 pub const ParserError = struct {
@@ -247,6 +251,7 @@ pub const Parser = struct {
             .kw_print => self.parsePrintStatement(),
             .kw_console => self.parseConsoleStatement(),
             .kw_input => self.parseInputStatement(),
+            .kw_line => self.parseInputStatement(),
             .kw_let => self.parseLetStatement(),
             .kw_goto => self.parseGotoStatement(),
             .kw_gosub => self.parseGosubStatement(),
@@ -289,10 +294,32 @@ pub const Parser = struct {
             .kw_delete => self.parseDeleteStatement(),
             .kw_open => self.parseOpenStatement(),
             .kw_close => self.parseCloseStatement(),
-            .kw_cls => self.parseSimpleStatement(.cls),
-            .kw_gcls, .kw_clg => self.parseSimpleStatement(.gcls),
-            .kw_vsync => self.parseSimpleStatement(.vsync),
+            .kw_shell, .kw_system => self.parseShellStatement(),
+            .kw_spit => self.parseSpitStatement(),
+            .kw_cls => self.parseSimpleStatement(.kw_cls),
+            .kw_gcls, .kw_clg => self.parseSimpleStatement(.kw_gcls),
+            .kw_vsync => self.parseSimpleStatement(.kw_vsync),
             .kw_color => self.parseColorStatement(),
+            .kw_locate => self.parseLocateStatement(),
+            .kw_cursor_on => self.parseSimpleStatement(.kw_cursor_on),
+            .kw_cursor_off => self.parseSimpleStatement(.kw_cursor_off),
+            .kw_cursor_hide => self.parseSimpleStatement(.kw_cursor_hide),
+            .kw_cursor_show => self.parseSimpleStatement(.kw_cursor_show),
+            .kw_cursor_save => self.parseSimpleStatement(.kw_cursor_save),
+            .kw_cursor_restore => self.parseSimpleStatement(.kw_cursor_restore),
+            .kw_color_reset => self.parseSimpleStatement(.kw_color_reset),
+            .kw_bold => self.parseSimpleStatement(.kw_bold),
+            .kw_italic => self.parseSimpleStatement(.kw_italic),
+            .kw_underline => self.parseSimpleStatement(.kw_underline),
+            .kw_blink => self.parseSimpleStatement(.kw_blink),
+            .kw_inverse => self.parseSimpleStatement(.kw_inverse),
+            .kw_style_reset => self.parseSimpleStatement(.kw_style_reset),
+            .kw_normal => self.parseSimpleStatement(.kw_normal),
+            .kw_screen_alternate => self.parseSimpleStatement(.kw_screen_alternate),
+            .kw_screen_main => self.parseSimpleStatement(.kw_screen_main),
+            .kw_kbraw => self.parseKbRawStatement(),
+            .kw_kbecho => self.parseKbEchoStatement(),
+            .kw_kbflush, .kw_kbclear => self.parseSimpleStatement(.kw_kbflush),
             .kw_wait => self.parseWaitStatement(),
             .kw_wait_ms => self.parseWaitMsStatement(),
             .kw_sleep => self.parseSleepStatement(),
@@ -340,6 +367,15 @@ pub const Parser = struct {
         const loc = self.currentLocation();
         _ = self.advance(); // consume PRINT
 
+        // Check for file output: PRINT #n, ... or PRINT n, ...
+        // Note: # may be lexed as .type_double, so accept both .hash and .type_double
+        var file_number_expr: ?ast.ExprPtr = null;
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+            file_number_expr = try self.parseExpression();
+            _ = try self.consume(.comma, "Expected comma after file number in PRINT");
+        }
+
         var items: std.ArrayList(ast.PrintItem) = .empty;
         defer items.deinit(self.allocator);
 
@@ -376,6 +412,7 @@ pub const Parser = struct {
         }
 
         return self.builder.stmt(loc, .{ .print = .{
+            .file_number = file_number_expr,
             .items = try self.allocator.dupe(ast.PrintItem, items.items),
             .trailing_newline = trailing_newline,
         } });
@@ -425,14 +462,33 @@ pub const Parser = struct {
 
     fn parseInputStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
+        const is_line_input = self.check(.kw_line);
+
+        if (is_line_input) {
+            _ = self.advance(); // consume LINE
+            if (!self.check(.kw_input)) {
+                try self.addError("Expected INPUT after LINE");
+                return error.ParseError;
+            }
+        }
+
         _ = self.advance(); // consume INPUT
+
+        // Check for file input: INPUT #n, var or LINE INPUT #n, var
+        // Note: # may be lexed as .type_double, so accept both .hash and .type_double
+        var file_number_expr: ?ast.ExprPtr = null;
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+            file_number_expr = try self.parseExpression();
+            _ = try self.consume(.comma, "Expected comma after file number in INPUT");
+        }
 
         var prompt: []const u8 = "";
         var variables: std.ArrayList([]const u8) = .empty;
         defer variables.deinit(self.allocator);
 
-        // Optional prompt string.
-        if (self.check(.string)) {
+        // Optional prompt string (only for console input).
+        if (file_number_expr == null and self.check(.string)) {
             prompt = lexer_mod.Lexer.stringValue(self.current());
             _ = self.advance();
             // Consume ; or , after prompt.
@@ -461,6 +517,8 @@ pub const Parser = struct {
         return self.builder.stmt(loc, .{ .input = .{
             .prompt = prompt,
             .variables = try self.allocator.dupe([]const u8, variables.items),
+            .file_number = file_number_expr,
+            .is_line_input = is_line_input,
         } });
     }
 
@@ -1482,7 +1540,8 @@ pub const Parser = struct {
         const loc = self.currentLocation();
         _ = self.advance(); // consume SWAP
 
-        if (!self.check(.identifier)) {
+        // Parse first variable (allow identifiers or keywords as variable names)
+        if (!self.check(.identifier) and !self.current().isKeyword()) {
             try self.addError("Expected variable name after SWAP");
             return error.ParseError;
         }
@@ -1490,9 +1549,42 @@ pub const Parser = struct {
         _ = self.advance();
         self.skipTypeSuffix();
 
+        // Parse first variable's array indices
+        var var1_indices: std.ArrayList(ast.ExprPtr) = .empty;
+        defer var1_indices.deinit(self.allocator);
+
+        if (self.check(.lparen)) {
+            _ = self.advance();
+            if (!self.check(.rparen)) {
+                try var1_indices.append(self.allocator, try self.parseExpression());
+                while (self.check(.comma)) {
+                    _ = self.advance();
+                    try var1_indices.append(self.allocator, try self.parseExpression());
+                }
+            }
+            _ = try self.consume(.rparen, "Expected ')' after array indices");
+        }
+
+        // Parse first variable's member chain
+        var var1_member_chain: std.ArrayList([]const u8) = .empty;
+        defer var1_member_chain.deinit(self.allocator);
+
+        while (self.check(.dot)) {
+            _ = self.advance();
+            if (self.check(.identifier) or self.current().isKeyword()) {
+                try var1_member_chain.append(self.allocator, self.current().lexeme);
+                _ = self.advance();
+                self.skipTypeSuffix();
+            } else {
+                try self.addError("Expected member name after '.'");
+                return error.ParseError;
+            }
+        }
+
         _ = try self.consume(.comma, "Expected ',' between SWAP variables");
 
-        if (!self.check(.identifier)) {
+        // Parse second variable (allow identifiers or keywords as variable names)
+        if (!self.check(.identifier) and !self.current().isKeyword()) {
             try self.addError("Expected second variable name in SWAP");
             return error.ParseError;
         }
@@ -1500,7 +1592,46 @@ pub const Parser = struct {
         _ = self.advance();
         self.skipTypeSuffix();
 
-        return self.builder.stmt(loc, .{ .swap = .{ .var1 = var1, .var2 = var2 } });
+        // Parse second variable's array indices
+        var var2_indices: std.ArrayList(ast.ExprPtr) = .empty;
+        defer var2_indices.deinit(self.allocator);
+
+        if (self.check(.lparen)) {
+            _ = self.advance();
+            if (!self.check(.rparen)) {
+                try var2_indices.append(self.allocator, try self.parseExpression());
+                while (self.check(.comma)) {
+                    _ = self.advance();
+                    try var2_indices.append(self.allocator, try self.parseExpression());
+                }
+            }
+            _ = try self.consume(.rparen, "Expected ')' after array indices");
+        }
+
+        // Parse second variable's member chain
+        var var2_member_chain: std.ArrayList([]const u8) = .empty;
+        defer var2_member_chain.deinit(self.allocator);
+
+        while (self.check(.dot)) {
+            _ = self.advance();
+            if (self.check(.identifier) or self.current().isKeyword()) {
+                try var2_member_chain.append(self.allocator, self.current().lexeme);
+                _ = self.advance();
+                self.skipTypeSuffix();
+            } else {
+                try self.addError("Expected member name after '.'");
+                return error.ParseError;
+            }
+        }
+
+        return self.builder.stmt(loc, .{ .swap = .{
+            .var1 = var1,
+            .var1_indices = try self.allocator.dupe(ast.ExprPtr, var1_indices.items),
+            .var1_member_chain = try self.allocator.dupe([]const u8, var1_member_chain.items),
+            .var2 = var2,
+            .var2_indices = try self.allocator.dupe(ast.ExprPtr, var2_indices.items),
+            .var2_member_chain = try self.allocator.dupe([]const u8, var2_member_chain.items),
+        } });
     }
 
     fn parseIncStatement(self: *Parser) ExprError!ast.StmtPtr {
@@ -2670,42 +2801,148 @@ pub const Parser = struct {
     fn parseOpenStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume OPEN
-        // Simplified: OPEN "filename" FOR INPUT/OUTPUT AS #n
-        // Skip parsing details for now.
-        self.skipToEndOfLine();
-        return self.builder.stmt(loc, .{ .open = .{ .filename = "" } });
+
+        // Parse filename expression
+        const filename = try self.parseExpression();
+
+        // Expect FOR keyword
+        _ = try self.consume(.kw_for, "Expected FOR after filename in OPEN");
+
+        // Parse mode (INPUT, OUTPUT, APPEND)
+        var mode: []const u8 = undefined;
+        if (self.check(.kw_input)) {
+            mode = "INPUT";
+            _ = self.advance();
+        } else if (self.check(.identifier)) {
+            const id_upper = self.current().lexeme;
+            if (std.mem.eql(u8, id_upper, "OUTPUT") or std.mem.eql(u8, id_upper, "output")) {
+                mode = "OUTPUT";
+                _ = self.advance();
+            } else if (std.mem.eql(u8, id_upper, "APPEND") or std.mem.eql(u8, id_upper, "append")) {
+                mode = "APPEND";
+                _ = self.advance();
+            } else {
+                try self.addError("Expected INPUT, OUTPUT, or APPEND after FOR");
+                return error.ParseError;
+            }
+        } else {
+            try self.addError("Expected file mode (INPUT, OUTPUT, or APPEND)");
+            return error.ParseError;
+        }
+
+        // Expect AS keyword
+        _ = try self.consume(.kw_as, "Expected AS in OPEN statement");
+
+        // Optional # token before file number (may be lexed as .type_double)
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+        }
+
+        // Parse file number expression
+        const file_number = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .open = .{
+                .filename = filename,
+                .mode = mode,
+                .file_number = file_number,
+            },
+        });
     }
 
     fn parseCloseStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume CLOSE
 
-        var file_number: i32 = 0;
+        var file_number_expr: ?ast.ExprPtr = null;
         var close_all = false;
 
-        if (self.check(.number)) {
-            file_number = @intFromFloat(self.current().number_value);
+        // Accept # (may be lexed as .type_double) or direct file number
+        if (self.check(.hash) or self.check(.type_double)) {
             _ = self.advance();
-        } else if (self.check(.hash)) {
-            _ = self.advance();
-            if (self.check(.number)) {
-                file_number = @intFromFloat(self.current().number_value);
-                _ = self.advance();
-            }
+            file_number_expr = try self.parseExpression();
+        } else if (!self.isAtEndOfStatement()) {
+            // Also allow CLOSE n without #
+            file_number_expr = try self.parseExpression();
         } else {
             close_all = true;
         }
 
         return self.builder.stmt(loc, .{ .close = .{
-            .file_number = file_number,
+            .file_number = file_number_expr,
             .close_all = close_all,
         } });
     }
 
-    fn parseSimpleStatement(self: *Parser, comptime kind: std.meta.FieldEnum(ast.StmtData)) !ast.StmtPtr {
+    fn parseShellStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume SHELL or SYSTEM
+
+        const command = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .shell = .{ .command = command },
+        });
+    }
+
+    fn parseSpitStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume SPIT
+
+        const filename = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' after SPIT filename");
+        const content = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .spit = .{
+                .filename = filename,
+                .content = content,
+            },
+        });
+    }
+
+    fn parseSimpleStatement(self: *Parser, comptime tag: Tag) !ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance();
-        return self.builder.stmt(loc, @unionInit(ast.StmtData, @tagName(kind), {}));
+        const stmt_data: ast.StmtData = switch (tag) {
+            .kw_cls => .{ .cls = {} },
+            .kw_gcls, .kw_clg => .{ .gcls = {} },
+            .kw_vsync => .{ .vsync = {} },
+            .kw_cursor_on => .{ .cursor_on = {} },
+            .kw_cursor_off => .{ .cursor_off = {} },
+            .kw_cursor_hide => .{ .cursor_hide = {} },
+            .kw_cursor_show => .{ .cursor_show = {} },
+            .kw_cursor_save => .{ .cursor_save = {} },
+            .kw_cursor_restore => .{ .cursor_restore = {} },
+            .kw_color_reset => .{ .color_reset = {} },
+            .kw_bold => .{ .bold = {} },
+            .kw_italic => .{ .italic = {} },
+            .kw_underline => .{ .underline = {} },
+            .kw_blink => .{ .blink = {} },
+            .kw_inverse => .{ .inverse = {} },
+            .kw_style_reset => .{ .style_reset = {} },
+            .kw_normal => .{ .normal = {} },
+            .kw_screen_alternate => .{ .screen_alternate = {} },
+            .kw_screen_main => .{ .screen_main = {} },
+            else => unreachable,
+        };
+        return self.builder.stmt(loc, stmt_data);
+    }
+
+    fn parseKbRawStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume KBRAW
+
+        const enable = try self.parseExpression();
+        return self.builder.stmt(loc, .{ .kbraw = .{ .enable = enable } });
+    }
+
+    fn parseKbEchoStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume KBECHO
+
+        const enable = try self.parseExpression();
+        return self.builder.stmt(loc, .{ .kbecho = .{ .enable = enable } });
     }
 
     fn parseColorStatement(self: *Parser) ExprError!ast.StmtPtr {
@@ -2720,6 +2957,20 @@ pub const Parser = struct {
         }
 
         return self.builder.stmt(loc, .{ .color = .{ .fg = fg, .bg = bg } });
+    }
+
+    fn parseLocateStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume LOCATE
+
+        const row = try self.parseExpression();
+        var col: ?ast.ExprPtr = null;
+        if (self.check(.comma)) {
+            _ = self.advance();
+            col = try self.parseExpression();
+        }
+
+        return self.builder.stmt(loc, .{ .locate = .{ .row = row, .col = col } });
     }
 
     fn parseWaitStatement(self: *Parser) ExprError!ast.StmtPtr {
@@ -3807,6 +4058,110 @@ pub const Parser = struct {
                 const expr = try self.parseExpression();
                 _ = try self.consume(.rparen, "Expected ')' after expression");
                 return expr;
+            },
+            .kw_kbhit => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBHIT",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbget => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBGET",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbpeek => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBPEEK",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbcode => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBCODE",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbspecial => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBSPECIAL",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbmod => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBMOD",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_kbcount => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "KBCOUNT",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_inkey => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "INKEY",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_slurp => {
+                _ = self.advance(); // consume SLURP
+                _ = try self.consume(.lparen, "Expected '(' after SLURP");
+                const filename = try self.parseExpression();
+                _ = try self.consume(.rparen, "Expected ')' after SLURP filename");
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "SLURP",
+                    .arguments = try self.allocator.dupe(ast.ExprPtr, &[_]ast.ExprPtr{filename}),
+                } });
+            },
+            .kw_command => {
+                _ = self.advance(); // consume COMMAND
+                _ = try self.consume(.lparen, "Expected '(' after COMMAND");
+                const index = try self.parseExpression();
+                _ = try self.consume(.rparen, "Expected ')' after COMMAND index");
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "COMMAND",
+                    .arguments = try self.allocator.dupe(ast.ExprPtr, &[_]ast.ExprPtr{index}),
+                } });
+            },
+            .kw_commandcount => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "COMMANDCOUNT",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_pos => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "POS",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_row => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "ROW",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_csrlin => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "CSRLIN",
+                    .arguments = &.{},
+                } });
             },
             .kw_iif => {
                 _ = self.advance(); // consume IIF

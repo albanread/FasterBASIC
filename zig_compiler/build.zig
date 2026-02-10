@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         "io_ops",
         "array_ops",
         "marshalling",
+        "terminal_io",
     };
 
     var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;

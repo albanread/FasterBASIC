@@ -648,7 +648,9 @@ fn isBasicFile(path: []const u8) bool {
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+    var arena = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena.deinit();
+    const allocator = arena.allocator();
 
     const stderr = std.fs.File.stderr().deprecatedWriter();
     const stdout = std.fs.File.stdout().deprecatedWriter();
@@ -1041,6 +1043,7 @@ pub fn main() !void {
                         "io_ops",
                         "array_ops",
                         "marshalling",
+                        "terminal_io",
                     };
                     for (zig_runtime_libs) |lib_name| {
                         const zig_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/lib{s}.a", .{ exe_dir, lib_name }) catch {

@@ -714,18 +714,19 @@ export fn samm_shutdown() callconv(.c) void {
     }
 
     // Print stats if tracing enabled or SAMM_STATS env var is set
-    if (g_samm.trace or c.getenv("SAMM_STATS") != null) {
+    const should_print_stats = g_samm.trace or c.getenv("SAMM_STATS") != null or c.getenv("BASIC_MEMORY_STATS") != null;
+    if (should_print_stats) {
         samm_print_stats();
     }
 
     // Destroy string descriptor pool
-    if (g_samm.trace or c.getenv("SAMM_STATS") != null) {
+    if (should_print_stats) {
         samm_slab_pool_print_stats(g_string_desc_pool);
     }
     samm_slab_pool_destroy(g_string_desc_pool);
 
     // Destroy list pools
-    if (g_samm.trace or c.getenv("SAMM_STATS") != null) {
+    if (should_print_stats) {
         samm_slab_pool_print_stats(g_list_header_pool);
         samm_slab_pool_print_stats(g_list_atom_pool);
         for (0..SAMM_OBJECT_SIZE_CLASSES) |sc| {
@@ -1175,7 +1176,9 @@ export fn samm_print_stats() callconv(.c) void {
     samm_get_stats(&s);
 
     _ = c.fprintf(c.getStderr(), "\n");
-    _ = c.fprintf(c.getStderr(), "=== SAMM Statistics ===\n");
+    _ = c.fprintf(c.getStderr(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    _ = c.fprintf(c.getStderr(), "  SAMM Memory Statistics\n");
+    _ = c.fprintf(c.getStderr(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     _ = c.fprintf(c.getStderr(), "  Scopes entered:       %llu\n", @as(c_ulonglong, s.scopes_entered));
     _ = c.fprintf(c.getStderr(), "  Scopes exited:        %llu\n", @as(c_ulonglong, s.scopes_exited));
     _ = c.fprintf(c.getStderr(), "  Objects allocated:    %llu\n", @as(c_ulonglong, s.objects_allocated));
@@ -1188,6 +1191,34 @@ export fn samm_print_stats() callconv(.c) void {
     _ = c.fprintf(c.getStderr(), "  RETAIN calls:         %llu\n", @as(c_ulonglong, s.retain_calls));
     _ = c.fprintf(c.getStderr(), "  Bytes allocated:      %llu\n", @as(c_ulonglong, s.total_bytes_allocated));
     _ = c.fprintf(c.getStderr(), "  Bytes freed:          %llu\n", @as(c_ulonglong, s.total_bytes_freed));
+
+    // Calculate leaks using signed arithmetic to avoid underflow
+    const allocated: i64 = @intCast(s.objects_allocated);
+    const freed_and_cleaned: i64 = @intCast(s.objects_freed + s.objects_cleaned);
+    const leaked_objects: i64 = allocated - freed_and_cleaned;
+
+    const bytes_allocated: i64 = @intCast(s.total_bytes_allocated);
+    const bytes_freed: i64 = @intCast(s.total_bytes_freed);
+    const leaked_bytes: i64 = bytes_allocated - bytes_freed;
+
+    if (leaked_objects > 0) {
+        _ = c.fprintf(c.getStderr(), "  Leaked objects:       %lld\n", @as(c_longlong, leaked_objects));
+    } else {
+        _ = c.fprintf(c.getStderr(), "  Leaked objects:       0\n");
+    }
+
+    if (leaked_bytes > 0) {
+        _ = c.fprintf(c.getStderr(), "  Leaked bytes:         %lld\n", @as(c_longlong, leaked_bytes));
+    } else {
+        _ = c.fprintf(c.getStderr(), "  Leaked bytes:         0\n");
+    }
+
+    if (leaked_objects > 0 or leaked_bytes > 0) {
+        _ = c.fprintf(c.getStderr(), "  ⚠️  WARNING: Memory leaks detected!\n");
+    } else {
+        _ = c.fprintf(c.getStderr(), "  ✓ All allocations freed\n");
+    }
+
     _ = c.fprintf(c.getStderr(), "  Current scope depth:  %d\n", s.current_scope_depth);
     _ = c.fprintf(c.getStderr(), "  Peak scope depth:     %d\n", s.peak_scope_depth);
     if (s.bloom_memory_bytes > 0) {
@@ -1197,7 +1228,12 @@ export fn samm_print_stats() callconv(.c) void {
     }
     _ = c.fprintf(c.getStderr(), "  Cleanup time:         %.3f ms\n", s.total_cleanup_time_ms);
     _ = c.fprintf(c.getStderr(), "  Background worker:    %s\n", if (s.background_worker_active != 0) @as([*:0]const u8, "active") else @as([*:0]const u8, "stopped"));
-    _ = c.fprintf(c.getStderr(), "===========================\n");
+    _ = c.fprintf(c.getStderr(), "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+}
+
+/// Print SAMM statistics unconditionally (for use in program cleanup)
+export fn samm_print_stats_always() callconv(.c) void {
+    samm_print_stats();
     _ = c.fprintf(c.getStderr(), "\n");
 }
 

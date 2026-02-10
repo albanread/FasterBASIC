@@ -436,7 +436,7 @@ pub const Lexer = struct {
         const followed_by_suffix = !self.isAtEnd() and (isNumericTypeSuffix(self.currentChar()) or self.currentChar() == '$');
 
         if (!followed_by_suffix) {
-            if (Tag.fromKeyword(lexeme)) |kw_tag| {
+            if (Tag.fromKeyword(lexeme, self.allocator)) |kw_tag| {
                 // Special handling for REM — rest of line is comment
                 if (kw_tag == .kw_rem) {
                     self.skipToEndOfLine();
@@ -563,7 +563,21 @@ pub const Lexer = struct {
             },
 
             '%' => try self.addToken(.type_int, self.source[self.pos - 1 .. self.pos], loc),
-            '#' => try self.addToken(.type_double, self.source[self.pos - 1 .. self.pos], loc),
+            '#' => {
+                // # can be either a file number indicator or type suffix
+                // Check if previous token was identifier/keyword - if so, it's a type suffix
+                // Otherwise it's a file number indicator (.hash)
+                const is_suffix = if (self.tokens.items.len > 0) blk: {
+                    const prev = self.tokens.items[self.tokens.items.len - 1];
+                    break :blk prev.tag == .identifier or prev.isKeyword();
+                } else false;
+
+                if (is_suffix) {
+                    try self.addToken(.type_double, self.source[self.pos - 1 .. self.pos], loc);
+                } else {
+                    try self.addToken(.hash, self.source[self.pos - 1 .. self.pos], loc);
+                }
+            },
             '$' => try self.addToken(.type_string, self.source[self.pos - 1 .. self.pos], loc),
             '@' => try self.addToken(.type_byte, self.source[self.pos - 1 .. self.pos], loc),
             '&' => {

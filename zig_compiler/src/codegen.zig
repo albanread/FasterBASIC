@@ -127,6 +127,81 @@ pub const FunctionContext = struct {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
+// FunctionScopeAnalyzer — Determines if a function needs automatic SAMM scoping
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Analyzes a function/SUB to determine if it needs automatic scope management.
+/// A function needs scoping if it:
+/// - Uses DIM statements (allocates dynamic variables)
+/// - Contains loops that may create temporaries
+/// - Allocates strings, objects, or performs operations that create managed memory
+pub const FunctionScopeAnalyzer = struct {
+    needs_scope: bool = false,
+    has_dim: bool = false,
+    has_loops: bool = false,
+    has_allocations: bool = false,
+
+    /// Analyze a CFG to determine if the function needs scope management.
+    pub fn analyze(the_cfg: *const cfg_mod.CFG) FunctionScopeAnalyzer {
+        var analyzer = FunctionScopeAnalyzer{};
+
+        // Walk all blocks in the CFG
+        for (the_cfg.blocks.items) |*block| {
+            // Check for loops
+            if (block.kind == .loop_header or
+                block.kind == .loop_body or
+                block.kind == .loop_increment)
+            {
+                analyzer.has_loops = true;
+            }
+
+            // Check statements for DIM and allocations
+            for (block.statements.items) |stmt_ptr| {
+                analyzer.analyzeStatement(stmt_ptr);
+            }
+        }
+
+        // Determine if scope is needed
+        analyzer.needs_scope = analyzer.has_dim or
+            (analyzer.has_loops and analyzer.has_allocations);
+
+        return analyzer;
+    }
+
+    fn analyzeStatement(self: *FunctionScopeAnalyzer, stmt_ptr: *const ast.Statement) void {
+        switch (stmt_ptr.data) {
+            .dim => {
+                // DIM statement detected - function needs scoping
+                self.has_dim = true;
+            },
+            .redim => {
+                // REDIM also requires scoping
+                self.has_dim = true;
+            },
+            .let => |let_stmt| {
+                // Check if assignment involves NEW (class instantiation)
+                self.checkForNew(let_stmt.value);
+            },
+            else => {},
+        }
+    }
+
+    fn checkForNew(self: *FunctionScopeAnalyzer, expr_ptr: *const ast.Expression) void {
+        // Simple check for NEW expressions which always allocate
+        switch (expr_ptr.data) {
+            .new => {
+                self.has_allocations = true;
+            },
+            .string_lit => {
+                // String operations in loops may accumulate
+                self.has_allocations = true;
+            },
+            else => {},
+        }
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
 // QBEBuilder — Low-level QBE IL emission
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -987,6 +1062,65 @@ pub const RuntimeLibrary = struct {
         try self.declare("unmarshall_array", "l %blob, l %desc_ptr");
         try self.declare("unmarshall_udt", "l %blob, l %udt_ptr, w %size");
         try self.declare("unmarshall_udt_deep", "l %blob, l %udt_ptr, w %size, l %offsets, w %num");
+
+        // Terminal I/O  (runtime: terminal_io.zig)
+        try self.declare("terminal_init", "");
+        try self.declare("terminal_cleanup", "");
+        try self.declare("basic_locate", "w %row, w %col");
+        try self.declare("basic_cls", "");
+        try self.declare("basic_gcls", "");
+        try self.declare("basic_clear_eol", "");
+        try self.declare("basic_clear_eos", "");
+        try self.declare("hideCursor", "");
+        try self.declare("showCursor", "");
+        try self.declare("saveCursor", "");
+        try self.declare("restoreCursor", "");
+        try self.declare("cursorUp", "w %n");
+        try self.declare("cursorDown", "w %n");
+        try self.declare("cursorLeft", "w %n");
+        try self.declare("cursorRight", "w %n");
+        try self.declare("basic_color", "w %fg");
+        try self.declare("basic_color_bg", "w %fg, w %bg");
+        try self.declare("basic_color_rgb", "w %r, w %g, w %b");
+        try self.declare("basic_color_rgb_bg", "w %r, w %g, w %b");
+        try self.declare("basic_color_reset", "");
+        try self.declare("basic_style_bold", "");
+        try self.declare("basic_style_dim", "");
+        try self.declare("basic_style_italic", "");
+        try self.declare("basic_style_underline", "");
+        try self.declare("basic_style_blink", "");
+        try self.declare("basic_style_reverse", "");
+        try self.declare("basic_style_reset", "");
+        try self.declare("basic_screen_alternate", "");
+        try self.declare("basic_screen_main", "");
+        try self.declare("basic_get_cursor_pos", "");
+        try self.declare("terminal_flush", "");
+
+        // Keyboard input functions
+        try self.declare("basic_kbraw", "w %enable");
+        try self.declare("basic_kbecho", "w %enable");
+        try self.declare("basic_kbhit", "w");
+        try self.declare("basic_kbget", "w");
+        try self.declare("basic_kbpeek", "w");
+        try self.declare("basic_kbcode", "w");
+        try self.declare("basic_kbspecial", "w");
+        try self.declare("basic_kbmod", "w");
+        try self.declare("basic_kbflush", "");
+        try self.declare("basic_kbclear", "");
+        try self.declare("basic_kbcount", "w");
+        try self.declare("basic_inkey", "l");
+        try self.declare("basic_pos", "w");
+        try self.declare("basic_row", "w");
+        try self.declare("basic_csrlin", "w");
+
+        // Mouse functions
+        try self.declare("basic_mouse_enable", "");
+        try self.declare("basic_mouse_disable", "");
+        try self.declare("basic_mouse_x", "w");
+        try self.declare("basic_mouse_y", "w");
+        try self.declare("basic_mouse_buttons", "w");
+        try self.declare("basic_mouse_button", "w %button");
+        try self.declare("basic_mouse_poll", "w");
 
         try self.builder.emitBlankLine();
     }
@@ -2073,6 +2207,32 @@ pub const ExprEmitter = struct {
         // Timer
         if (std.mem.eql(u8, name_upper, "TIMER")) return .{ .rt_name = "basic_timer", .ret_type = "d" };
         if (std.mem.eql(u8, name_upper, "TIMER_MS")) return .{ .rt_name = "basic_timer_ms", .ret_type = "l" };
+        // Keyboard input
+        if (std.mem.eql(u8, name_upper, "KBHIT")) return .{ .rt_name = "basic_kbhit", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBGET")) return .{ .rt_name = "basic_kbget", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBPEEK")) return .{ .rt_name = "basic_kbpeek", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBCODE")) return .{ .rt_name = "basic_kbcode", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBSPECIAL")) return .{ .rt_name = "basic_kbspecial", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBMOD")) return .{ .rt_name = "basic_kbmod", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "KBCOUNT")) return .{ .rt_name = "basic_kbcount", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "INKEY")) return .{ .rt_name = "basic_inkey", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "INKEY$")) return .{ .rt_name = "basic_inkey", .ret_type = "l" };
+        // File operations
+        if (std.mem.eql(u8, name_upper, "SLURP")) return .{ .rt_name = "basic_slurp", .ret_type = "l" };
+        // Command-line arguments
+        if (std.mem.eql(u8, name_upper, "COMMAND")) return .{ .rt_name = "basic_command", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "COMMAND$")) return .{ .rt_name = "basic_command", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "COMMANDCOUNT")) return .{ .rt_name = "basic_command_count", .ret_type = "w" };
+        // Terminal position queries
+        if (std.mem.eql(u8, name_upper, "POS")) return .{ .rt_name = "basic_pos", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "ROW")) return .{ .rt_name = "basic_row", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "CSRLIN")) return .{ .rt_name = "basic_csrlin", .ret_type = "w" };
+        // Mouse functions
+        if (std.mem.eql(u8, name_upper, "MOUSE_X")) return .{ .rt_name = "basic_mouse_x", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "MOUSE_Y")) return .{ .rt_name = "basic_mouse_y", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "MOUSE_BUTTONS")) return .{ .rt_name = "basic_mouse_buttons", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "MOUSE_BUTTON")) return .{ .rt_name = "basic_mouse_button", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "MOUSE_POLL")) return .{ .rt_name = "basic_mouse_poll", .ret_type = "w" };
         // Not a builtin
         return null;
     }
@@ -4628,6 +4788,12 @@ pub const BlockEmitter = struct {
             .shared => |sh_stmt| try self.emitSharedStatement(&sh_stmt),
             .erase => |er| try self.emitEraseStatement(&er),
 
+            // ── File I/O & Process Execution ────────────────────────────
+            .open => |op| try self.emitOpenStatement(&op),
+            .close => |cl| try self.emitCloseStatement(&cl),
+            .shell => |sh| try self.emitShellStatement(&sh),
+            .spit => |sp| try self.emitSpitStatement(&sp),
+
             // ── Control-flow statements: handle structurally ────────────
             //
             // These statements created the block structure in the CFG.
@@ -4662,6 +4828,34 @@ pub const BlockEmitter = struct {
             .sub => {}, // handled via function_cfgs
             .worker => {}, // handled via function_cfgs
             .unmarshall => |um| try self.emitUnmarshallStatement(&um),
+
+            // ── Terminal I/O ────────────────────────────────────────────
+            .cls => try self.emitCLS(),
+            .gcls => try self.emitGCLS(),
+            .locate => |loc_stmt| try self.emitLocate(&loc_stmt),
+            .color => |col_stmt| try self.emitColor(&col_stmt),
+            .cursor_on => try self.emitCursorOn(),
+            .cursor_off => try self.emitCursorOff(),
+            .cursor_hide => try self.emitCursorHide(),
+            .cursor_show => try self.emitCursorShow(),
+            .cursor_save => try self.emitCursorSave(),
+            .cursor_restore => try self.emitCursorRestore(),
+            .color_reset => try self.emitColorReset(),
+            .bold => try self.emitBold(),
+            .italic => try self.emitItalic(),
+            .underline => try self.emitUnderline(),
+            .blink => try self.emitBlink(),
+            .inverse => try self.emitInverse(),
+            .style_reset => try self.emitStyleReset(),
+            .normal => try self.emitNormal(),
+            .screen_alternate => try self.emitScreenAlternate(),
+            .screen_main => try self.emitScreenMain(),
+            .kbraw => |kb| try self.emitKbRaw(&kb),
+            .kbecho => |kb| try self.emitKbEcho(&kb),
+            .kbflush => try self.emitKbFlush(),
+
+            // ── Input statements ────────────────────────────────────────
+            .input => |inp| try self.emitInputStatement(&inp),
 
             // ── Fallback ────────────────────────────────────────────────
             else => {
@@ -7189,40 +7383,75 @@ pub const BlockEmitter = struct {
     // ── Leaf Statement Emitters ─────────────────────────────────────────
 
     fn emitPrintStatement(self: *BlockEmitter, pr: *const ast.PrintStmt) EmitError!void {
+        // Check for file output: PRINT #n, ...
+        var file_handle: ?[]const u8 = null;
+        if (pr.file_number) |file_num_expr| {
+            try self.builder.emitComment("PRINT # to file");
+
+            // Evaluate file number expression
+            const file_num_val = try self.expr_emitter.emitExpression(file_num_expr);
+
+            // Get file handle
+            const fh = try self.builder.newTemp();
+            try self.builder.emitCall(fh, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+            file_handle = fh;
+        }
+
         for (pr.items) |item| {
-            // ── Check if the expression is a UDT variable ──────────────
-            // UDT variables are stored as pointers (l type) but
-            // inferExprType returns .double.  Printing them with
-            // basic_print_double causes a QBE type mismatch.  Instead,
-            // emit field-by-field printing.
-            const udt_name = self.expr_emitter.inferUDTNameForExpr(item.expr);
-            if (udt_name) |uname| {
-                try self.emitPrintUDT(item.expr, uname);
-            } else {
+            if (file_handle) |fh| {
+                // Print to file
                 const val = try self.expr_emitter.emitExpression(item.expr);
                 const et = self.expr_emitter.inferExprType(item.expr);
-                // basic_print_int expects int64_t (l type).  If the expression
-                // produced a 32-bit word we must sign-extend it first.
-                const print_val = if (et == .integer) blk: {
+
+                if (et == .string) {
+                    try self.runtime.callVoid("file_print_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ fh, val }));
+                } else if (et == .integer) {
                     const long_val = try self.builder.newTemp();
                     try self.builder.emitExtend(long_val, "l", "extsw", val);
-                    break :blk long_val;
-                } else val;
-                const args = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ et.printArgLetter(), print_val });
-                try self.runtime.callVoid(et.printFn(), args);
-            }
+                    try self.runtime.callVoid("file_print_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ fh, long_val }));
+                } else if (et == .double) {
+                    try self.runtime.callVoid("file_print_double", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ fh, val }));
+                }
+            } else {
+                // Print to console
+                // ── Check if the expression is a UDT variable ──────────────
+                // UDT variables are stored as pointers (l type) but
+                // inferExprType returns .double.  Printing them with
+                // basic_print_double causes a QBE type mismatch.  Instead,
+                // emit field-by-field printing.
+                const udt_name = self.expr_emitter.inferUDTNameForExpr(item.expr);
+                if (udt_name) |uname| {
+                    try self.emitPrintUDT(item.expr, uname);
+                } else {
+                    const val = try self.expr_emitter.emitExpression(item.expr);
+                    const et = self.expr_emitter.inferExprType(item.expr);
+                    // basic_print_int expects int64_t (l type).  If the expression
+                    // produced a 32-bit word we must sign-extend it first.
+                    const print_val = if (et == .integer) blk: {
+                        const long_val = try self.builder.newTemp();
+                        try self.builder.emitExtend(long_val, "l", "extsw", val);
+                        break :blk long_val;
+                    } else val;
+                    const args = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ et.printArgLetter(), print_val });
+                    try self.runtime.callVoid(et.printFn(), args);
+                }
 
-            if (item.comma) {
-                try self.runtime.callVoid("basic_print_tab", "");
-            }
-            if (item.semicolon) {
-                // Semicolon: no space between items (already handled by not
-                // emitting tab/newline). Nothing to do.
+                if (item.comma) {
+                    try self.runtime.callVoid("basic_print_tab", "");
+                }
+                if (item.semicolon) {
+                    // Semicolon: no space between items (already handled by not
+                    // emitting tab/newline). Nothing to do.
+                }
             }
         }
 
         if (pr.trailing_newline) {
-            try self.runtime.callVoid("basic_print_newline", "");
+            if (file_handle) |fh| {
+                try self.runtime.callVoid("file_print_newline", try std.fmt.allocPrint(self.allocator, "l {s}", .{fh}));
+            } else {
+                try self.runtime.callVoid("basic_print_newline", "");
+            }
         }
     }
 
@@ -7355,6 +7584,106 @@ pub const BlockEmitter = struct {
         }
     }
 
+    fn emitOpenStatement(self: *BlockEmitter, op: *const ast.OpenStmt) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "OPEN file", .{}));
+
+        // Evaluate filename expression (should be a string)
+        const filename_val = try self.expr_emitter.emitExpression(op.filename);
+
+        // Create mode string literal
+        const mode_label = try self.builder.registerString(op.mode);
+        const mode_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ mode_tmp, mode_label });
+        const mode_str = try self.builder.newTemp();
+        try self.builder.emitCall(mode_str, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{mode_tmp}));
+
+        // Call file_open(filename, mode)
+        const file_handle = try self.builder.newTemp();
+        try self.builder.emitCall(file_handle, "l", "file_open", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ filename_val, mode_str }));
+
+        // Evaluate file number expression
+        const file_num_val = try self.expr_emitter.emitExpression(op.file_number);
+
+        // Store handle in file table: file_set_handle(file_number, handle)
+        try self.runtime.callVoid("file_set_handle", try std.fmt.allocPrint(self.allocator, "w {s}, l {s}", .{ file_num_val, file_handle }));
+    }
+
+    fn emitCloseStatement(self: *BlockEmitter, cl: *const ast.CloseStmt) EmitError!void {
+        if (cl.close_all) {
+            try self.builder.emitComment("CLOSE all files (not implemented)");
+            // TODO: implement close all
+            return;
+        }
+
+        if (cl.file_number) |file_num_expr| {
+            try self.builder.emitComment("CLOSE file");
+
+            // Evaluate file number expression
+            const file_num_val = try self.expr_emitter.emitExpression(file_num_expr);
+
+            // Get file handle
+            const file_handle = try self.builder.newTemp();
+            try self.builder.emitCall(file_handle, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+
+            // Close file
+            try self.runtime.callVoid("file_close", try std.fmt.allocPrint(self.allocator, "l {s}", .{file_handle}));
+
+            // Clear handle in table
+            try self.runtime.callVoid("file_set_handle", try std.fmt.allocPrint(self.allocator, "w {s}, l 0", .{file_num_val}));
+        }
+    }
+
+    fn emitShellStatement(self: *BlockEmitter, sh: *const ast.ShellStmt) EmitError!void {
+        try self.builder.emitComment("SHELL command");
+
+        // Evaluate command expression
+        const cmd_val = try self.expr_emitter.emitExpression(sh.command);
+
+        // Call basic_shell(command)
+        try self.runtime.callVoid("basic_shell", try std.fmt.allocPrint(self.allocator, "l {s}", .{cmd_val}));
+    }
+
+    fn emitSpitStatement(self: *BlockEmitter, sp: *const ast.SpitStmt) EmitError!void {
+        try self.builder.emitComment("SPIT - write string to file");
+
+        // Evaluate filename expression
+        const filename_val = try self.expr_emitter.emitExpression(sp.filename);
+
+        // Evaluate content expression
+        const content_val = try self.expr_emitter.emitExpression(sp.content);
+
+        // Call basic_spit(filename, content)
+        try self.runtime.callVoid("basic_spit", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ filename_val, content_val }));
+    }
+
+    fn emitInputStatement(self: *BlockEmitter, inp: *const ast.InputStmt) EmitError!void {
+        if (inp.file_number) |file_num_expr| {
+            // File input: INPUT #n, var or LINE INPUT #n, var
+            try self.builder.emitComment(if (inp.is_line_input) "LINE INPUT # from file" else "INPUT # from file");
+
+            // Evaluate file number
+            const file_num_val = try self.expr_emitter.emitExpression(file_num_expr);
+
+            // Get file handle
+            const file_handle = try self.builder.newTemp();
+            try self.builder.emitCall(file_handle, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+
+            // For now, only handle string variables (LINE INPUT style)
+            for (inp.variables) |var_name| {
+                // Read line from file
+                const line_val = try self.builder.newTemp();
+                try self.builder.emitCall(line_val, "l", "file_read_line", try std.fmt.allocPrint(self.allocator, "l {s}", .{file_handle}));
+
+                // Store in variable
+                const resolved = try self.resolveVarAddr(var_name, .type_string);
+                try self.builder.emitStore("l", line_val, resolved.addr);
+            }
+        } else {
+            // Console input (existing behavior would go here - for now just comment)
+            try self.builder.emitComment("INPUT from console (TODO)");
+        }
+    }
+
     /// Emit UNMARSHALL target, source — reconstruct array or UDT from
     /// a marshalled blob pointer.
     fn emitUnmarshallStatement(self: *BlockEmitter, um: *const ast.UnmarshallStmt) EmitError!void {
@@ -7464,6 +7793,210 @@ pub const BlockEmitter = struct {
         // Fallback: treat as scalar assignment (store the value).
         const resolved = try self.resolveVarAddr(um.target_variable, null);
         try self.builder.emitStore(resolved.store_type, src_val, resolved.addr);
+    }
+
+    // ── Terminal I/O Statement Emitters ─────────────────────────────────
+
+    fn emitCLS(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CLS - Clear screen");
+        try self.runtime.callVoid("basic_cls", "");
+    }
+
+    fn emitGCLS(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("GCLS - Graphics clear screen");
+        try self.runtime.callVoid("basic_gcls", "");
+    }
+
+    fn emitLocate(self: *BlockEmitter, loc_stmt: *const ast.LocateStmt) EmitError!void {
+        try self.builder.emitComment("LOCATE - Position cursor");
+
+        // Evaluate row expression
+        const row_val = try self.expr_emitter.emitExpression(loc_stmt.row);
+        const row_type = self.expr_emitter.inferExprType(loc_stmt.row);
+
+        // Convert to integer if needed
+        const row_int = if (row_type == .integer) row_val else blk: {
+            const t = try self.builder.newTemp();
+            try self.builder.emitConvert(t, "w", "dtosi", row_val);
+            break :blk t;
+        };
+
+        // Handle column (optional)
+        if (loc_stmt.col) |col_expr| {
+            const col_val = try self.expr_emitter.emitExpression(col_expr);
+            const col_type = self.expr_emitter.inferExprType(col_expr);
+
+            const col_int = if (col_type == .integer) col_val else blk: {
+                const t = try self.builder.newTemp();
+                try self.builder.emitConvert(t, "w", "dtosi", col_val);
+                break :blk t;
+            };
+
+            // BASIC syntax is LOCATE col, row but runtime is basic_locate(row, col)
+            // So we swap the parameters here
+            const args = try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ col_int, row_int });
+            try self.runtime.callVoid("basic_locate", args);
+        } else {
+            // Column defaults to 1
+            const args = try std.fmt.allocPrint(self.allocator, "w 1, w {s}", .{row_int});
+            try self.runtime.callVoid("basic_locate", args);
+        }
+    }
+
+    fn emitColor(self: *BlockEmitter, col_stmt: *const ast.ColorStmt) EmitError!void {
+        try self.builder.emitComment("COLOR - Set terminal colors");
+
+        // Evaluate foreground color
+        const fg_val = try self.expr_emitter.emitExpression(col_stmt.fg);
+        const fg_type = self.expr_emitter.inferExprType(col_stmt.fg);
+
+        const fg_int = if (fg_type == .integer) fg_val else blk: {
+            const t = try self.builder.newTemp();
+            try self.builder.emitConvert(t, "w", "dtosi", fg_val);
+            break :blk t;
+        };
+
+        // Handle background color (optional)
+        if (col_stmt.bg) |bg_expr| {
+            const bg_val = try self.expr_emitter.emitExpression(bg_expr);
+            const bg_type = self.expr_emitter.inferExprType(bg_expr);
+
+            const bg_int = if (bg_type == .integer) bg_val else blk: {
+                const t = try self.builder.newTemp();
+                try self.builder.emitConvert(t, "w", "dtosi", bg_val);
+                break :blk t;
+            };
+
+            const args = try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ fg_int, bg_int });
+            try self.runtime.callVoid("basic_color_bg", args);
+        } else {
+            // Foreground only
+            const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{fg_int});
+            try self.runtime.callVoid("basic_color", args);
+        }
+    }
+
+    // ── Cursor Control Commands ─────────────────────────────────────────
+
+    fn emitCursorOn(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_ON - Show cursor");
+        try self.runtime.callVoid("showCursor", "");
+    }
+
+    fn emitCursorOff(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_OFF - Hide cursor");
+        try self.runtime.callVoid("hideCursor", "");
+    }
+
+    fn emitCursorHide(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_HIDE - Hide cursor");
+        try self.runtime.callVoid("basic_cursor_hide", "");
+    }
+
+    fn emitCursorShow(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_SHOW - Show cursor");
+        try self.runtime.callVoid("basic_cursor_show", "");
+    }
+
+    fn emitCursorSave(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_SAVE - Save cursor position");
+        try self.runtime.callVoid("basic_cursor_save", "");
+    }
+
+    fn emitCursorRestore(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("CURSOR_RESTORE - Restore cursor position");
+        try self.runtime.callVoid("basic_cursor_restore", "");
+    }
+
+    // ── Color and Style Commands ────────────────────────────────────────
+
+    fn emitColorReset(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("COLOR_RESET - Reset colors to defaults");
+        try self.runtime.callVoid("basic_color_reset", "");
+    }
+
+    fn emitBold(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("BOLD - Enable bold text");
+        try self.runtime.callVoid("basic_style_bold", "");
+    }
+
+    fn emitItalic(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("ITALIC - Enable italic text");
+        try self.runtime.callVoid("basic_style_italic", "");
+    }
+
+    fn emitUnderline(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("UNDERLINE - Enable underlined text");
+        try self.runtime.callVoid("basic_style_underline", "");
+    }
+
+    fn emitBlink(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("BLINK - Enable blinking text");
+        try self.runtime.callVoid("basic_style_blink", "");
+    }
+
+    fn emitInverse(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("INVERSE - Enable reverse video");
+        try self.runtime.callVoid("basic_style_reverse", "");
+    }
+
+    fn emitStyleReset(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("STYLE_RESET - Reset all text styles");
+        try self.runtime.callVoid("basic_style_reset", "");
+    }
+
+    fn emitNormal(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("NORMAL - Return to normal display");
+        try self.runtime.callVoid("basic_color_reset", "");
+    }
+
+    // ── Screen Buffer Commands ──────────────────────────────────────────
+
+    fn emitScreenAlternate(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("SCREEN_ALTERNATE - Switch to alternate screen buffer");
+        try self.runtime.callVoid("basic_screen_alternate", "");
+    }
+
+    fn emitScreenMain(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("SCREEN_MAIN - Switch to main screen");
+        try self.runtime.callVoid("basic_screen_main", "");
+    }
+
+    fn emitKbRaw(self: *BlockEmitter, stmt: *const ast.KbRawStmt) EmitError!void {
+        try self.builder.emitComment("KBRAW - Set raw mode");
+        const enable_val = try self.expr_emitter.emitExpression(stmt.enable);
+        const enable_type = self.expr_emitter.inferExprType(stmt.enable);
+
+        // Convert to integer if needed
+        const enable_int = if (enable_type == .integer) enable_val else blk: {
+            const t = try self.builder.newTemp();
+            try self.builder.emitConvert(t, "w", "dtosi", enable_val);
+            break :blk t;
+        };
+
+        const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{enable_int});
+        try self.runtime.callVoid("basic_kbraw", args);
+    }
+
+    fn emitKbEcho(self: *BlockEmitter, stmt: *const ast.KbEchoStmt) EmitError!void {
+        try self.builder.emitComment("KBECHO - Set echo mode");
+        const enable_val = try self.expr_emitter.emitExpression(stmt.enable);
+        const enable_type = self.expr_emitter.inferExprType(stmt.enable);
+
+        // Convert to integer if needed
+        const enable_int = if (enable_type == .integer) enable_val else blk: {
+            const t = try self.builder.newTemp();
+            try self.builder.emitConvert(t, "w", "dtosi", enable_val);
+            break :blk t;
+        };
+
+        const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{enable_int});
+        try self.runtime.callVoid("basic_kbecho", args);
+    }
+
+    fn emitKbFlush(self: *BlockEmitter) EmitError!void {
+        try self.builder.emitComment("KBFLUSH/KBCLEAR - Flush keyboard buffer");
+        try self.runtime.callVoid("basic_kbflush", "");
     }
 
     fn emitLetStatement(self: *BlockEmitter, lt: *const ast.LetStmt) EmitError!void {
@@ -8716,21 +9249,96 @@ pub const BlockEmitter = struct {
     }
 
     fn emitSwapStatement(self: *BlockEmitter, sw: *const ast.SwapStmt) EmitError!void {
-        const resolved1 = try self.resolveVarAddr(sw.var1, null);
-        const resolved2 = try self.resolveVarAddr(sw.var2, null);
+        // Helper to compute the address and type of an lvalue (simple var, array element, or member)
+        const LValue = struct {
+            addr: []const u8,
+            store_type: []const u8,
+            base_type: semantic.BaseType,
+        };
 
-        // Use the type of the first variable for the swap operation.
-        // If both are the same type this is straightforward; if they
-        // differ we use the wider type (double) to avoid truncation.
-        const load1 = resolved1.store_type;
-        const load2 = resolved2.store_type;
+        const computeLValueAddr = struct {
+            fn compute(
+                emitter: *BlockEmitter,
+                var_name: []const u8,
+                indices: []ast.ExprPtr,
+                member_chain: []const []const u8,
+            ) EmitError!LValue {
+                // Simple variable (no indices, no member chain)
+                if (indices.len == 0 and member_chain.len == 0) {
+                    const resolved = try emitter.resolveVarAddr(var_name, null);
+                    return LValue{
+                        .addr = resolved.addr,
+                        .store_type = resolved.store_type,
+                        .base_type = resolved.base_type,
+                    };
+                }
 
+                // Array element access
+                if (indices.len > 0) {
+                    const index_val = try emitter.expr_emitter.emitExpression(indices[0]);
+                    const idx_type = emitter.expr_emitter.inferExprType(indices[0]);
+                    const index_int = if (idx_type == .integer) index_val else blk: {
+                        const t = try emitter.builder.newTemp();
+                        try emitter.builder.emitConvert(t, "w", "dtosi", index_val);
+                        break :blk t;
+                    };
+
+                    const desc_name = try emitter.symbol_mapper.arrayDescName(var_name);
+                    const desc_addr = try emitter.builder.newTemp();
+                    try emitter.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
+
+                    // Bounds check
+                    const bc_args = try std.fmt.allocPrint(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                    try emitter.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+
+                    // Get element address
+                    const elem_addr = try emitter.builder.newTemp();
+                    const ea_args = try std.fmt.allocPrint(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                    try emitter.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
+
+                    // Look up array element type
+                    var arr_bt = semantic.BaseType.integer;
+                    var arr_store_type: []const u8 = "w";
+                    {
+                        var alu_buf: [128]u8 = undefined;
+                        const alu_len = @min(var_name.len, alu_buf.len);
+                        for (0..alu_len) |ali| alu_buf[ali] = std.ascii.toUpper(var_name[ali]);
+                        if (emitter.symbol_table.lookupArray(alu_buf[0..alu_len])) |arr_sym| {
+                            if (arr_sym.element_type_desc.base_type != .unknown) {
+                                arr_bt = arr_sym.element_type_desc.base_type;
+                                arr_store_type = arr_bt.toQBEMemOp();
+                            }
+                        }
+                    }
+
+                    // TODO: Handle member_chain for array elements if needed
+                    return LValue{
+                        .addr = elem_addr,
+                        .store_type = arr_store_type,
+                        .base_type = arr_bt,
+                    };
+                }
+
+                // TODO: Handle member_chain for simple variables if needed
+                const resolved = try emitter.resolveVarAddr(var_name, null);
+                return LValue{
+                    .addr = resolved.addr,
+                    .store_type = resolved.store_type,
+                    .base_type = resolved.base_type,
+                };
+            }
+        }.compute;
+
+        const lval1 = try computeLValueAddr(self, sw.var1, sw.var1_indices, sw.var1_member_chain);
+        const lval2 = try computeLValueAddr(self, sw.var2, sw.var2_indices, sw.var2_member_chain);
+
+        // Perform the swap using temporaries
         const tmp1 = try self.builder.newTemp();
-        try self.builder.emitLoad(tmp1, load1, resolved1.addr);
+        try self.builder.emitLoad(tmp1, lval1.store_type, lval1.addr);
         const tmp2 = try self.builder.newTemp();
-        try self.builder.emitLoad(tmp2, load2, resolved2.addr);
-        try self.builder.emitStore(load1, tmp2, resolved1.addr);
-        try self.builder.emitStore(load2, tmp1, resolved2.addr);
+        try self.builder.emitLoad(tmp2, lval2.store_type, lval2.addr);
+        try self.builder.emitStore(lval1.store_type, tmp2, lval1.addr);
+        try self.builder.emitStore(lval2.store_type, tmp1, lval2.addr);
     }
 
     // ── LOCAL / SHARED statement handling ───────────────────────────────
@@ -8942,7 +9550,7 @@ pub const CFGCodeGenerator = struct {
         try self.runtime.emitDeclarations();
 
         // Phase 5: Main function (from program CFG)
-        try self.emitCFGFunction(self.program_cfg, "main", "w", "", true, null);
+        try self.emitCFGFunction(self.program_cfg, "main", "w", "w %argc, l %argv", true, null, false);
 
         // Phase 6: Function/Sub definitions (from CFGBuilder's function_cfgs)
         var func_it = self.cfg_builder.function_cfgs.iterator();
@@ -9080,7 +9688,10 @@ pub const CFGCodeGenerator = struct {
                     _ = alignment;
                 }
 
-                try self.emitCFGFunction(func_cfg, mangled, ret_type, params_buf.items, false, &func_ctx);
+                // Analyze if this function needs automatic scoping
+                const scope_analysis = FunctionScopeAnalyzer.analyze(func_cfg);
+
+                try self.emitCFGFunction(func_cfg, mangled, ret_type, params_buf.items, false, &func_ctx, scope_analysis.needs_scope);
                 func_ctx.deinit();
             } else {
                 // It might be a SUB (no return value).
@@ -9166,9 +9777,16 @@ pub const CFGCodeGenerator = struct {
                         const param_stripped = SymbolMapper.stripSuffix(param);
                         try std.fmt.format(params_buf.writer(self.allocator), "{s} %{s}", .{ pt, param_stripped });
                     }
-                    try self.emitCFGFunction(func_cfg, mangled, "", params_buf.items, false, &func_ctx);
+
+                    // Analyze if this SUB needs automatic scoping
+                    const scope_analysis = FunctionScopeAnalyzer.analyze(func_cfg);
+
+                    try self.emitCFGFunction(func_cfg, mangled, "", params_buf.items, false, &func_ctx, scope_analysis.needs_scope);
                 } else {
-                    try self.emitCFGFunction(func_cfg, mangled, "", "", false, &func_ctx);
+                    // Analyze if this SUB needs automatic scoping
+                    const scope_analysis = FunctionScopeAnalyzer.analyze(func_cfg);
+
+                    try self.emitCFGFunction(func_cfg, mangled, "", "", false, &func_ctx, scope_analysis.needs_scope);
                 }
                 func_ctx.deinit();
             }
@@ -9212,6 +9830,7 @@ pub const CFGCodeGenerator = struct {
         params: []const u8,
         is_main: bool,
         func_ctx: ?*FunctionContext,
+        auto_scope: bool,
     ) !void {
         var be = &self.block_emitter.?;
         be.setCFG(the_cfg);
@@ -9229,6 +9848,16 @@ pub const CFGCodeGenerator = struct {
         // that follows lives in a valid block.
         if (!is_main) {
             try self.builder.emitLabel("prologue");
+        } else {
+            // Main function: initialize command-line arguments
+            try self.builder.emitLabel("prologue");
+            try self.runtime.callVoid("basic_init_args", "w %argc, l %argv");
+        }
+
+        // ── Automatic SAMM scope for functions that need it ──────
+        if (!is_main and auto_scope and self.samm_enabled) {
+            try self.builder.emitComment("SAMM: Enter function scope (auto-detected)");
+            try self.runtime.callVoid("samm_enter_scope", "");
         }
 
         // ── Function prologue: allocate stack slots for parameters ──────
@@ -9297,12 +9926,12 @@ pub const CFGCodeGenerator = struct {
             for (order) |block_idx| {
                 const block = the_cfg.getBlockConst(block_idx);
                 if (!block.reachable) continue;
-                try self.emitBlock(the_cfg, block, is_main, func_ctx);
+                try self.emitBlock(the_cfg, block, is_main, func_ctx, auto_scope);
             }
         } else {
             // Fallback: iterate all blocks in index order.
             for (the_cfg.blocks.items) |block| {
-                try self.emitBlock(the_cfg, &block, is_main, func_ctx);
+                try self.emitBlock(the_cfg, &block, is_main, func_ctx, auto_scope);
             }
         }
 
@@ -9323,6 +9952,7 @@ pub const CFGCodeGenerator = struct {
         block: *const cfg_mod.BasicBlock,
         is_main: bool,
         func_ctx: ?*const FunctionContext,
+        auto_scope: bool,
     ) !void {
         var be = &self.block_emitter.?;
         const label = try blockLabel(the_cfg, block.index, self.allocator);
@@ -9365,12 +9995,20 @@ pub const CFGCodeGenerator = struct {
             try self.builder.emitComment("Program exit");
             // Always call samm_shutdown to match the unconditional samm_init.
             try self.runtime.callVoid("samm_shutdown", "");
+            // Call runtime cleanup (closes files, frees arena, prints memory stats)
+            try self.runtime.callVoid("basic_runtime_cleanup", "");
             try self.builder.emitReturn("0");
             return;
         }
 
         // Special: exit block for a function/sub.
         if (block.kind == .exit_block and !is_main) {
+            // Exit automatic SAMM scope if enabled
+            if (auto_scope and self.samm_enabled) {
+                try self.builder.emitComment("SAMM: Exit function scope (auto-detected)");
+                try self.runtime.callVoid("samm_exit_scope", "");
+            }
+
             if (func_ctx) |fctx| {
                 if (fctx.is_function) {
                     // Load the accumulated return value and return it.

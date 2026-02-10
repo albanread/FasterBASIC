@@ -275,6 +275,10 @@ pub const StmtData = union(enum) {
     open: OpenStmt,
     close: CloseStmt,
 
+    // ── Process Execution ───────────────────────────────────────────────
+    shell: ShellStmt,
+    spit: SpitStmt,
+
     // ── Graphics / Sound / Timing ───────────────────────────────────────
     cls: void,
     gcls: void,
@@ -282,6 +286,30 @@ pub const StmtData = union(enum) {
     color: ColorStmt,
     wait_stmt: WaitStmt,
     wait_ms: WaitStmt,
+
+    // ── Terminal I/O (simple commands) ───────────────────────────────────
+    cursor_on: void,
+    cursor_off: void,
+    cursor_hide: void,
+    cursor_show: void,
+    cursor_save: void,
+    cursor_restore: void,
+    color_reset: void,
+    bold: void,
+    italic: void,
+    underline: void,
+    blink: void,
+    inverse: void,
+    style_reset: void,
+    normal: void,
+    screen_alternate: void,
+    screen_main: void,
+
+    // ── Keyboard input ──────────────────────────────────────────────────
+    kbraw: KbRawStmt,
+    kbecho: KbEchoStmt,
+    kbflush: void,
+
     pset: PsetStmt,
     line_stmt: LineStmt,
     rect: RectStmt,
@@ -339,7 +367,7 @@ pub const PrintItem = struct {
 };
 
 pub const PrintStmt = struct {
-    file_number: i32 = 0,
+    file_number: ?ExprPtr = null, // Expression for file number (null for console)
     items: []PrintItem,
     trailing_newline: bool = true,
     /// PRINT USING support.
@@ -356,7 +384,7 @@ pub const ConsoleStmt = struct {
 pub const InputStmt = struct {
     prompt: []const u8 = "",
     variables: []const []const u8,
-    file_number: i32 = 0,
+    file_number: ?ExprPtr = null, // Expression for file number (null for console)
     is_line_input: bool = false,
 };
 
@@ -610,7 +638,11 @@ pub const EraseStmt = struct {
 
 pub const SwapStmt = struct {
     var1: []const u8,
+    var1_indices: []ExprPtr = &.{},
+    var1_member_chain: []const []const u8 = &.{},
     var2: []const u8,
+    var2_indices: []ExprPtr = &.{},
+    var2_member_chain: []const []const u8 = &.{},
 };
 
 pub const IncDecStmt = struct {
@@ -862,15 +894,26 @@ pub const DeleteStmt = struct {
 // ── File I/O ────────────────────────────────────────────────────────────
 
 pub const OpenStmt = struct {
-    filename: []const u8,
-    mode: []const u8 = "",
-    file_number: i32 = 0,
+    filename: ExprPtr, // Expression for filename (string)
+    mode: []const u8 = "", // "INPUT", "OUTPUT", "APPEND"
+    file_number: ExprPtr, // Expression for file number (integer)
     record_length: i32 = 0,
 };
 
 pub const CloseStmt = struct {
-    file_number: i32 = 0,
+    file_number: ?ExprPtr = null, // Expression for file number (null if close_all)
     close_all: bool = false,
+};
+
+// ── Process Execution ───────────────────────────────────────────────────
+
+pub const ShellStmt = struct {
+    command: ExprPtr, // Command expression (string)
+};
+
+pub const SpitStmt = struct {
+    filename: ExprPtr, // Filename expression (string)
+    content: ExprPtr, // Content expression (string)
 };
 
 // ── Graphics ────────────────────────────────────────────────────────────
@@ -1065,6 +1108,14 @@ pub const RemStmt = struct {
 pub const ExpressionStmtData = struct {
     name: []const u8,
     arguments: []ExprPtr = &.{},
+};
+
+pub const KbRawStmt = struct {
+    enable: ExprPtr,
+};
+
+pub const KbEchoStmt = struct {
+    enable: ExprPtr,
 };
 
 pub const RegistryCommandStmt = struct {

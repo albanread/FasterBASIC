@@ -5,11 +5,19 @@
 // Console output (print int/float/string/newline/tab/hex/pointer),
 // terminal control (CLS, LOCATE, COLOR, WIDTH),
 // console input (INPUT, LINE INPUT, INKEY$),
-// file operations (OPEN, CLOSE, PRINT#, READ LINE, EOF).
+// file operations (OPEN, CLOSE, PRINT#, READ LINE, EOF),
+// command-line arguments (COMMAND$).
 //
 
 const std = @import("std");
 const c = std.c;
+
+// =========================================================================
+// Command-line arguments storage
+// =========================================================================
+
+var g_argc: i32 = 0;
+var g_argv: [*][*:0]u8 = undefined;
 
 // =========================================================================
 // Extern declarations
@@ -44,9 +52,16 @@ extern fn fgets(buf: [*]u8, size: c_int, stream: *anyopaque) ?[*]u8;
 extern fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern fn fclose(stream: *anyopaque) c_int;
 extern fn feof(stream: *anyopaque) c_int;
+extern fn fseek(stream: *anyopaque, offset: c_long, whence: c_int) c_int;
+extern fn ftell(stream: *anyopaque) c_long;
+extern fn fread(ptr: *anyopaque, size: usize, nmemb: usize, stream: *anyopaque) usize;
+extern fn fwrite(ptr: *const anyopaque, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern fn strdup(s: [*:0]const u8) ?[*:0]u8;
 extern fn strlen(s: [*:0]const u8) usize;
 extern fn putchar(ch: c_int) c_int;
+
+const SEEK_SET: c_int = 0;
+const SEEK_END: c_int = 2;
 
 // stdout
 extern const __stdoutp: *anyopaque;
@@ -163,39 +178,12 @@ export fn basic_print_at(row: i32, col: i32, str: ?*BasicString) callconv(.c) vo
     _ = fflush(__stdoutp);
 }
 
-export fn basic_cls() callconv(.c) void {
-    _ = printf("\x1b[2J\x1b[H");
-    _ = fflush(__stdoutp);
-}
-
 // =========================================================================
 // Terminal Control
 // =========================================================================
-
-export fn basic_locate(row: i32, col: i32) callconv(.c) void {
-    _ = printf("\x1b[%d;%dH", row, col);
-    _ = fflush(__stdoutp);
-}
-
-export fn basic_color(foreground: i32, background: i32) callconv(.c) void {
-    var fg: i32 = 30;
-    var bg: i32 = 40;
-
-    if (foreground >= 8) {
-        fg = 90 + (foreground - 8);
-    } else if (foreground >= 0) {
-        fg = 30 + foreground;
-    }
-
-    if (background >= 8) {
-        bg = 100 + (background - 8);
-    } else if (background >= 0) {
-        bg = 40 + background;
-    }
-
-    _ = printf("\x1b[%d;%dm", fg, bg);
-    _ = fflush(__stdoutp);
-}
+// NOTE: CLS, LOCATE, and COLOR functions moved to terminal_io.zig
+// The terminal_io module provides a complete terminal I/O implementation
+// with cursor control, colors, styles, and more.
 
 var g_terminal_width: i32 = 80;
 
@@ -210,42 +198,12 @@ export fn basic_get_width() callconv(.c) i32 {
 var g_cursor_row: i32 = 1;
 var g_cursor_col: i32 = 1;
 
-export fn basic_csrlin() callconv(.c) i32 {
-    return g_cursor_row;
-}
-
-export fn basic_pos(dummy: i32) callconv(.c) i32 {
-    _ = dummy;
-    return g_cursor_col;
-}
+// NOTE: basic_csrlin, basic_pos, and basic_inkey are now in terminal_io.zig
+// to avoid duplication and to support enhanced keyboard input features.
 
 export fn _basic_update_cursor_pos(row: i32, col: i32) callconv(.c) void {
     g_cursor_row = row;
     g_cursor_col = col;
-}
-
-// =========================================================================
-// INKEY$ — Non-blocking keyboard input
-// =========================================================================
-
-export fn basic_inkey() callconv(.c) ?*anyopaque {
-    // Set stdin to non-blocking mode
-    const flags = fcntl(STDIN_FILENO, F_GETFL, @as(c_int, 0));
-    _ = fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
-
-    // Try to read one character
-    var ch: [1]u8 = undefined;
-    const n = read(STDIN_FILENO, &ch, 1);
-
-    // Restore blocking mode
-    _ = fcntl(STDIN_FILENO, F_SETFL, flags);
-
-    if (n == 1) {
-        var str_buf: [2]u8 = .{ ch[0], 0 };
-        return string_new_utf8(@ptrCast(&str_buf));
-    }
-
-    return string_new_utf8("");
 }
 
 // =========================================================================
@@ -337,23 +295,29 @@ export fn basic_input_line() callconv(.c) ?*anyopaque {
 // File Operations
 // =========================================================================
 
-export fn file_open(filename: ?*BasicString, mode: ?*BasicString) callconv(.c) ?*BasicFile {
-    const fname = filename orelse {
+export fn file_open(filename: ?*anyopaque, mode: ?*anyopaque) callconv(.c) ?*BasicFile {
+    if (filename == null or mode == null) {
         basic_error_msg("Invalid file open parameters");
         return null;
-    };
-    const m = mode orelse {
-        basic_error_msg("Invalid file open parameters");
-        return null;
-    };
-    const fname_data = fname.data orelse {
-        basic_error_msg("Invalid file open parameters");
-        return null;
-    };
-    const mode_data = m.data orelse {
-        basic_error_msg("Invalid file open parameters");
-        return null;
-    };
+    }
+
+    // Convert string descriptors to C strings
+    const fname_data = string_to_utf8(filename);
+    const mode_str = string_to_utf8(mode);
+
+    // Map BASIC modes to C fopen modes
+    // INPUT -> "r", OUTPUT -> "w", APPEND -> "a"
+    var mode_data: [*:0]const u8 = "r";
+    if (std.mem.eql(u8, std.mem.span(mode_str), "INPUT")) {
+        mode_data = "r";
+    } else if (std.mem.eql(u8, std.mem.span(mode_str), "OUTPUT")) {
+        mode_data = "w";
+    } else if (std.mem.eql(u8, std.mem.span(mode_str), "APPEND")) {
+        mode_data = "a";
+    } else {
+        // Assume it's already a C mode
+        mode_data = mode_str;
+    }
 
     const raw = c.malloc(@sizeOf(BasicFile)) orelse {
         basic_error_msg("Out of memory (file allocation)");
@@ -497,4 +461,188 @@ export fn file_eof(file: ?*BasicFile) callconv(.c) bool {
     if (!f.is_open) return true;
     const fp = f.fp orelse return true;
     return feof(fp) != 0;
+}
+
+// =========================================================================
+// File Handle Management by Number
+// =========================================================================
+
+const MAX_FILE_HANDLES = 256;
+var file_handles: [MAX_FILE_HANDLES]?*BasicFile = [_]?*BasicFile{null} ** MAX_FILE_HANDLES;
+
+export fn file_get_handle(file_number: i32) callconv(.c) ?*BasicFile {
+    if (file_number < 0 or file_number >= MAX_FILE_HANDLES) {
+        basic_error_msg("Invalid file number");
+        return null;
+    }
+    return file_handles[@intCast(file_number)];
+}
+
+export fn file_set_handle(file_number: i32, file: ?*BasicFile) callconv(.c) void {
+    if (file_number < 0 or file_number >= MAX_FILE_HANDLES) {
+        basic_error_msg("Invalid file number");
+        return;
+    }
+    file_handles[@intCast(file_number)] = file;
+}
+
+export fn file_print_double(file: ?*BasicFile, value: f64) callconv(.c) void {
+    const f = file orelse {
+        basic_error_msg("File not open for writing");
+        return;
+    };
+    if (!f.is_open) {
+        basic_error_msg("File not open for writing");
+        return;
+    }
+    const fp = f.fp orelse {
+        basic_error_msg("File not open for writing");
+        return;
+    };
+    _ = fprintf(fp, "%g", value);
+    _ = fflush(fp);
+}
+
+// =========================================================================
+// Process Execution
+// =========================================================================
+
+extern fn system(command: [*:0]const u8) c_int;
+
+export fn basic_system(command: ?*anyopaque) callconv(.c) i32 {
+    if (command == null) return -1;
+    const cmd_str = string_to_utf8(command);
+    _ = fflush(__stdoutp);
+    const result = system(cmd_str);
+    return @intCast(result);
+}
+
+export fn basic_shell(command: ?*anyopaque) callconv(.c) void {
+    _ = basic_system(command);
+}
+
+// =========================================================================
+// Whole File Operations (SLURP / SPIT)
+// =========================================================================
+
+/// SLURP(filename$) — Read entire file into a string
+export fn basic_slurp(filename: ?*anyopaque) callconv(.c) ?*anyopaque {
+    if (filename == null) {
+        basic_error_msg("SLURP: filename cannot be null");
+        return string_new_utf8("");
+    }
+
+    const fname_data = string_to_utf8(filename);
+
+    // Open file in binary mode to preserve exact content
+    const fp = fopen(fname_data, "rb") orelse {
+        var err_msg: [256]u8 = undefined;
+        _ = snprintf(&err_msg, err_msg.len, "SLURP: Cannot open file: %s", fname_data);
+        basic_error_msg(@ptrCast(&err_msg));
+        return string_new_utf8("");
+    };
+    defer _ = fclose(fp);
+
+    // Get file size
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        basic_error_msg("SLURP: Cannot seek to end of file");
+        return string_new_utf8("");
+    }
+
+    const file_size = ftell(fp);
+    if (file_size < 0) {
+        basic_error_msg("SLURP: Cannot determine file size");
+        return string_new_utf8("");
+    }
+
+    if (fseek(fp, 0, SEEK_SET) != 0) {
+        basic_error_msg("SLURP: Cannot seek to beginning of file");
+        return string_new_utf8("");
+    }
+
+    // Allocate buffer (+1 for null terminator)
+    const buffer_size: usize = @intCast(file_size + 1);
+    const buffer = c.malloc(buffer_size) orelse {
+        basic_error_msg("SLURP: Out of memory");
+        return string_new_utf8("");
+    };
+    defer c.free(buffer);
+
+    // Read entire file
+    const bytes_read = fread(buffer, 1, @intCast(file_size), fp);
+    if (bytes_read != @as(usize, @intCast(file_size))) {
+        basic_error_msg("SLURP: Failed to read entire file");
+        return string_new_utf8("");
+    }
+
+    // Null-terminate the buffer
+    const buf_ptr: [*]u8 = @ptrCast(buffer);
+    buf_ptr[@intCast(file_size)] = 0;
+
+    // Create string from buffer
+    const result = string_new_utf8(@ptrCast(buffer));
+    return result;
+}
+
+/// SPIT(filename$, content$) — Write entire string to file
+export fn basic_spit(filename: ?*anyopaque, content: ?*anyopaque) callconv(.c) void {
+    if (filename == null) {
+        basic_error_msg("SPIT: filename cannot be null");
+        return;
+    }
+
+    const fname_data = string_to_utf8(filename);
+
+    // Open file in binary mode to preserve exact content
+    const fp = fopen(fname_data, "wb") orelse {
+        var err_msg: [256]u8 = undefined;
+        _ = snprintf(&err_msg, err_msg.len, "SPIT: Cannot open file: %s", fname_data);
+        basic_error_msg(@ptrCast(&err_msg));
+        return;
+    };
+    defer _ = fclose(fp);
+
+    // Handle empty/null content
+    if (content == null) {
+        // Write empty file
+        return;
+    }
+
+    const content_data = string_to_utf8(content);
+    const content_len = strlen(content_data);
+
+    if (content_len > 0) {
+        const bytes_written = fwrite(content_data, 1, content_len, fp);
+        if (bytes_written != content_len) {
+            basic_error_msg("SPIT: Failed to write entire file");
+            return;
+        }
+    }
+
+    _ = fflush(fp);
+}
+
+// =========================================================================
+// Command-line Arguments
+// =========================================================================
+
+/// Initialize command-line arguments (called from generated main)
+export fn basic_init_args(argc: i32, argv: [*][*:0]u8) callconv(.c) void {
+    g_argc = argc;
+    g_argv = argv;
+}
+
+/// Get number of command-line arguments (includes program name at index 0)
+export fn basic_command_count() callconv(.c) i32 {
+    return g_argc;
+}
+
+/// Get command-line argument at index n as a string
+/// COMMAND$(0) returns program name
+/// COMMAND$(1) returns first argument, etc.
+export fn basic_command(index: i32) callconv(.c) ?*anyopaque {
+    if (index < 0 or index >= g_argc) {
+        return string_new_utf8("");
+    }
+    return string_new_utf8(g_argv[@intCast(index)]);
 }

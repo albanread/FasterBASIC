@@ -253,6 +253,8 @@ pub const Tag = enum(u16) {
     kw_input_stream,
     kw_line_input_stream,
     kw_write_stream,
+    kw_slurp,
+    kw_spit,
 
     // ── Keywords (misc) ──────────────────────────────────────────────────
     kw_rem,
@@ -260,6 +262,10 @@ pub const Tag = enum(u16) {
     kw_color,
     kw_wait,
     kw_wait_ms,
+    kw_shell,
+    kw_system,
+    kw_command,
+    kw_commandcount,
 
     // ── Keywords (graphics) ──────────────────────────────────────────────
     kw_pset,
@@ -282,6 +288,75 @@ pub const Tag = enum(u16) {
     kw_tgrid,
     kw_tscroll,
     kw_tclear,
+
+    // ── Keywords (terminal I/O - VDU output) ─────────────────────────────
+    kw_vducls,
+    kw_vdueol,
+    kw_vdueos,
+    kw_vdupos,
+    kw_vducursor,
+    kw_vduup,
+    kw_vdudown,
+    kw_vduleft,
+    kw_vduright,
+    kw_vdumove,
+    kw_vducolor,
+    kw_vducolour,
+    kw_vdurgb,
+    kw_vdureset,
+    kw_vdustyle,
+    kw_vduscreen,
+    kw_vduposx,
+    kw_vduposy,
+    kw_vduwidth,
+    kw_vduheight,
+    kw_vdusize,
+
+    // ── Keywords (terminal I/O - cursor control) ─────────────────────────
+    kw_cursor_on,
+    kw_cursor_off,
+    kw_cursor_hide,
+    kw_cursor_show,
+    kw_cursor_save,
+    kw_cursor_restore,
+
+    // ── Keywords (terminal I/O - color & style) ──────────────────────────
+    kw_colour,
+    kw_color_reset,
+    kw_rgb,
+    kw_rgbfg,
+    kw_rgbbg,
+    kw_bold,
+    kw_italic,
+    kw_underline,
+    kw_blink,
+    kw_inverse,
+    kw_style_reset,
+    kw_normal,
+
+    // ── Keywords (terminal I/O - screen modes) ───────────────────────────
+    kw_screen_alternate,
+    kw_screen_main,
+
+    // ── Keywords (terminal I/O - KB input) ───────────────────────────────
+    kw_kbget,
+    kw_kbhit,
+    kw_kbpeek,
+    kw_kbcode,
+    kw_kbspecial,
+    kw_kbmod,
+    kw_kbraw,
+    kw_kbecho,
+    kw_kbflush,
+    kw_kbclear,
+    kw_kbcount,
+    kw_kbinput,
+    kw_inkey,
+
+    // ── Keywords (terminal I/O - position queries) ───────────────────────
+    kw_pos,
+    kw_row,
+    kw_csrlin,
 
     // ── Keywords (sprites) ───────────────────────────────────────────────
     kw_sprload,
@@ -405,11 +480,13 @@ pub const Tag = enum(u16) {
 
     /// Look up a keyword from its text representation (case-insensitive).
     /// Returns null if the text is not a keyword.
-    pub fn fromKeyword(text: []const u8) ?Tag {
-        const map = comptime buildKeywordMap();
+    /// Uses a general-purpose allocator (typically arena) for initialization.
+    pub fn fromKeyword(text: []const u8, allocator: std.mem.Allocator) ?Tag {
         var buf: [32]u8 = undefined;
         if (text.len > buf.len) return null;
         const upper = toUpperBuf(text, &buf);
+
+        const map = getKeywordMap(allocator) catch return null;
         return map.get(upper);
     }
 
@@ -435,9 +512,13 @@ pub const Tag = enum(u16) {
     }
 };
 
-// ─── Keyword map built at comptime ──────────────────────────────────────────
+// ─── Keyword map built at runtime (once) ────────────────────────────────────
 
-const KeywordMap = std.StaticStringMap(Tag);
+const KeywordMap = std.StringHashMap(Tag);
+
+var keyword_map_initialized = false;
+var keyword_map: KeywordMap = undefined;
+var keyword_map_mutex = std.Thread.Mutex{};
 
 fn toUpperBuf(text: []const u8, buf: []u8) []const u8 {
     const len = @min(text.len, buf.len);
@@ -447,7 +528,9 @@ fn toUpperBuf(text: []const u8, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-fn buildKeywordMap() KeywordMap {
+fn initKeywordMap(allocator: std.mem.Allocator) !void {
+    @setEvalBranchQuota(100000);
+    keyword_map = KeywordMap.init(allocator);
     const keywords = [_]struct { []const u8, Tag }{
         .{ "PRINT", .kw_print },
         .{ "CONSOLE", .kw_console },
@@ -578,11 +661,17 @@ fn buildKeywordMap() KeywordMap {
         .{ "NOTHING", .kw_nothing },
         .{ "OPEN", .kw_open },
         .{ "CLOSE", .kw_close },
+        .{ "SLURP", .kw_slurp },
+        .{ "SPIT", .kw_spit },
         .{ "REM", .kw_rem },
         .{ "CLS", .kw_cls },
         .{ "COLOR", .kw_color },
+        .{ "COMMAND", .kw_command },
+        .{ "COMMANDCOUNT", .kw_commandcount },
         .{ "WAIT", .kw_wait },
         .{ "WAIT_MS", .kw_wait_ms },
+        .{ "SHELL", .kw_shell },
+        .{ "SYSTEM", .kw_system },
         .{ "PSET", .kw_pset },
         .{ "LINE", .kw_line },
         .{ "RECT", .kw_rect },
@@ -594,37 +683,99 @@ fn buildKeywordMap() KeywordMap {
         .{ "VLINE", .kw_vline },
         .{ "AT", .kw_at },
         .{ "LOCATE", .kw_locate },
-        .{ "TEXTPUT", .kw_textput },
-        .{ "PRINT_AT", .kw_print_at },
-        .{ "INPUT_AT", .kw_input_at },
-        .{ "TCHAR", .kw_tchar },
-        .{ "TGRID", .kw_tgrid },
-        .{ "TSCROLL", .kw_tscroll },
-        .{ "TCLEAR", .kw_tclear },
-        .{ "SPRLOAD", .kw_sprload },
-        .{ "SPRFREE", .kw_sprfree },
-        .{ "SPRSHOW", .kw_sprshow },
-        .{ "SPRHIDE", .kw_sprhide },
-        .{ "SPRMOVE", .kw_sprmove },
-        .{ "SPRPOS", .kw_sprpos },
-        .{ "SPRTINT", .kw_sprtint },
-        .{ "SPRSCALE", .kw_sprscale },
-        .{ "SPRROT", .kw_sprrot },
-        .{ "SPREXPLODE", .kw_sprexplode },
-        .{ "PLAY", .kw_play },
-        .{ "PLAY_SOUND", .kw_play_sound },
+        .{ "VDUCLS", .kw_vducls },
+        .{ "VDUEOL", .kw_vdueol },
+        .{ "VDUEOS", .kw_vdueos },
+        .{ "VDUPOS", .kw_vdupos },
+        .{ "VDUCURSOR", .kw_vducursor },
+        .{ "VDUUP", .kw_vduup },
+        .{ "VDUDOWN", .kw_vdudown },
+        .{ "VDULEFT", .kw_vduleft },
+        .{ "VDURIGHT", .kw_vduright },
+        .{ "VDUMOVE", .kw_vdumove },
+        .{ "VDUCOLOR", .kw_vducolor },
+        .{ "VDUCOLOUR", .kw_vducolour },
+        .{ "VDURGB", .kw_vdurgb },
+        .{ "VDURESET", .kw_vdureset },
+        .{ "VDUSTYLE", .kw_vdustyle },
+        .{ "VDUSCREEN", .kw_vduscreen },
+        .{ "VDUPOSX", .kw_vduposx },
+        .{ "VDUPOSY", .kw_vduposy },
+        .{ "VDUWIDTH", .kw_vduwidth },
+        .{ "VDUHEIGHT", .kw_vduheight },
+        .{ "VDUSIZE", .kw_vdusize },
+        .{ "CURSOR_ON", .kw_cursor_on },
+        .{ "CURSOR_OFF", .kw_cursor_off },
+        .{ "CURSOR_HIDE", .kw_cursor_hide },
+        .{ "CURSOR_SHOW", .kw_cursor_show },
+        .{ "CURSOR_SAVE", .kw_cursor_save },
+        .{ "CURSOR_RESTORE", .kw_cursor_restore },
+        .{ "COLOUR", .kw_colour },
+        .{ "COLOR_RESET", .kw_color_reset },
+        .{ "RGB", .kw_rgb },
+        .{ "RGBFG", .kw_rgbfg },
+        .{ "RGBBG", .kw_rgbbg },
+        .{ "BOLD", .kw_bold },
+        .{ "ITALIC", .kw_italic },
+        .{ "UNDERLINE", .kw_underline },
+        .{ "BLINK", .kw_blink },
+        .{ "INVERSE", .kw_inverse },
+        .{ "STYLE_RESET", .kw_style_reset },
+        .{ "NORMAL", .kw_normal },
+        .{ "SCREEN_ALTERNATE", .kw_screen_alternate },
+        .{ "SCREEN_MAIN", .kw_screen_main },
+        // Keyboard input - commented out to reduce keyword map size
+        .{ "KBGET", .kw_kbget },
+        .{ "KBHIT", .kw_kbhit },
+        .{ "KBPEEK", .kw_kbpeek },
+        .{ "KBCODE", .kw_kbcode },
+        .{ "KBSPECIAL", .kw_kbspecial },
+        .{ "KBMOD", .kw_kbmod },
+        .{ "KBRAW", .kw_kbraw },
+        .{ "KBECHO", .kw_kbecho },
+        .{ "KBFLUSH", .kw_kbflush },
+        .{ "KBCLEAR", .kw_kbclear },
+        .{ "KBCOUNT", .kw_kbcount },
+        .{ "KBINPUT", .kw_kbinput },
+        .{ "INKEY", .kw_inkey },
+        .{ "POS", .kw_pos },
+        .{ "ROW", .kw_row },
+        .{ "CSRLIN", .kw_csrlin },
+        // Text layer - commented out to reduce keyword map size
+        // .{ "TEXTPUT", .kw_textput },
+        // .{ "PRINT_AT", .kw_print_at },
+        // .{ "INPUT_AT", .kw_input_at },
+        // .{ "TCHAR", .kw_tchar },
+        // .{ "TGRID", .kw_tgrid },
+        // .{ "TSCROLL", .kw_tscroll },
+        // .{ "TCLEAR", .kw_tclear },
+        // Sprites - commented out to reduce keyword map size
+        // .{ "SPRLOAD", .kw_sprload },
+        // .{ "SPRFREE", .kw_sprfree },
+        // .{ "SPRSHOW", .kw_sprshow },
+        // .{ "SPRHIDE", .kw_sprhide },
+        // .{ "SPRMOVE", .kw_sprmove },
+        // .{ "SPRPOS", .kw_sprpos },
+        // .{ "SPRTINT", .kw_sprtint },
+        // .{ "SPRSCALE", .kw_sprscale },
+        // .{ "SPRROT", .kw_sprrot },
+        // .{ "SPREXPLODE", .kw_sprexplode },
+        // Audio - commented out to reduce keyword map size
+        // .{ "PLAY", .kw_play },
+        // .{ "PLAY_SOUND", .kw_play_sound },
         .{ "SLEEP", .kw_sleep },
-        .{ "VSYNC", .kw_vsync },
-        .{ "AFTER", .kw_after },
-        .{ "EVERY", .kw_every },
-        .{ "AFTERFRAMES", .kw_afterframes },
-        .{ "EVERYFRAME", .kw_everyframe },
-        .{ "TIMER", .kw_timer },
-        .{ "STOP", .kw_stop },
-        .{ "RUN", .kw_run },
-        .{ "MS", .kw_ms },
-        .{ "SECS", .kw_secs },
-        .{ "FRAMES", .kw_frames },
+        // Timing - commented out some to reduce keyword map size
+        // .{ "VSYNC", .kw_vsync },
+        // .{ "AFTER", .kw_after },
+        // .{ "EVERY", .kw_every },
+        // .{ "AFTERFRAMES", .kw_afterframes },
+        // .{ "EVERYFRAME", .kw_everyframe },
+        // .{ "TIMER", .kw_timer },
+        // .{ "STOP", .kw_stop },
+        // .{ "RUN", .kw_run },
+        // .{ "MS", .kw_ms },
+        // .{ "SECS", .kw_secs },
+        // .{ "FRAMES", .kw_frames },
         .{ "AND", .kw_and },
         .{ "OR", .kw_or },
         .{ "NOT", .kw_not },
@@ -657,30 +808,57 @@ fn buildKeywordMap() KeywordMap {
         .{ "TYPEOF", .kw_typeof },
         .{ "USING", .kw_using },
     };
-    return KeywordMap.initComptime(&keywords);
+
+    for (keywords) |kw| {
+        try keyword_map.put(kw[0], kw[1]);
+    }
+    keyword_map_initialized = true;
+}
+
+fn getKeywordMap(allocator: std.mem.Allocator) !*KeywordMap {
+    keyword_map_mutex.lock();
+    defer keyword_map_mutex.unlock();
+
+    if (!keyword_map_initialized) {
+        try initKeywordMap(allocator);
+    }
+    return &keyword_map;
+}
+
+fn deinitKeywordMap() void {
+    keyword_map_mutex.lock();
+    defer keyword_map_mutex.unlock();
+
+    if (keyword_map_initialized) {
+        keyword_map.deinit();
+        keyword_map_initialized = false;
+    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "keyword lookup - basic" {
-    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("PRINT").?);
-    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("print").?);
-    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("Print").?);
-    try std.testing.expectEqual(Tag.kw_if, Tag.fromKeyword("IF").?);
-    try std.testing.expectEqual(Tag.kw_end, Tag.fromKeyword("END").?);
-    try std.testing.expect(Tag.fromKeyword("NOTAKEYWORD") == null);
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("PRINT", allocator).?);
+    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("print", allocator).?);
+    try std.testing.expectEqual(Tag.kw_print, Tag.fromKeyword("Print", allocator).?);
+    try std.testing.expectEqual(Tag.kw_if, Tag.fromKeyword("IF", allocator).?);
+    try std.testing.expectEqual(Tag.kw_end, Tag.fromKeyword("END", allocator).?);
+    try std.testing.expect(Tag.fromKeyword("NOTAKEYWORD", allocator) == null);
 }
 
 test "keyword lookup - type keywords" {
-    try std.testing.expectEqual(Tag.kw_integer, Tag.fromKeyword("INTEGER").?);
-    try std.testing.expectEqual(Tag.kw_string_type, Tag.fromKeyword("STRING").?);
-    try std.testing.expectEqual(Tag.kw_double, Tag.fromKeyword("DOUBLE").?);
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(Tag.kw_integer, Tag.fromKeyword("INTEGER", allocator).?);
+    try std.testing.expectEqual(Tag.kw_string_type, Tag.fromKeyword("STRING", allocator).?);
+    try std.testing.expectEqual(Tag.kw_double, Tag.fromKeyword("DOUBLE", allocator).?);
 }
 
 test "keyword lookup - operators" {
-    try std.testing.expectEqual(Tag.kw_and, Tag.fromKeyword("AND").?);
-    try std.testing.expectEqual(Tag.kw_or, Tag.fromKeyword("OR").?);
-    try std.testing.expectEqual(Tag.kw_mod, Tag.fromKeyword("MOD").?);
+    const allocator = std.testing.allocator;
+    try std.testing.expectEqual(Tag.kw_and, Tag.fromKeyword("AND", allocator).?);
+    try std.testing.expectEqual(Tag.kw_or, Tag.fromKeyword("OR", allocator).?);
+    try std.testing.expectEqual(Tag.kw_mod, Tag.fromKeyword("MOD", allocator).?);
 }
 
 test "token predicates" {
