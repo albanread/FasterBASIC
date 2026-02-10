@@ -269,7 +269,7 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - ✅ STRING and numeric arrays with full read/write access
 - ✅ Array declaration: `DIM names$(5)`, `DIM numbers%(10 TO 20)`
 - ✅ Array assignment: `names$(0) = "Alice"`, `numbers%(15) = 42`
-- ✅ Array access in expressions: `PRINT names$(0)`, `x% = numbers%(i%)`
+- ✅ Array access in expressions: `PRINT names$(0)`, `x = numbers(i)`
 - ✅ Bounds checking with runtime error handling
 - ✅ Dynamic array operations:
   - ✅ ERASE - Free array memory (preserves declaration)
@@ -607,26 +607,26 @@ END
 
 ### FOR Loop with Nested Loops
 ```basic
-FOR i% = 1 TO 3
-    PRINT "Outer: i% = "; i%
-    FOR j% = 1 TO 2
-        PRINT "  Inner: j% = "; j%
-    NEXT j%
-NEXT i%
+FOR i = 1 TO 3
+    PRINT "Outer: i = "; i
+    FOR j = 1 TO 2
+        PRINT "  Inner: j = "; j
+    NEXT j
+NEXT i
 END
 ```
 
 ### Recursive Function
 ```basic
-FUNCTION Factorial%(N%)
-    IF N% <= 1 THEN
-        Factorial% = 1
+FUNCTION Factorial(N)
+    IF N <= 1 THEN
+        Factorial = 1
     ELSE
-        Factorial% = N% * Factorial%(N% - 1)
+        Factorial = N * Factorial(N - 1)
     END IF
 END FUNCTION
 
-PRINT "5! = "; Factorial%(5)
+PRINT "5! = "; Factorial(5)
 END
 ```
 
@@ -837,9 +837,9 @@ Outer body block → Inner FOR init block → Inner check → Inner body → Inn
 
 Input:
 ```basic
-FOR i% = 1 TO 5
-    PRINT i%
-NEXT i%
+FOR i = 1 TO 5
+    PRINT i
+NEXT i
 END
 ```
 
