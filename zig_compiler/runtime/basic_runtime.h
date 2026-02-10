@@ -59,6 +59,10 @@ typedef struct BasicFile {
     char* filename;
     char* mode;
     bool is_open;
+    // Buffered reader fields (used by INPUT mode).
+    uint8_t* read_buf;
+    size_t   read_buf_size;
+    size_t   read_pos;
 } BasicFile;
 
 // =============================================================================
@@ -194,9 +198,18 @@ int32_t basic_setjmp(void);
 #define ERR_TYPE_MISMATCH     13
 #define ERR_BAD_FILE          52
 #define ERR_FILE_NOT_FOUND    53
+#define ERR_FILE_ALREADY_OPEN 55
+#define ERR_FILE_NOT_OPEN     56
 #define ERR_DISK_FULL         61
 #define ERR_INPUT_PAST_END    62
+#define ERR_BAD_FILE_NUMBER   64
+#define ERR_FILE_ALREADY_EXISTS 68
 #define ERR_DISK_NOT_READY    71
+#define ERR_PERMISSION_DENIED 75
+#define ERR_PATH_NOT_FOUND    76
+#define ERR_INVALID_MODE      80
+#define ERR_INVALID_RECORD_LENGTH 81
+#define ERR_RECORD_OUT_OF_RANGE 82
 
 // =============================================================================
 // Array Operations

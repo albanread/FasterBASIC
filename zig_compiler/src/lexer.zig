@@ -436,6 +436,37 @@ pub const Lexer = struct {
         const followed_by_suffix = !self.isAtEnd() and (isNumericTypeSuffix(self.currentChar()) or self.currentChar() == '$');
 
         if (!followed_by_suffix) {
+            // Special: LINE INPUT (check before keyword lookup since LINE is no longer a keyword)
+            if (std.mem.eql(u8, lexeme, "LINE")) {
+                const saved_pos = self.pos;
+                const saved_line = self.line;
+                const saved_col = self.column;
+                self.skipWhitespace();
+                if (!self.isAtEnd() and isIdentifierStart(self.currentChar())) {
+                    const compound_start = self.pos;
+                    while (!self.isAtEnd() and isIdentifierChar(self.currentChar())) {
+                        _ = self.advance();
+                    }
+                    const second_word = self.source[compound_start..self.pos];
+                    var buf: [16]u8 = undefined;
+                    if (second_word.len <= buf.len) {
+                        const upper = toUpperBuf(second_word, &buf);
+                        if (std.mem.eql(u8, upper, "INPUT")) {
+                            const compound_lexeme = self.source[start..self.pos];
+                            try self.addToken(.kw_line_input, compound_lexeme, loc);
+                            return;
+                        }
+                    }
+                }
+                // Not "LINE INPUT" — rewind and treat LINE as identifier
+                self.pos = saved_pos;
+                self.line = saved_line;
+                self.column = saved_col;
+                // Continue to emit as identifier since kw_line no longer exists
+                try self.addToken(.identifier, lexeme, loc);
+                return;
+            }
+
             if (Tag.fromKeyword(lexeme, self.allocator)) |kw_tag| {
                 // Special handling for REM — rest of line is comment
                 if (kw_tag == .kw_rem) {

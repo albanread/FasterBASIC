@@ -1436,7 +1436,7 @@ pub const ExprEmitter = struct {
                 if (mapBuiltinFunction(fc_upper)) |bi| {
                     if (std.mem.eql(u8, bi.ret_type, "w")) break :blk ExprType.integer;
                     if (std.mem.eql(u8, bi.ret_type, "l")) break :blk ExprType.string;
-                    if (std.mem.eql(u8, bi.ret_type, "d")) break :blk ExprType.double;
+                    if (std.mem.eql(u8, bi.ret_type, "d") or std.mem.eql(u8, bi.ret_type, "s")) break :blk ExprType.double;
                 }
                 // Check symbol table for user-defined functions
                 if (self.symbol_table.lookupFunction(fc_upper)) |fsym| {
@@ -2146,7 +2146,14 @@ pub const ExprEmitter = struct {
         switch (op) {
             .minus => try self.builder.emitNeg(dest, qbe_t, val),
             .kw_not => {
-                try self.builder.emitCompare(dest, "w", "eq", val, "0");
+                if (std.mem.eql(u8, qbe_t, "d")) {
+                    // Double operand: convert to word first, then compare
+                    const conv = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =w dtosi {s}\n", .{ conv, val });
+                    try self.builder.emitCompare(dest, "w", "eq", conv, "0");
+                } else {
+                    try self.builder.emitCompare(dest, "w", "eq", val, "0");
+                }
             },
             else => {
                 try self.builder.emit("    {s} ={s} copy {s}\n", .{ dest, qbe_t, val });
@@ -2237,6 +2244,17 @@ pub const ExprEmitter = struct {
         if (std.mem.eql(u8, name_upper, "POS")) return .{ .rt_name = "basic_pos", .ret_type = "w" };
         if (std.mem.eql(u8, name_upper, "ROW")) return .{ .rt_name = "basic_row", .ret_type = "w" };
         if (std.mem.eql(u8, name_upper, "CSRLIN")) return .{ .rt_name = "basic_csrlin", .ret_type = "w" };
+        // Binary/Random file I/O functions
+        if (std.mem.eql(u8, name_upper, "MKI$") or std.mem.eql(u8, name_upper, "MKI")) return .{ .rt_name = "basic_mki", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "MKS$") or std.mem.eql(u8, name_upper, "MKS")) return .{ .rt_name = "basic_mks", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "MKD$") or std.mem.eql(u8, name_upper, "MKD")) return .{ .rt_name = "basic_mkd", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "CVI")) return .{ .rt_name = "basic_cvi", .ret_type = "w" };
+        if (std.mem.eql(u8, name_upper, "CVS")) return .{ .rt_name = "basic_cvs", .ret_type = "d" };
+        if (std.mem.eql(u8, name_upper, "CVD")) return .{ .rt_name = "basic_cvd", .ret_type = "d" };
+        if (std.mem.eql(u8, name_upper, "INPUT$")) return .{ .rt_name = "basic_input_file", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "LOC")) return .{ .rt_name = "basic_loc", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "LOF")) return .{ .rt_name = "basic_lof", .ret_type = "l" };
+        if (std.mem.eql(u8, name_upper, "EOF")) return .{ .rt_name = "basic_eof", .ret_type = "w" };
         // Mouse functions
         if (std.mem.eql(u8, name_upper, "MOUSE_X")) return .{ .rt_name = "basic_mouse_x", .ret_type = "w" };
         if (std.mem.eql(u8, name_upper, "MOUSE_Y")) return .{ .rt_name = "basic_mouse_y", .ret_type = "w" };
@@ -4614,6 +4632,9 @@ pub const BlockEmitter = struct {
     /// Pre-allocated FOR loop slots, keyed by uppercase variable name.
     for_pre_allocs: std.StringHashMap(ForPreAlloc),
 
+    /// FIELD variable mappings: var_name -> { file_num_tmp, offset, length }
+    field_mappings: std.StringHashMap(FieldMapping),
+
     /// Whether SAMM is enabled.
     samm_enabled: bool = true,
 
@@ -4645,6 +4666,7 @@ pub const BlockEmitter = struct {
             .foreach_hashmap_contexts = std.AutoHashMap(u32, ForEachHashmapContext).init(allocator),
             .case_contexts = std.AutoHashMap(u32, CaseContext).init(allocator),
             .for_pre_allocs = std.StringHashMap(ForPreAlloc).init(allocator),
+            .field_mappings = std.StringHashMap(FieldMapping).init(allocator),
         };
     }
 
@@ -4655,6 +4677,7 @@ pub const BlockEmitter = struct {
         self.foreach_hashmap_contexts.deinit();
         self.case_contexts.deinit();
         self.for_pre_allocs.deinit();
+        self.field_mappings.deinit();
     }
 
     /// Reset per-function state.
@@ -4665,6 +4688,7 @@ pub const BlockEmitter = struct {
         self.foreach_hashmap_contexts.clearRetainingCapacity();
         self.case_contexts.clearRetainingCapacity();
         self.for_pre_allocs.clearRetainingCapacity();
+        self.field_mappings.clearRetainingCapacity();
         self.func_ctx = null;
         self.expr_emitter.func_ctx = null;
     }
@@ -4803,6 +4827,12 @@ pub const BlockEmitter = struct {
             // ── File I/O & Process Execution ────────────────────────────
             .open => |op| try self.emitOpenStatement(&op),
             .close => |cl| try self.emitCloseStatement(&cl),
+            .field => |fd| try self.emitFieldStatement(&fd),
+            .lset => |ls| try self.emitLsetStatement(&ls),
+            .rset => |rs| try self.emitRsetStatement(&rs),
+            .put => |pt| try self.emitPutStatement(&pt),
+            .get => |gt| try self.emitGetStatement(&gt),
+            .seek => |sk| try self.emitSeekStatement(&sk),
             .shell => |sh| try self.emitShellStatement(&sh),
             .spit => |sp| try self.emitSpitStatement(&sp),
 
@@ -7621,6 +7651,201 @@ pub const BlockEmitter = struct {
         }
     }
 
+    // ── FIELD / LSET / RSET / PUT / GET / SEEK emitters ─────────────────
+
+    /// Track FIELD variable mappings: var_name -> { file_num_tmp, offset, length }
+    const FieldMapping = struct {
+        file_num_tmp: []const u8, // QBE temp holding the file number
+        offset: i32,
+        length: i32,
+    };
+
+    fn emitFieldStatement(self: *BlockEmitter, fd: *const ast.FieldStmt) EmitError!void {
+        try self.builder.emitComment("FIELD statement");
+
+        // Evaluate file number
+        const file_num_val = try self.expr_emitter.emitExpression(fd.file_number);
+
+        // Calculate total record size and emit field_init_buffer
+        var total_size: i32 = 0;
+        for (fd.fields) |field| {
+            // Field sizes must be numeric literals for now; evaluate expression
+            _ = try self.expr_emitter.emitExpression(field.size);
+            // For the offset calculation we need compile-time sizes.
+            // Extract from the AST: if it's a number literal, use it directly.
+            const size_val: i32 = switch (field.size.data) {
+                .number => |n| @intFromFloat(n.value),
+                else => 128, // fallback
+            };
+            total_size += size_val;
+        }
+
+        // Call field_init_buffer(file_num, total_size)
+        const size_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w copy {d}\n", .{ size_tmp, total_size });
+        try self.runtime.callVoid("field_init_buffer", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, size_tmp }));
+
+        // Store field mappings for LSET/RSET/GET to use
+        var offset: i32 = 0;
+        for (fd.fields) |field| {
+            const size_val: i32 = switch (field.size.data) {
+                .number => |n| @intFromFloat(n.value),
+                else => 128,
+            };
+
+            // Store mapping in the field_mappings table
+            const mapping = FieldMapping{
+                .file_num_tmp = try self.allocator.dupe(u8, file_num_val),
+                .offset = offset,
+                .length = size_val,
+            };
+
+            // Ensure the variable exists as a string variable
+            const resolved = try self.resolveVarAddr(field.var_name, .type_string);
+            // Initialize the variable to empty string
+            const empty_label = try self.builder.registerString("");
+            const empty_tmp = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l copy ${s}\n", .{ empty_tmp, empty_label });
+            const empty_str = try self.builder.newTemp();
+            try self.builder.emitCall(empty_str, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{empty_tmp}));
+            try self.builder.emitStore("l", empty_str, resolved.addr);
+
+            try self.field_mappings.put(try self.allocator.dupe(u8, field.var_name), mapping);
+
+            offset += size_val;
+        }
+    }
+
+    fn emitLsetStatement(self: *BlockEmitter, ls: *const ast.LsetStmt) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LSET {s}", .{ls.var_name}));
+
+        // Look up field mapping
+        const mapping = self.field_mappings.get(ls.var_name) orelse {
+            try self.builder.emitComment("LSET: variable not in FIELD mapping, treating as normal assignment");
+            // Fallback: just assign
+            const value = try self.expr_emitter.emitExpression(ls.value);
+            const resolved = try self.resolveVarAddr(ls.var_name, .type_string);
+            try self.builder.emitStore("l", value, resolved.addr);
+            return;
+        };
+
+        // Evaluate value expression
+        const value = try self.expr_emitter.emitExpression(ls.value);
+
+        // Call field_lset(file_num, offset, length, value)
+        const offset_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w copy {d}\n", .{ offset_tmp, mapping.offset });
+        const length_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
+        try self.runtime.callVoid("field_lset", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
+
+        // Also update the variable so reading it reflects the LSET value
+        const extracted = try self.builder.newTemp();
+        try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+        const resolved = try self.resolveVarAddr(ls.var_name, .type_string);
+        try self.builder.emitStore("l", extracted, resolved.addr);
+    }
+
+    fn emitRsetStatement(self: *BlockEmitter, rs: *const ast.RsetStmt) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "RSET {s}", .{rs.var_name}));
+
+        // Look up field mapping
+        const mapping = self.field_mappings.get(rs.var_name) orelse {
+            try self.builder.emitComment("RSET: variable not in FIELD mapping, treating as normal assignment");
+            const value = try self.expr_emitter.emitExpression(rs.value);
+            const resolved = try self.resolveVarAddr(rs.var_name, .type_string);
+            try self.builder.emitStore("l", value, resolved.addr);
+            return;
+        };
+
+        // Evaluate value expression
+        const value = try self.expr_emitter.emitExpression(rs.value);
+
+        // Call field_rset(file_num, offset, length, value)
+        const offset_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w copy {d}\n", .{ offset_tmp, mapping.offset });
+        const length_tmp = try self.builder.newTemp();
+        try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
+        try self.runtime.callVoid("field_rset", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
+
+        // Also update the variable
+        const extracted = try self.builder.newTemp();
+        try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+        const resolved = try self.resolveVarAddr(rs.var_name, .type_string);
+        try self.builder.emitStore("l", extracted, resolved.addr);
+    }
+
+    fn emitPutStatement(self: *BlockEmitter, pt: *const ast.PutStmt) EmitError!void {
+        try self.builder.emitComment("PUT record");
+
+        // Evaluate file number
+        const file_num_val = try self.expr_emitter.emitExpression(pt.file_number);
+
+        // Evaluate optional record number (default 0 = current position)
+        const record_val = if (pt.record_number) |rec_expr|
+            try self.expr_emitter.emitExpression(rec_expr)
+        else blk: {
+            const zero = try self.builder.newTemp();
+            try self.builder.emit("    {s} =w copy 0\n", .{zero});
+            break :blk zero;
+        };
+
+        // Call file_put_record(file_num, record_num)
+        try self.runtime.callVoid("file_put_record", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
+    }
+
+    fn emitGetStatement(self: *BlockEmitter, gt: *const ast.GetStmt) EmitError!void {
+        try self.builder.emitComment("GET record");
+
+        // Evaluate file number
+        const file_num_val = try self.expr_emitter.emitExpression(gt.file_number);
+
+        // Evaluate optional record number (default 0 = current position)
+        const record_val = if (gt.record_number) |rec_expr|
+            try self.expr_emitter.emitExpression(rec_expr)
+        else blk: {
+            const zero = try self.builder.newTemp();
+            try self.builder.emit("    {s} =w copy 0\n", .{zero});
+            break :blk zero;
+        };
+
+        // Call file_get_record(file_num, record_num)
+        try self.runtime.callVoid("file_get_record", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
+
+        // After GET, extract all FIELD variables mapped to this file
+        // so that reading them returns the data just read from disk.
+        var it = self.field_mappings.iterator();
+        while (it.next()) |entry| {
+            const mapping = entry.value_ptr.*;
+            // Only extract if this mapping belongs to the same file number temp.
+            // Since file_num_val might differ from the stored temp, we compare
+            // by re-extracting unconditionally (safe; costs a few extra calls).
+            const offset_tmp = try self.builder.newTemp();
+            try self.builder.emit("    {s} =w copy {d}\n", .{ offset_tmp, mapping.offset });
+            const length_tmp = try self.builder.newTemp();
+            try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
+
+            const extracted = try self.builder.newTemp();
+            try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+
+            const resolved = try self.resolveVarAddr(entry.key_ptr.*, .type_string);
+            try self.builder.emitStore("l", extracted, resolved.addr);
+        }
+    }
+
+    fn emitSeekStatement(self: *BlockEmitter, sk: *const ast.SeekStmt) EmitError!void {
+        try self.builder.emitComment("SEEK");
+
+        // Evaluate file number
+        const file_num_val = try self.expr_emitter.emitExpression(sk.file_number);
+
+        // Evaluate position
+        const pos_val = try self.expr_emitter.emitExpression(sk.position);
+
+        // Call file_seek(file_num, position)
+        try self.runtime.callVoid("file_seek", try std.fmt.allocPrint(self.allocator, "w {s}, l {s}", .{ file_num_val, pos_val }));
+    }
+
     fn emitOpenStatement(self: *BlockEmitter, op: *const ast.OpenStmt) EmitError!void {
         try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "OPEN file", .{}));
 
@@ -7716,8 +7941,52 @@ pub const BlockEmitter = struct {
                 try self.builder.emitStore("l", line_val, resolved.addr);
             }
         } else {
-            // Console input (existing behavior would go here - for now just comment)
-            try self.builder.emitComment("INPUT from console (TODO)");
+            // Console input: INPUT "prompt"; var or LINE INPUT "prompt"; var
+            if (inp.is_line_input) {
+                try self.builder.emitComment("LINE INPUT from console");
+            } else {
+                try self.builder.emitComment("INPUT from console");
+            }
+
+            // Print prompt if provided
+            if (inp.prompt.len > 0) {
+                const prompt_label = try self.builder.registerString(inp.prompt);
+                const prompt_tmp = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l copy ${s}\n", .{ prompt_tmp, prompt_label });
+                // Call basic_line_input(prompt) for first variable
+                if (inp.variables.len > 0) {
+                    const line_val = try self.builder.newTemp();
+                    try self.builder.emitCall(line_val, "l", "basic_line_input", try std.fmt.allocPrint(self.allocator, "l {s}", .{prompt_tmp}));
+                    const resolved = try self.resolveVarAddr(inp.variables[0], .type_string);
+                    try self.builder.emitStore("l", line_val, resolved.addr);
+                }
+                // Remaining variables get no prompt
+                if (inp.variables.len > 1) {
+                    for (inp.variables[1..]) |var_name| {
+                        const line_val = try self.builder.newTemp();
+                        try self.builder.emitCall(line_val, "l", "basic_input_line", "");
+                        const resolved = try self.resolveVarAddr(var_name, .type_string);
+                        try self.builder.emitStore("l", line_val, resolved.addr);
+                    }
+                }
+            } else {
+                // No prompt — use "? " for INPUT, nothing for LINE INPUT
+                for (inp.variables) |var_name| {
+                    const line_val = try self.builder.newTemp();
+                    if (!inp.is_line_input) {
+                        // INPUT uses "? " as default prompt
+                        const qmark_label = try self.builder.registerString("? ");
+                        const qmark_tmp = try self.builder.newTemp();
+                        try self.builder.emit("    {s} =l copy ${s}\n", .{ qmark_tmp, qmark_label });
+                        try self.builder.emitCall(line_val, "l", "basic_line_input", try std.fmt.allocPrint(self.allocator, "l {s}", .{qmark_tmp}));
+                    } else {
+                        // LINE INPUT uses no prompt
+                        try self.builder.emitCall(line_val, "l", "basic_input_line", "");
+                    }
+                    const resolved = try self.resolveVarAddr(var_name, .type_string);
+                    try self.builder.emitStore("l", line_val, resolved.addr);
+                }
+            }
         }
     }
 

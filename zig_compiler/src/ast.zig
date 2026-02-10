@@ -276,6 +276,12 @@ pub const StmtData = union(enum) {
     // ── File I/O ────────────────────────────────────────────────────────
     open: OpenStmt,
     close: CloseStmt,
+    field: FieldStmt,
+    lset: LsetStmt,
+    rset: RsetStmt,
+    put: PutStmt,
+    get: GetStmt,
+    seek: SeekStmt,
 
     // ── Process Execution ───────────────────────────────────────────────
     shell: ShellStmt,
@@ -911,6 +917,41 @@ pub const OpenStmt = struct {
     mode: []const u8 = "", // "INPUT", "OUTPUT", "APPEND"
     file_number: ExprPtr, // Expression for file number (integer)
     record_length: i32 = 0,
+};
+
+pub const FieldStmt = struct {
+    file_number: ExprPtr, // File number expression
+    fields: []FieldDef, // Field definitions
+};
+
+pub const FieldDef = struct {
+    size: ExprPtr, // Size in bytes
+    var_name: []const u8, // Variable name to bind
+};
+
+pub const LsetStmt = struct {
+    var_name: []const u8, // Variable name
+    value: ExprPtr, // Expression to left-justify
+};
+
+pub const RsetStmt = struct {
+    var_name: []const u8, // Variable name
+    value: ExprPtr, // Expression to right-justify
+};
+
+pub const PutStmt = struct {
+    file_number: ExprPtr, // File number expression
+    record_number: ?ExprPtr, // Optional record number (null = current position)
+};
+
+pub const GetStmt = struct {
+    file_number: ExprPtr, // File number expression
+    record_number: ?ExprPtr, // Optional record number (null = current position)
+};
+
+pub const SeekStmt = struct {
+    file_number: ExprPtr, // File number expression
+    position: ExprPtr, // Byte position to seek to
 };
 
 pub const CloseStmt = struct {

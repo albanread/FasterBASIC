@@ -59,6 +59,10 @@ typedef struct BasicFile {
     char* filename;
     char* mode;
     bool is_open;
+    // Buffered reader fields (used by INPUT mode).
+    uint8_t* read_buf;
+    size_t   read_buf_size;
+    size_t   read_pos;
 } BasicFile;
 
 // =============================================================================

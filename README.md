@@ -178,6 +178,7 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 
 - **Native Compilation** - Compiles to machine code, not interpreted
 - **Zig Compiler** - Written in Zig for memory safety and performance
+- **Classic File I/O** - Supports the I/O Grandad used (INPUT, OUTPUT, APPEND, BINARY, RANDOM)
 - **Object-Oriented** - Classes, inheritance, polymorphism, virtual dispatch
 - **Workers** - Lightweight concurrent threads with structured data passing
 - **MARSHALL/UNMARSHALL** - Type-safe binary serialisation with deep string copy
@@ -199,6 +200,21 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 - **[Lists and Pattern Matching](https://github.com/albanread/FasterBASIC/wiki/Lists-and-Pattern-Matching)** - Collections guide
 - **[NEON SIMD Support](https://github.com/albanread/FasterBASIC/wiki/NEON-SIMD-Support)** - Performance optimization
 - **[BNF Grammar](https://github.com/albanread/FasterBASIC/wiki/BNF-Grammar)** - Formal specification
+
+📖 **Articles** (in this repository):
+- **[Traditional File I/O](articles/traditional-file-io.md)** - Classic BASIC file operations guide
+- **[Classes and Objects](articles/classes-and-objects.md)** - Object-oriented programming
+- **[Workers](articles/workers.md)** - Concurrent programming with workers
+- **[User-Defined Types](articles/user-defined-types.md)** - UDT guide
+- **[Lists and Pattern Matching](articles/lists-and-match-type.md)** - Collections guide
+- **[NEON SIMD Support](articles/neon-simd-support.md)** - ARM64 vectorization
+- **[Array Expressions](articles/array-expressions.md)** - Array operations
+
+📁 **File I/O Documentation** (in this repository):
+- **[FILE_IO_ENHANCEMENTS_SUMMARY.md](FILE_IO_ENHANCEMENTS_SUMMARY.md)** - Complete OPEN statement guide
+- **[BINARY_RANDOM_FILE_IO.md](BINARY_RANDOM_FILE_IO.md)** - Binary and random access files
+- **[FILE_ERROR_HANDLING_SUMMARY.md](FILE_ERROR_HANDLING_SUMMARY.md)** - Error codes and TRY/CATCH patterns
+- **[LINE_INPUT_FIX_SUMMARY.md](LINE_INPUT_FIX_SUMMARY.md)** - LINE INPUT implementation details
 
 ## Project Status
 
@@ -308,6 +324,33 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
   - `s$(7 TO 7)` - single character
 - ✅ String concatenation with `+`
 - ✅ String literals and variables
+
+**Classic File I/O (QuickBASIC Compatible):**
+- ✅ OPEN statement with all modes:
+  - INPUT mode for reading text files
+  - OUTPUT mode for writing/creating files
+  - APPEND mode for appending to files
+  - BINARY mode (INPUT/OUTPUT/APPEND) for binary files
+  - RANDOM mode with record length for database-style access
+- ✅ Flexible OPEN syntax:
+  - Long form: `OPEN "file.dat" FOR BINARY OUTPUT AS #1`
+  - Single-letter aliases: `OPEN "file.dat" FOR B O AS #1`
+  - Flexible ordering: `BINARY OUTPUT` or `OUTPUT BINARY`
+  - Record lengths: `OPEN "data.db" FOR RANDOM 128 AS #1`
+- ✅ LINE INPUT for reading complete lines from files
+- ✅ PRINT # for writing to files
+- ✅ CLOSE for closing files
+- ✅ File position functions: LOC(), LOF()
+- ✅ Binary data conversion: MKI$, MKD$, CVI, CVD
+- ✅ INPUT$ for reading N bytes from files
+- ✅ Error handling with unique error codes:
+  - Error 53: File Not Found
+  - Error 64: Bad File Number
+  - Error 75: Permission Denied
+  - Error 56: File Not Open
+  - And 12 more file-specific error codes
+- ✅ Multiple files open simultaneously (256 file handles)
+- ✅ Expression-based filenames and file numbers
 
 **Statements:**
 - ✅ PRINT with formatting
@@ -691,6 +734,44 @@ PRINT "s$(TO 5): "; m$
 
 m$ = s$(7 TO)
 PRINT "s$(7 TO): "; m$
+END
+```
+
+### Classic File I/O (QuickBASIC Style)
+```basic
+REM Write data to a file
+OPEN "data.txt" FOR OUTPUT AS #1
+PRINT #1, "Line 1"
+PRINT #1, "Line 2"
+PRINT #1, "Line 3"
+CLOSE #1
+
+REM Read data from a file
+OPEN "data.txt" FOR INPUT AS #1
+DIM line1 AS STRING
+DIM line2 AS STRING
+LINE INPUT #1, line1
+LINE INPUT #1, line2
+CLOSE #1
+PRINT "First line: "; line1
+PRINT "Second line: "; line2
+
+REM Append to a file
+OPEN "data.txt" FOR APPEND AS #1
+PRINT #1, "Line 4 appended"
+CLOSE #1
+
+REM Binary file with record access
+OPEN "records.dat" FOR RANDOM 128 AS #2
+PRINT #2, "Record data"
+CLOSE #2
+
+REM Handle file errors
+TRY
+    OPEN "missing.txt" FOR INPUT AS #1
+CATCH
+    IF ERR = 53 THEN PRINT "File not found!"
+END TRY
 END
 ```
 

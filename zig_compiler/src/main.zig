@@ -1041,6 +1041,7 @@ pub fn main() !void {
                         "fbc_bridge",
                         "io_ops_format",
                         "io_ops",
+                        "binary_io",
                         "array_ops",
                         "marshalling",
                         "terminal_io",

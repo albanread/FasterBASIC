@@ -253,7 +253,7 @@ pub const Parser = struct {
             .kw_wrstr => self.parseWrstrStatement(),
             .kw_console => self.parseConsoleStatement(),
             .kw_input => self.parseInputStatement(),
-            .kw_line => self.parseInputStatement(),
+            .kw_line_input => self.parseInputStatement(),
             .kw_let => self.parseLetStatement(),
             .kw_goto => self.parseGotoStatement(),
             .kw_gosub => self.parseGosubStatement(),
@@ -296,6 +296,12 @@ pub const Parser = struct {
             .kw_delete => self.parseDeleteStatement(),
             .kw_open => self.parseOpenStatement(),
             .kw_close => self.parseCloseStatement(),
+            .kw_field => self.parseFieldStatement(),
+            .kw_lset => self.parseLsetStatement(),
+            .kw_rset => self.parseRsetStatement(),
+            .kw_put => self.parsePutStatement(),
+            .kw_get => self.parseGetStatement(),
+            .kw_seek => self.parseSeekStatement(),
             .kw_shell, .kw_system => self.parseShellStatement(),
             .kw_spit => self.parseSpitStatement(),
             .kw_cls => self.parseSimpleStatement(.kw_cls),
@@ -492,17 +498,9 @@ pub const Parser = struct {
 
     fn parseInputStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
-        const is_line_input = self.check(.kw_line);
+        const is_line_input = self.check(.kw_line_input);
 
-        if (is_line_input) {
-            _ = self.advance(); // consume LINE
-            if (!self.check(.kw_input)) {
-                try self.addError("Expected INPUT after LINE");
-                return error.ParseError;
-            }
-        }
-
-        _ = self.advance(); // consume INPUT
+        _ = self.advance(); // consume INPUT or LINE INPUT
 
         // Check for file input: INPUT #n, var or LINE INPUT #n, var
         // Note: # may be lexed as .type_double, so accept both .hash and .type_double
@@ -2828,6 +2826,197 @@ pub const Parser = struct {
         return self.builder.stmt(loc, .{ .delete = .{ .variable_name = var_name } });
     }
 
+    // ── FIELD #n, size AS var$, size AS var$, ... ────────────────────────
+    fn parseFieldStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume FIELD
+
+        // Optional # before file number
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+        }
+
+        // Parse file number expression
+        const file_number = try self.parseExpression();
+
+        _ = try self.consume(.comma, "Expected comma after file number in FIELD");
+
+        // Parse field definitions: size AS var$, size AS var$, ...
+        var fields: std.ArrayList(ast.FieldDef) = .empty;
+        defer fields.deinit(self.allocator);
+
+        while (!self.isAtEndOfStatement()) {
+            // Parse size expression
+            const size = try self.parseExpression();
+
+            // Expect AS keyword
+            _ = try self.consume(.kw_as, "Expected AS in FIELD definition");
+
+            // Parse variable name
+            if (!self.check(.identifier)) {
+                try self.addError("Expected variable name after AS in FIELD");
+                return error.ParseError;
+            }
+            const var_name = self.current().lexeme;
+            _ = self.advance();
+            // Skip optional type suffix ($, %, etc.)
+            self.skipTypeSuffix();
+
+            try fields.append(self.allocator, .{
+                .size = size,
+                .var_name = var_name,
+            });
+
+            // Optional comma before next field
+            if (self.check(.comma)) {
+                _ = self.advance();
+            } else {
+                break;
+            }
+        }
+
+        return self.builder.stmt(loc, .{
+            .field = .{
+                .file_number = file_number,
+                .fields = try self.allocator.dupe(ast.FieldDef, fields.items),
+            },
+        });
+    }
+
+    // ── LSET var$ = expression ───────────────────────────────────────────
+    fn parseLsetStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume LSET
+
+        if (!self.check(.identifier)) {
+            try self.addError("Expected variable name after LSET");
+            return error.ParseError;
+        }
+        const var_name = self.current().lexeme;
+        _ = self.advance();
+        // Skip optional type suffix
+        self.skipTypeSuffix();
+
+        _ = try self.consume(.equal, "Expected '=' after variable name in LSET");
+
+        const value = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .lset = .{
+                .var_name = var_name,
+                .value = value,
+            },
+        });
+    }
+
+    // ── RSET var$ = expression ───────────────────────────────────────────
+    fn parseRsetStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume RSET
+
+        if (!self.check(.identifier)) {
+            try self.addError("Expected variable name after RSET");
+            return error.ParseError;
+        }
+        const var_name = self.current().lexeme;
+        _ = self.advance();
+        // Skip optional type suffix
+        self.skipTypeSuffix();
+
+        _ = try self.consume(.equal, "Expected '=' after variable name in RSET");
+
+        const value = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .rset = .{
+                .var_name = var_name,
+                .value = value,
+            },
+        });
+    }
+
+    // ── PUT #n [, record_number] ─────────────────────────────────────────
+    fn parsePutStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume PUT
+
+        // Optional # before file number
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+        }
+
+        // Parse file number expression
+        const file_number = try self.parseExpression();
+
+        // Optional record number
+        var record_number: ?ast.ExprPtr = null;
+        if (self.check(.comma)) {
+            _ = self.advance();
+            record_number = try self.parseExpression();
+        }
+
+        return self.builder.stmt(loc, .{
+            .put = .{
+                .file_number = file_number,
+                .record_number = record_number,
+            },
+        });
+    }
+
+    // ── GET #n [, record_number] ─────────────────────────────────────────
+    fn parseGetStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume GET
+
+        // Optional # before file number
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+        }
+
+        // Parse file number expression
+        const file_number = try self.parseExpression();
+
+        // Optional record number
+        var record_number: ?ast.ExprPtr = null;
+        if (self.check(.comma)) {
+            _ = self.advance();
+            record_number = try self.parseExpression();
+        }
+
+        return self.builder.stmt(loc, .{
+            .get = .{
+                .file_number = file_number,
+                .record_number = record_number,
+            },
+        });
+    }
+
+    // ── SEEK #n, position ────────────────────────────────────────────────
+    fn parseSeekStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume SEEK
+
+        // Optional # before file number
+        if (self.check(.hash) or self.check(.type_double)) {
+            _ = self.advance();
+        }
+
+        // Parse file number expression
+        const file_number = try self.parseExpression();
+
+        _ = try self.consume(.comma, "Expected comma after file number in SEEK");
+
+        // Parse position expression
+        const position = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{
+            .seek = .{
+                .file_number = file_number,
+                .position = position,
+            },
+        });
+    }
+
     fn parseOpenStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume OPEN
@@ -2838,26 +3027,132 @@ pub const Parser = struct {
         // Expect FOR keyword
         _ = try self.consume(.kw_for, "Expected FOR after filename in OPEN");
 
-        // Parse mode (INPUT, OUTPUT, APPEND)
-        var mode: []const u8 = undefined;
-        if (self.check(.kw_input)) {
-            mode = "INPUT";
-            _ = self.advance();
-        } else if (self.check(.identifier)) {
-            const id_upper = self.current().lexeme;
-            if (std.mem.eql(u8, id_upper, "OUTPUT") or std.mem.eql(u8, id_upper, "output")) {
-                mode = "OUTPUT";
+        // Parse mode with flexible ordering support
+        // Supports: INPUT, OUTPUT, APPEND, BINARY, RANDOM
+        // Aliases: I, O, A, B, R (single letters)
+        // Flexible ordering: "BINARY INPUT", "INPUT BINARY", "RANDOM", etc.
+        var is_binary = false;
+        var base_mode: []const u8 = "";
+        var record_length: i32 = 0;
+
+        // Parse up to 2 mode keywords (e.g., BINARY INPUT or INPUT BINARY)
+        var parsed_count: u8 = 0;
+        while (parsed_count < 2) : (parsed_count += 1) {
+            if (self.check(.kw_input)) {
+                if (base_mode.len > 0) {
+                    try self.addError("Multiple base modes specified (INPUT conflicts with previous mode)");
+                    return error.ParseError;
+                }
+                base_mode = "INPUT";
                 _ = self.advance();
-            } else if (std.mem.eql(u8, id_upper, "APPEND") or std.mem.eql(u8, id_upper, "append")) {
-                mode = "APPEND";
+            } else if (self.check(.kw_append)) {
+                if (base_mode.len > 0) {
+                    try self.addError("Multiple base modes specified (APPEND conflicts with previous mode)");
+                    return error.ParseError;
+                }
+                base_mode = "APPEND";
                 _ = self.advance();
+            } else if (self.check(.identifier)) {
+                const id_upper = self.current().lexeme;
+
+                // Check for full mode names
+                if (std.mem.eql(u8, id_upper, "OUTPUT")) {
+                    if (base_mode.len > 0) {
+                        try self.addError("Multiple base modes specified (OUTPUT conflicts with previous mode)");
+                        return error.ParseError;
+                    }
+                    base_mode = "OUTPUT";
+                    _ = self.advance();
+                } else if (std.mem.eql(u8, id_upper, "BINARY")) {
+                    if (is_binary) {
+                        try self.addError("BINARY specified multiple times");
+                        return error.ParseError;
+                    }
+                    is_binary = true;
+                    _ = self.advance();
+                } else if (std.mem.eql(u8, id_upper, "RANDOM")) {
+                    if (base_mode.len > 0) {
+                        try self.addError("Multiple base modes specified (RANDOM conflicts with previous mode)");
+                        return error.ParseError;
+                    }
+                    base_mode = "RANDOM";
+                    _ = self.advance();
+
+                    // Optional record length for RANDOM mode
+                    if (self.check(.number)) {
+                        const num_tok = self.current();
+                        record_length = @intFromFloat(num_tok.number_value);
+                        _ = self.advance();
+                    }
+                } else if (id_upper.len == 1) {
+                    // Check for single-letter aliases
+                    const letter = id_upper[0];
+                    if (letter == 'I') {
+                        if (base_mode.len > 0) {
+                            try self.addError("Multiple base modes specified");
+                            return error.ParseError;
+                        }
+                        base_mode = "INPUT";
+                        _ = self.advance();
+                    } else if (letter == 'O') {
+                        if (base_mode.len > 0) {
+                            try self.addError("Multiple base modes specified");
+                            return error.ParseError;
+                        }
+                        base_mode = "OUTPUT";
+                        _ = self.advance();
+                    } else if (letter == 'A') {
+                        if (base_mode.len > 0) {
+                            try self.addError("Multiple base modes specified");
+                            return error.ParseError;
+                        }
+                        base_mode = "APPEND";
+                        _ = self.advance();
+                    } else if (letter == 'B') {
+                        if (is_binary) {
+                            try self.addError("BINARY specified multiple times");
+                            return error.ParseError;
+                        }
+                        is_binary = true;
+                        _ = self.advance();
+                    } else if (letter == 'R') {
+                        if (base_mode.len > 0) {
+                            try self.addError("Multiple base modes specified");
+                            return error.ParseError;
+                        }
+                        base_mode = "RANDOM";
+                        _ = self.advance();
+
+                        // Optional record length for RANDOM mode
+                        if (self.check(.number)) {
+                            const num_tok = self.current();
+                            record_length = @intFromFloat(num_tok.number_value);
+                            _ = self.advance();
+                        }
+                    } else {
+                        break; // Not a recognized mode, stop parsing modes
+                    }
+                } else {
+                    break; // Not a recognized mode keyword, stop parsing
+                }
             } else {
-                try self.addError("Expected INPUT, OUTPUT, or APPEND after FOR");
-                return error.ParseError;
+                break; // Not a mode token, stop parsing modes
             }
-        } else {
-            try self.addError("Expected file mode (INPUT, OUTPUT, or APPEND)");
+        }
+
+        // Validate: must have at least one mode specified
+        if (base_mode.len == 0) {
+            try self.addError("Expected file mode (INPUT, OUTPUT, APPEND, BINARY, or RANDOM)");
             return error.ParseError;
+        }
+
+        // Construct final mode string
+        var mode: []const u8 = undefined;
+        if (is_binary) {
+            // Combine BINARY with base mode
+            mode = try std.fmt.allocPrint(self.allocator, "BINARY {s}", .{base_mode});
+        } else {
+            mode = base_mode;
         }
 
         // Expect AS keyword
@@ -2876,6 +3171,7 @@ pub const Parser = struct {
                 .filename = filename,
                 .mode = mode,
                 .file_number = file_number,
+                .record_length = record_length,
             },
         });
     }
@@ -4884,6 +5180,12 @@ pub const Parser = struct {
             "OCT",  "BIN",   "MID",    "LEFT",  "RIGHT", "TIMER",
             "PEEK", "POKE",  "STRING", "INKEY", "POINT", "SUM",
             "MAX",  "MIN",   "AVG",    "DOT",
+            // File I/O builtins
+              "EOF",   "LOC",
+            "LOF",  "INPUT",
+            // Binary conversion builtins
+            "MKI",    "MKS",   "MKD",   "CVI",
+            "CVS",  "CVD",
         };
 
         // Strip trailing type suffix ($, %, !, #, &, @, ^) before

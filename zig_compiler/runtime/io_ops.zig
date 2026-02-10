@@ -25,6 +25,7 @@ var g_argv: [*][*:0]u8 = undefined;
 
 // basic_runtime.c
 extern fn basic_error_msg(msg: [*:0]const u8) void;
+extern fn basic_throw(error_code: c_int) void;
 
 // string functions (string_utf32.zig / string_ops.zig)
 extern fn string_to_utf8(desc: ?*anyopaque) [*:0]const u8;
@@ -98,13 +99,23 @@ pub const BasicString = extern struct {
     refcount: i32,
 };
 
-/// BasicFile — file handle
+/// BasicFile — file handle with buffered reader for INPUT mode.
+///
+/// On OPEN FOR INPUT the entire file is slurped into `read_buf`.
+/// `file_read_line` then scans that buffer recognising CR+LF, LF, CR
+/// and end-of-buffer as line terminators.  Any file that contains at
+/// least one byte of data contains at least one line.
 pub const BasicFile = extern struct {
+    // ── original fields (ABI-stable, must match basic_runtime.h) ──
     fp: ?*anyopaque,
     file_number: i32,
     filename: ?[*:0]u8,
     mode: ?[*:0]u8,
     is_open: bool,
+    // ── buffered reader fields (appended, invisible to legacy C code) ──
+    read_buf: ?[*]u8 = null,
+    read_buf_size: usize = 0,
+    read_pos: usize = 0,
 };
 
 // =========================================================================
@@ -307,7 +318,7 @@ export fn basic_input_line() callconv(.c) ?*anyopaque {
 
 export fn file_open(filename: ?*anyopaque, mode: ?*anyopaque) callconv(.c) ?*BasicFile {
     if (filename == null or mode == null) {
-        basic_error_msg("Invalid file open parameters");
+        basic_throw(52); // ERR_BAD_FILE
         return null;
     }
 
@@ -316,21 +327,34 @@ export fn file_open(filename: ?*anyopaque, mode: ?*anyopaque) callconv(.c) ?*Bas
     const mode_str = string_to_utf8(mode);
 
     // Map BASIC modes to C fopen modes
-    // INPUT -> "r", OUTPUT -> "w", APPEND -> "a"
     var mode_data: [*:0]const u8 = "r";
-    if (std.mem.eql(u8, std.mem.span(mode_str), "INPUT")) {
-        mode_data = "r";
-    } else if (std.mem.eql(u8, std.mem.span(mode_str), "OUTPUT")) {
+    const mode_span = std.mem.span(mode_str);
+
+    const is_input_mode = std.mem.eql(u8, mode_span, "INPUT") or
+        std.mem.eql(u8, mode_span, "BINARY INPUT");
+
+    if (std.mem.eql(u8, mode_span, "INPUT")) {
+        mode_data = "rb"; // always binary so we control line-ending logic ourselves
+    } else if (std.mem.eql(u8, mode_span, "OUTPUT")) {
         mode_data = "w";
-    } else if (std.mem.eql(u8, std.mem.span(mode_str), "APPEND")) {
+    } else if (std.mem.eql(u8, mode_span, "APPEND")) {
         mode_data = "a";
+    } else if (std.mem.eql(u8, mode_span, "BINARY INPUT")) {
+        mode_data = "rb";
+    } else if (std.mem.eql(u8, mode_span, "BINARY OUTPUT")) {
+        mode_data = "wb";
+    } else if (std.mem.eql(u8, mode_span, "BINARY APPEND")) {
+        mode_data = "ab";
+    } else if (std.mem.eql(u8, mode_span, "RANDOM")) {
+        mode_data = "r+b";
+    } else if (std.mem.eql(u8, mode_span, "BINARY RANDOM")) {
+        mode_data = "r+b";
     } else {
-        // Assume it's already a C mode
         mode_data = mode_str;
     }
 
     const raw = c.malloc(@sizeOf(BasicFile)) orelse {
-        basic_error_msg("Out of memory (file allocation)");
+        basic_throw(7); // ERR_OUT_OF_MEMORY
         return null;
     };
     const file: *BasicFile = @ptrCast(@alignCast(raw));
@@ -339,20 +363,66 @@ export fn file_open(filename: ?*anyopaque, mode: ?*anyopaque) callconv(.c) ?*Bas
     file.mode = strdup(mode_data);
     file.file_number = 0;
     file.is_open = false;
+    file.read_buf = null;
+    file.read_buf_size = 0;
+    file.read_pos = 0;
 
     file.fp = fopen(fname_data, mode_data);
+
+    // Special handling for RANDOM mode: if r+b fails, try w+b (create new file)
+    if (file.fp == null and (std.mem.eql(u8, mode_span, "RANDOM") or
+        std.mem.eql(u8, mode_span, "BINARY RANDOM")))
+    {
+        mode_data = "w+b";
+        file.fp = fopen(fname_data, mode_data);
+    }
+
     if (file.fp == null) {
         if (file.filename) |fn_ptr| c.free(fn_ptr);
         if (file.mode) |m_ptr| c.free(m_ptr);
         c.free(raw);
 
-        var err_msg: [256]u8 = undefined;
-        _ = snprintf(&err_msg, err_msg.len, "Cannot open file: %s", fname_data);
-        basic_error_msg(@ptrCast(&err_msg));
+        const err_code: c_int = if (is_input_mode)
+            53 // ERR_FILE_NOT_FOUND
+        else
+            75; // ERR_PERMISSION_DENIED
+
+        basic_throw(err_code);
         return null;
     }
 
     file.is_open = true;
+
+    // ── Buffered reader: slurp entire file into memory for INPUT modes ──
+    if (is_input_mode) {
+        const fp = file.fp.?;
+        // Determine file size
+        _ = fseek(fp, 0, SEEK_END);
+        const size_long = ftell(fp);
+        _ = fseek(fp, 0, SEEK_SET);
+        const file_size: usize = if (size_long > 0) @intCast(size_long) else 0;
+
+        if (file_size > 0) {
+            const buf_raw = c.malloc(file_size) orelse {
+                basic_throw(7); // ERR_OUT_OF_MEMORY
+                return null;
+            };
+            const buf: [*]u8 = @ptrCast(buf_raw);
+            const bytes_read = fread(buf_raw, 1, file_size, fp);
+            file.read_buf = buf;
+            file.read_buf_size = bytes_read;
+        } else {
+            file.read_buf = null;
+            file.read_buf_size = 0;
+        }
+        file.read_pos = 0;
+
+        // We no longer need the FILE* for reading — close it now so we
+        // don't hold OS handles while the program processes data.
+        _ = fclose(fp);
+        file.fp = null;
+    }
+
     _basic_register_file(file);
 
     return file;
@@ -365,8 +435,15 @@ export fn file_close(file: ?*BasicFile) callconv(.c) void {
         if (f.fp) |fp| {
             _ = fclose(fp);
             f.fp = null;
-            f.is_open = false;
         }
+        // Free the read buffer if we slurped the file.
+        if (f.read_buf) |buf| {
+            c.free(buf);
+            f.read_buf = null;
+            f.read_buf_size = 0;
+            f.read_pos = 0;
+        }
+        f.is_open = false;
     }
 
     _basic_unregister_file(f);
@@ -383,7 +460,7 @@ export fn file_close(file: ?*BasicFile) callconv(.c) void {
     c.free(f);
 }
 
-export fn file_print_string(file: ?*BasicFile, str: ?*BasicString) callconv(.c) void {
+export fn file_print_string(file: ?*BasicFile, str_desc: ?*anyopaque) callconv(.c) void {
     const f = file orelse {
         basic_error_msg("File not open for writing");
         return;
@@ -397,8 +474,8 @@ export fn file_print_string(file: ?*BasicFile, str: ?*BasicString) callconv(.c) 
         return;
     };
 
-    const s = str orelse return;
-    const data = s.data orelse return;
+    if (str_desc == null) return;
+    const data = string_to_utf8(str_desc);
     _ = fprintf(fp, "%s", data);
     _ = fflush(fp);
 }
@@ -439,38 +516,112 @@ export fn file_print_newline(file: ?*BasicFile) callconv(.c) void {
     _ = fflush(fp);
 }
 
+/// Read the next line from a buffered file.
+///
+/// Scans `read_buf` from `read_pos` forward, recognising three line-ending
+/// conventions:
+///   • CR+LF  (Windows)
+///   • LF     (Unix / macOS)
+///   • CR     (classic Mac)
+///
+/// End-of-buffer is also treated as a line terminator, so a file that
+/// contains data but no trailing newline still yields its last line.
+///
+/// Returns a `StringDescriptor*` (via `string_new_utf8`) for the line
+/// content *without* the terminator.  At true end-of-file (read_pos ≥
+/// read_buf_size) returns an empty string.
 export fn file_read_line(file: ?*BasicFile) callconv(.c) ?*anyopaque {
     const f = file orelse {
         basic_error_msg("File not open for reading");
-        return str_new("");
+        return string_new_utf8("");
     };
     if (!f.is_open) {
         basic_error_msg("File not open for reading");
-        return str_new("");
+        return string_new_utf8("");
     }
-    const fp = f.fp orelse {
-        basic_error_msg("File not open for reading");
-        return str_new("");
+
+    const buf = f.read_buf orelse {
+        // No buffer — file was opened for writing or is empty.
+        return string_new_utf8("");
     };
+    const size = f.read_buf_size;
+    const pos = f.read_pos;
 
-    var buffer: [4096]u8 = undefined;
-    if (fgets(&buffer, 4096, fp) == null) {
-        return str_new("");
+    // Already past the end — nothing left to read.
+    if (pos >= size) return string_new_utf8("");
+
+    // Scan for the next line terminator (CR, LF, or CR+LF).
+    var end = pos;
+    while (end < size) : (end += 1) {
+        const ch = buf[end];
+        if (ch == '\n' or ch == '\r') break;
     }
 
-    const len = strlen(@ptrCast(&buffer));
-    if (len > 0 and buffer[len - 1] == '\n') {
-        buffer[len - 1] = 0;
-    }
+    // `end` now points at the terminator byte, or == size (end of buffer).
+    const line_start = buf + pos;
+    const line_len = end - pos;
 
-    return str_new(@ptrCast(&buffer));
+    // Build a NUL-terminated copy for string_new_utf8.
+    const copy_raw = c.malloc(line_len + 1) orelse {
+        basic_throw(7);
+        return string_new_utf8("");
+    };
+    const copy: [*]u8 = @ptrCast(copy_raw);
+    if (line_len > 0) {
+        @memcpy(copy[0..line_len], line_start[0..line_len]);
+    }
+    copy[line_len] = 0;
+
+    // Advance past the terminator.  CR+LF counts as one terminator.
+    var new_pos = end;
+    if (new_pos < size) {
+        if (buf[new_pos] == '\r') {
+            new_pos += 1;
+            if (new_pos < size and buf[new_pos] == '\n') {
+                new_pos += 1; // CR+LF
+            }
+        } else {
+            // must be '\n'
+            new_pos += 1;
+        }
+    }
+    f.read_pos = new_pos;
+
+    const result = string_new_utf8(@ptrCast(copy));
+    c.free(copy_raw);
+    return result;
 }
 
+/// Low-level EOF predicate on a BasicFile pointer (used by binary_io).
 export fn file_eof(file: ?*BasicFile) callconv(.c) bool {
     const f = file orelse return true;
     if (!f.is_open) return true;
+
+    // Buffered reader path — authoritative for INPUT mode files.
+    if (f.read_buf != null) {
+        return f.read_pos >= f.read_buf_size;
+    }
+
+    // Fallback for write-mode files that still have an fp.
     const fp = f.fp orelse return true;
     return feof(fp) != 0;
+}
+
+/// `EOF(file_number)` — callable directly from generated code.
+/// Returns BASIC true (-1) when at end-of-file, BASIC false (0) otherwise.
+export fn basic_eof(file_number: i32) callconv(.c) i32 {
+    const handle = file_get_handle(file_number);
+    const f = handle orelse return -1;
+    if (!f.is_open) return -1;
+
+    // Buffered reader path.
+    if (f.read_buf != null) {
+        return if (f.read_pos >= f.read_buf_size) @as(i32, -1) else @as(i32, 0);
+    }
+
+    // Fallback (write-mode file with fp).
+    const fp = f.fp orelse return -1;
+    return if (feof(fp) != 0) @as(i32, -1) else @as(i32, 0);
 }
 
 // =========================================================================
@@ -482,7 +633,7 @@ var file_handles: [MAX_FILE_HANDLES]?*BasicFile = [_]?*BasicFile{null} ** MAX_FI
 
 export fn file_get_handle(file_number: i32) callconv(.c) ?*BasicFile {
     if (file_number < 0 or file_number >= MAX_FILE_HANDLES) {
-        basic_error_msg("Invalid file number");
+        basic_throw(64); // ERR_BAD_FILE_NUMBER
         return null;
     }
     return file_handles[@intCast(file_number)];
@@ -490,7 +641,7 @@ export fn file_get_handle(file_number: i32) callconv(.c) ?*BasicFile {
 
 export fn file_set_handle(file_number: i32, file: ?*BasicFile) callconv(.c) void {
     if (file_number < 0 or file_number >= MAX_FILE_HANDLES) {
-        basic_error_msg("Invalid file number");
+        basic_throw(64); // ERR_BAD_FILE_NUMBER
         return;
     }
     file_handles[@intCast(file_number)] = file;
