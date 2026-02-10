@@ -18,21 +18,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          xcode-version: latest-stable
+          version: 0.13.0
 
       - name: Build FasterBASIC
         run: |
-          cd qbe_basic_integrated
-          ./build_qbe_basic.sh
+          cd zig_compiler
+          zig build
 
       - name: Verify build
         run: |
-          cd qbe_basic_integrated
-          ./fbc_qbe --version || echo "Version flag not implemented"
-          file fbc_qbe
+          file zig_compiler/zig-out/bin/fbc
 
       - name: Create test program
         run: |
@@ -44,16 +42,17 @@ jobs:
 
       - name: Test compilation
         run: |
-          cd qbe_basic_integrated
-          ./fbc_qbe ../test_hello.bas -o ../test_hello
-          ../test_hello
+          ./zig_compiler/zig-out/bin/fbc test_hello.bas -o test_hello
+          ./test_hello
+
+      - name: Run full test suite
+        run: |
+          bash run_tests_parallel.sh
 
       - name: Package release
         run: |
           mkdir -p release/fasterbasic-macos-arm64
-          cp qbe_basic_integrated/fbc_qbe release/fasterbasic-macos-arm64/
-          cp qbe_basic_integrated/qbe_basic release/fasterbasic-macos-arm64/
-          cp -r qbe_basic_integrated/runtime release/fasterbasic-macos-arm64/
+          cp zig_compiler/zig-out/bin/fbc release/fasterbasic-macos-arm64/
           cp README.md release/fasterbasic-macos-arm64/
           cp LICENSE release/fasterbasic-macos-arm64/ || echo "No LICENSE file"
 
@@ -62,10 +61,9 @@ jobs:
           ==================================================
 
           Usage:
-            ./fbc_qbe program.bas              # Compile to executable
-            ./fbc_qbe program.bas -o name      # Compile with custom name
-            ./fbc_qbe program.bas -i -o out.qbe # Generate QBE IL
-            ./fbc_qbe program.bas -c -o out.s  # Generate assembly
+            ./fbc program.bas -o name          # Compile to executable
+            ./fbc program.bas -i -o out.qbe    # Generate QBE IL
+            ./fbc program.bas -c -o out.s      # Generate assembly
 
           Documentation:
             https://github.com/albanread/FasterBASIC/wiki
@@ -73,14 +71,8 @@ jobs:
           Examples:
             echo 'PRINT "Hello, World!"' > hello.bas
             echo 'END' >> hello.bas
-            ./fbc_qbe hello.bas -o hello
+            ./fbc hello.bas -o hello
             ./hello
-
-          The fbc_qbe executable is the main compiler.
-          The qbe_basic symlink is provided for backward compatibility.
-
-          Runtime library files are in the runtime/ directory and will be
-          automatically compiled and cached on first use.
           EOF
 
           cd release
@@ -102,21 +94,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          xcode-version: latest-stable
+          version: 0.13.0
 
       - name: Build FasterBASIC
         run: |
-          cd qbe_basic_integrated
-          ./build_qbe_basic.sh
+          cd zig_compiler
+          zig build
 
       - name: Run all NEON-path tests
         env:
           ENABLE_NEON_LOOP: "1"
         run: |
-          cd qbe_basic_integrated
+          FBC="./zig_compiler/zig-out/bin/fbc"
           TOTAL=0
           PASSED=0
           FAILED=0
@@ -138,7 +130,7 @@ jobs:
               echo "--- Compiling: $test_name ---"
               TOTAL=$((TOTAL + 1))
 
-              if ! ./fbc_qbe "$bas_file" -o "../test_output_${test_name}" 2>&1; then
+              if ! $FBC "$bas_file" -o "test_output_${test_name}" 2>&1; then
                 echo "COMPILE ERROR: $test_name"
                 FAILED=$((FAILED + 1))
                 FAILED_TESTS="$FAILED_TESTS  COMPILE: $test_name\n"
@@ -146,7 +138,7 @@ jobs:
               fi
 
               echo "--- Running: $test_name ---"
-              output=$("../test_output_${test_name}" 2>&1) || true
+              output=$("./test_output_${test_name}" 2>&1) || true
               echo "$output"
               echo ""
 
@@ -166,12 +158,12 @@ jobs:
                 fi
               fi
 
-              rm -f "../test_output_${test_name}"
+              rm -f "./test_output_${test_name}"
             done
           }
 
-          run_suite "Array Expression Tests" "../tests/array_expr"
-          run_suite "NEON SIMD Tests"        "../tests/neon"
+          run_suite "Array Expression Tests" "tests/array_expr"
+          run_suite "NEON SIMD Tests"        "tests/neon"
 
           echo ""
           echo "============================================"
@@ -194,21 +186,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          xcode-version: latest-stable
+          version: 0.13.0
 
       - name: Build FasterBASIC
         run: |
-          cd qbe_basic_integrated
-          ./build_qbe_basic.sh
+          cd zig_compiler
+          zig build
 
       - name: Run all scalar-fallback tests
         env:
           ENABLE_NEON_LOOP: "0"
         run: |
-          cd qbe_basic_integrated
+          FBC="./zig_compiler/zig-out/bin/fbc"
           TOTAL=0
           PASSED=0
           FAILED=0
@@ -230,7 +222,7 @@ jobs:
               echo "--- Compiling: $test_name ---"
               TOTAL=$((TOTAL + 1))
 
-              if ! ./fbc_qbe "$bas_file" -o "../test_output_${test_name}_scalar" 2>&1; then
+              if ! $FBC "$bas_file" -o "test_output_${test_name}_scalar" 2>&1; then
                 echo "COMPILE ERROR: $test_name"
                 FAILED=$((FAILED + 1))
                 FAILED_TESTS="$FAILED_TESTS  COMPILE: $test_name\n"
@@ -238,7 +230,7 @@ jobs:
               fi
 
               echo "--- Running: $test_name (scalar) ---"
-              output=$(ENABLE_NEON_LOOP=0 "../test_output_${test_name}_scalar" 2>&1) || true
+              output=$(ENABLE_NEON_LOOP=0 "./test_output_${test_name}_scalar" 2>&1) || true
               echo "$output"
               echo ""
 
@@ -258,12 +250,12 @@ jobs:
                 fi
               fi
 
-              rm -f "../test_output_${test_name}_scalar"
+              rm -f "./test_output_${test_name}_scalar"
             done
           }
 
-          run_suite "Array Expression Tests" "../tests/array_expr"
-          run_suite "NEON SIMD Tests"        "../tests/neon"
+          run_suite "Array Expression Tests" "tests/array_expr"
+          run_suite "NEON SIMD Tests"        "tests/neon"
 
           echo ""
           echo "============================================"
@@ -305,7 +297,15 @@ jobs:
 
           1. Download the archive
           2. Extract: `tar -xzf fasterbasic-macos-arm64.tar.gz`
-          3. Run: `cd fasterbasic-macos-arm64/ && ./fbc_qbe yourprogram.bas`
+          3. Run: `cd fasterbasic-macos-arm64/ && ./fbc yourprogram.bas -o yourprogram`
+
+          ## Building from Source
+
+          ```bash
+          git clone https://github.com/albanread/FasterBASIC.git
+          cd FasterBASIC/zig_compiler
+          zig build
+          ```
 
           ## Documentation
 
@@ -319,38 +319,25 @@ jobs:
           ## Quick Start
 
           ```bash
-          # Create a simple program
           echo 'PRINT "Hello, FasterBASIC!"' > hello.bas
           echo 'END' >> hello.bas
-
-          # Compile and run
-          ./fbc_qbe hello.bas -o hello
+          ./fbc hello.bas -o hello
           ./hello
           ```
 
-          ## What's Included
-
-          - `fbc_qbe` - The FasterBASIC compiler
-          - `qbe_basic` - Symlink for backward compatibility
-          - `runtime/` - Runtime library sources (auto-compiled on first use)
-          - `README.md` - Project documentation
-          - `README.txt` - Quick start guide
-
-          ## System Requirements
-
-          - **macOS**: macOS 10.15 or later (Apple Silicon)
-
           ## Features
 
+          - Compiler written in Zig with hybrid Zig + C runtime
           - Native code compilation via QBE backend
+          - Workers with MARSHALL/UNMARSHALL for concurrency
           - Object-oriented programming (classes, inheritance, polymorphism)
           - Modern collections (Lists, HashMaps)
           - Pattern matching with MATCH TYPE
           - Exception handling (TRY/CATCH/FINALLY)
           - NEON SIMD acceleration on ARM64
           - Whole-array expressions with automatic NEON vectorization
-          - User-defined types with SIMD optimization
           - Plugin system for extensibility
+          - 312 end-to-end tests
 
           For more information, visit: https://github.com/albanread/FasterBASIC
           EOF
