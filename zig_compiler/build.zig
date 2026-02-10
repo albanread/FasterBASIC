@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
         "io_ops_format",
         "io_ops",
         "array_ops",
+        "marshalling",
     };
 
     var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;
@@ -197,6 +198,42 @@ pub fn build(b: *std.Build) void {
     });
     const run_samm_scope_tests = b.addRunArtifact(samm_scope_tests);
     test_step.dependOn(&run_samm_scope_tests.step);
+
+    // Runtime modules with tests — these need test_stubs.c to satisfy
+    // extern symbols from other runtime modules (the tests only exercise
+    // internal helpers so the stubs are never actually called).
+    const runtime_test_modules = [_][]const u8{
+        "runtime/samm_core.zig",
+        "runtime/memory_mgmt.zig",
+        "runtime/string_ops.zig",
+        "runtime/conversion_ops.zig",
+        "runtime/class_runtime.zig",
+        "runtime/math_ops.zig",
+        "runtime/basic_data.zig",
+        "runtime/io_ops_format.zig",
+        "runtime/string_utf32.zig",
+    };
+
+    const stub_sources = [_][]const u8{"test_stubs.c"};
+
+    for (runtime_test_modules) |rt_path| {
+        const rt_mod = b.createModule(.{
+            .root_source_file = b.path(rt_path),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        rt_mod.addCSourceFiles(.{
+            .root = b.path("runtime"),
+            .files = &stub_sources,
+            .flags = &.{},
+        });
+        const rt_tests = b.addTest(.{
+            .root_module = rt_mod,
+        });
+        const run_rt_tests = b.addRunArtifact(rt_tests);
+        test_step.dependOn(&run_rt_tests.step);
+    }
 
     // Helper: create a test module with QBE C sources linked in
     const TestModuleConfig = struct {

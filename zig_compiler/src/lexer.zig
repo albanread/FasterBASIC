@@ -504,6 +504,7 @@ pub const Lexer = struct {
         if (std.mem.eql(u8, upper, "CASE")) return .kw_endcase;
         if (std.mem.eql(u8, upper, "SELECT")) return .kw_endcase;
         if (std.mem.eql(u8, upper, "MATCH")) return .kw_endmatch;
+        if (std.mem.eql(u8, upper, "WORKER")) return .kw_endworker;
         // NOTE: END CONSTRUCTOR, END DESTRUCTOR, END METHOD, and END CLASS
         // are intentionally NOT collapsed into compound tokens.  The parser
         // handles them as two separate tokens (.kw_end + .kw_constructor etc.)

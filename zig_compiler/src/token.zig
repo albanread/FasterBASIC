@@ -69,7 +69,7 @@ pub const Token = struct {
 
     pub fn isTypeKeyword(self: Token) bool {
         return switch (self.tag) {
-            .kw_integer, .kw_double, .kw_single, .kw_string_type, .kw_long, .kw_byte, .kw_short, .kw_ubyte, .kw_ushort, .kw_uinteger, .kw_ulong, .kw_hashmap, .kw_list => true,
+            .kw_integer, .kw_double, .kw_single, .kw_string_type, .kw_long, .kw_byte, .kw_short, .kw_ubyte, .kw_ushort, .kw_uinteger, .kw_ulong, .kw_marshalled, .kw_hashmap, .kw_list => true,
             else => false,
         };
     }
@@ -175,6 +175,16 @@ pub const Tag = enum(u16) {
     kw_function,
     kw_endsub,
     kw_endfunction,
+
+    // ── Keywords (concurrency — workers) ─────────────────────────────────
+    kw_worker,
+    kw_endworker,
+    kw_spawn,
+    kw_await,
+    kw_ready,
+    kw_future,
+    kw_marshall,
+    kw_unmarshall,
     kw_call,
     kw_local,
     kw_global,
@@ -204,6 +214,7 @@ pub const Tag = enum(u16) {
     kw_ushort,
     kw_uinteger,
     kw_ulong,
+    kw_marshalled,
     kw_hashmap,
     kw_list,
 
@@ -418,6 +429,7 @@ pub const Tag = enum(u16) {
             .kw_long, .kw_ulong => .ampersand,
             .kw_byte, .kw_ubyte => .type_byte,
             .kw_short, .kw_ushort => .type_short,
+            .kw_marshalled => null,
             else => null,
         };
     }
@@ -499,6 +511,14 @@ fn buildKeywordMap() KeywordMap {
         .{ "FUNCTION", .kw_function },
         .{ "ENDSUB", .kw_endsub },
         .{ "ENDFUNCTION", .kw_endfunction },
+        .{ "WORKER", .kw_worker },
+        .{ "ENDWORKER", .kw_endworker },
+        .{ "SPAWN", .kw_spawn },
+        .{ "AWAIT", .kw_await },
+        .{ "READY", .kw_ready },
+        .{ "FUTURE", .kw_future },
+        .{ "MARSHALL", .kw_marshall },
+        .{ "UNMARSHALL", .kw_unmarshall },
         .{ "CALL", .kw_call },
         .{ "LOCAL", .kw_local },
         .{ "GLOBAL", .kw_global },
@@ -529,6 +549,7 @@ fn buildKeywordMap() KeywordMap {
         .{ "USHORT", .kw_ushort },
         .{ "UINTEGER", .kw_uinteger },
         .{ "ULONG", .kw_ulong },
+        .{ "MARSHALLED", .kw_marshalled },
         .{ "HASHMAP", .kw_hashmap },
         .{ "LIST", .kw_list },
         .{ "DIM", .kw_dim },

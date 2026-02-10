@@ -70,6 +70,14 @@ pub const ExprData = union(enum) {
     list_constructor: ListConstructorExpr,
     /// Registry-based modular function expression
     registry_function: RegistryFunctionExpr,
+    /// SPAWN WorkerName(args...) — starts a worker on a background thread
+    spawn: SpawnExpr,
+    /// AWAIT future — blocks until worker finishes, returns result
+    await_expr: AwaitExpr,
+    /// READY(future) — non-blocking check if worker is done
+    ready: ReadyExpr,
+    /// MARSHALL(variable) — deep-copy array/UDT for worker transfer
+    marshall: MarshallExpr,
 };
 
 pub const BinaryExpr = struct {
@@ -254,6 +262,10 @@ pub const StmtData = union(enum) {
     def: DefStmt,
     call: CallStmt,
     label: LabelStmt,
+
+    // ── Workers (concurrency) ───────────────────────────────────────────
+    worker: WorkerStmt,
+    unmarshall: UnmarshallStmt,
 
     // ── CLASS / Object system ───────────────────────────────────────────
     class: ClassStmt,
@@ -762,6 +774,48 @@ pub const CallStmt = struct {
 
 pub const LabelStmt = struct {
     label_name: []const u8,
+};
+
+// ── Workers (concurrency) ───────────────────────────────────────────────
+
+/// WORKER declaration — an isolated function that runs on a background thread.
+pub const WorkerStmt = struct {
+    worker_name: []const u8,
+    return_type_suffix: ?Tag = null,
+    return_type_as_name: []const u8 = "",
+    has_return_as_type: bool = false,
+    parameters: []const []const u8,
+    parameter_types: []const ?Tag,
+    parameter_as_types: []const []const u8,
+    body: []StmtPtr,
+};
+
+/// UNMARSHALL target, source — reconstruct an array or UDT from a marshalled blob.
+pub const UnmarshallStmt = struct {
+    target_variable: []const u8,
+    source_expr: ExprPtr,
+};
+
+/// SPAWN WorkerName(args...) — starts a worker, returns a FUTURE handle.
+pub const SpawnExpr = struct {
+    worker_name: []const u8,
+    arguments: []ExprPtr,
+};
+
+/// AWAIT future — blocks until worker finishes, returns its result.
+pub const AwaitExpr = struct {
+    future: ExprPtr,
+};
+
+/// READY(future) — non-blocking check, returns 1 (true) or 0 (false).
+pub const ReadyExpr = struct {
+    future: ExprPtr,
+};
+
+/// MARSHALL(variable) — deep-copy an array or UDT into a portable blob.
+/// Returns an opaque pointer (stored as DOUBLE) for passing to workers.
+pub const MarshallExpr = struct {
+    variable_name: []const u8,
 };
 
 // ── CLASS / Object system ───────────────────────────────────────────────
@@ -1281,7 +1335,7 @@ test "all expression variants can be constructed" {
     const variants = comptime std.meta.fields(ExprData);
     try std.testing.expect(variants.len > 0);
     // Just verify we have the expected count of expression types
-    try std.testing.expectEqual(@as(usize, 19), variants.len);
+    try std.testing.expectEqual(@as(usize, 23), variants.len);
 }
 
 test "all statement variants can be constructed" {

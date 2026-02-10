@@ -1053,9 +1053,10 @@ pub const CFGBuilder = struct {
             // ── Labels ─────────────────────────────────────────────────
             .label => |lbl| try self.processLabelStatement(stmt, &lbl),
 
-            // ── Function/Sub definitions ───────────────────────────────
+            // ── Function/Sub/Worker definitions ───────────────────────
             .function => |func| try self.processFunctionDef(stmt, &func),
             .sub => |sub_def| try self.processSubDef(stmt, &sub_def),
+            .worker => |wkr| try self.processWorkerDef(stmt, &wkr),
 
             // ── Normal statements (no control flow) ────────────────────
             else => {
@@ -1812,6 +1813,21 @@ pub const CFGBuilder = struct {
         _ = sub_cfg;
 
         try self.function_cfgs.put(sub_def.sub_name, sub_builder.cfg);
+        sub_builder.cfg = CFG.init(self.allocator);
+        sub_builder.deinit();
+    }
+
+    fn processWorkerDef(self: *CFGBuilder, stmt: *const ast.Statement, wkr: *const ast.WorkerStmt) !void {
+        try self.cfg.getBlock(self.current_block).addStatement(self.allocator, stmt);
+
+        var sub_builder = CFGBuilder.init(self.allocator);
+
+        const sub_cfg = try sub_builder.buildFromBody(wkr.body, wkr.worker_name);
+        _ = sub_cfg;
+
+        // Workers are stored in function_cfgs like functions — the codegen
+        // uses the FunctionSymbol.is_worker flag to distinguish them.
+        try self.function_cfgs.put(wkr.worker_name, sub_builder.cfg);
         sub_builder.cfg = CFG.init(self.allocator);
         sub_builder.deinit();
     }

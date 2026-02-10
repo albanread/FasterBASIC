@@ -75,6 +75,8 @@ pub const FunctionContext = struct {
         base_type: semantic.BaseType,
         /// The type suffix tag (if any).
         suffix: ?Tag,
+        /// UDT type name (for user_defined locals), empty otherwise.
+        as_type_name: []const u8 = "",
     };
 
     pub fn init(allocator: std.mem.Allocator, func_name: []const u8, upper_name: []const u8, is_function: bool, return_type: []const u8, return_base_type: semantic.BaseType) FunctionContext {
@@ -530,7 +532,7 @@ pub const TypeManager = struct {
             .byte, .ubyte => 1,
             .short, .ushort => 2,
             .integer, .uinteger, .single, .loop_index => 4,
-            .long, .ulong, .double => 8,
+            .long, .ulong, .double, .marshalled => 8,
             .string, .unicode, .pointer, .object, .class_instance, .array_desc, .string_desc => 8,
             .user_defined => 0, // must look up UDT
             .void, .unknown => 0,
@@ -578,7 +580,7 @@ pub const TypeManager = struct {
             .integer, .uinteger, .loop_index => "w",
             .long, .ulong => "l",
             .single => "s",
-            .double => "d",
+            .double, .marshalled => "d",
             .string, .unicode, .pointer, .object, .class_instance, .array_desc, .string_desc, .user_defined => "l",
             .void => "",
             .unknown => "w",
@@ -613,6 +615,7 @@ pub const TypeManager = struct {
         if (std.ascii.eqlIgnoreCase(name, "BOOLEAN")) return .integer;
         if (std.ascii.eqlIgnoreCase(name, "LIST")) return .object;
         if (std.ascii.eqlIgnoreCase(name, "HASHMAP")) return .object;
+        if (std.ascii.eqlIgnoreCase(name, "MARSHALLED")) return .marshalled;
         // Unknown / UDT name — treat as user-defined (pointer-sized, no conversion).
         return .user_defined;
     }
@@ -970,6 +973,21 @@ pub const RuntimeLibrary = struct {
         try self.declare("list_iter_value_float", "l %cursor");
         try self.declare("list_iter_value_ptr", "l %cursor");
 
+        // Worker / concurrency runtime
+        try self.declare("worker_spawn", "l %func_ptr, l %args, w %num_args, w %ret_type");
+        try self.declare("worker_await", "l %handle");
+        try self.declare("worker_ready", "l %handle");
+        try self.declare("worker_args_alloc", "w %num_args");
+        try self.declare("worker_args_set_double", "l %args, w %index, d %value");
+        try self.declare("worker_args_set_int", "l %args, w %index, w %value");
+        try self.declare("worker_args_set_ptr", "l %args, w %index, l %value");
+        try self.declare("marshall_array", "l %desc_ptr");
+        try self.declare("marshall_udt", "l %udt_ptr, w %size");
+        try self.declare("marshall_udt_deep", "l %udt_ptr, w %size, l %offsets, w %num");
+        try self.declare("unmarshall_array", "l %blob, l %desc_ptr");
+        try self.declare("unmarshall_udt", "l %blob, l %udt_ptr, w %size");
+        try self.declare("unmarshall_udt_deep", "l %blob, l %udt_ptr, w %size, l %offsets, w %num");
+
         try self.builder.emitBlankLine();
     }
 
@@ -1085,6 +1103,7 @@ pub const ExprEmitter = struct {
     /// QBE-level type classification for expression results.
     pub const ExprType = enum {
         /// 64-bit float (QBE `d`) — the BASIC default numeric type.
+        /// Also used for MARSHALLED blob pointers (bit-punned into double).
         double,
         /// 32-bit integer (QBE `w`) — INTEGER / LONG variables.
         integer,
@@ -1151,6 +1170,7 @@ pub const ExprEmitter = struct {
                         if (rv.base_type.isInteger()) return .integer;
                         if (rv.base_type.isString()) return .string;
                         if (rv.base_type.isFloat()) return .double;
+                        if (rv.base_type == .marshalled) return .double;
                         return .double;
                     }
 
@@ -1159,6 +1179,7 @@ pub const ExprEmitter = struct {
                     if (fctx.isReturnAssignment(fupper)) {
                         if (fctx.return_base_type.isInteger()) return .integer;
                         if (fctx.return_base_type.isString()) return .string;
+                        if (fctx.return_base_type == .marshalled) return .double;
                         return .double;
                     }
                 }
@@ -1174,6 +1195,7 @@ pub const ExprEmitter = struct {
                 if (self.symbol_table.lookupVariable(vupper)) |vsym| {
                     if (vsym.type_desc.base_type.isInteger()) return .integer;
                     if (vsym.type_desc.base_type.isString()) return .string;
+                    if (vsym.type_desc.base_type == .marshalled) return .double;
                 }
                 return .double;
             },
@@ -1455,6 +1477,10 @@ pub const ExprEmitter = struct {
                 return .double;
             },
             .registry_function => .double,
+            .spawn => .double, // SPAWN returns a FUTURE handle (pointer as double)
+            .await_expr => .double, // AWAIT returns the worker's result (as double)
+            .ready => .integer, // READY returns 0 or 1
+            .marshall => .double, // MARSHALL returns blob pointer (as double)
         };
     }
 
@@ -1558,6 +1584,10 @@ pub const ExprEmitter = struct {
             .list_constructor => |lc| self.emitListConstructor(lc.elements),
             .array_binop => |ab| self.emitArrayBinop(ab.left_array, ab.operation, ab.right_expr),
             .registry_function => |rf| self.emitRegistryFunction(rf.name, rf.arguments),
+            .spawn => |sp| self.emitSpawn(sp.worker_name, sp.arguments),
+            .await_expr => |aw| self.emitAwait(aw.future),
+            .ready => |rd| self.emitReady(rd.future),
+            .marshall => |m| self.emitMarshall(m.variable_name),
         };
     }
 
@@ -1938,7 +1968,7 @@ pub const ExprEmitter = struct {
                 for (0..vlen) |vi| vu_buf[vi] = std.ascii.toUpper(vbase[vi]);
                 if (self.symbol_table.lookupVariable(vu_buf[0..vlen])) |vsym| {
                     return switch (vsym.type_desc.base_type) {
-                        .class_instance, .object, .user_defined, .pointer => true,
+                        .class_instance, .object, .user_defined => true,
                         else => false,
                     };
                 }
@@ -1954,7 +1984,7 @@ pub const ExprEmitter = struct {
                     if (self.symbol_table.lookupClass(cu_buf[0..cu_len])) |cls| {
                         if (cls.findField(ma.member_name)) |fi| {
                             return switch (fi.type_desc.base_type) {
-                                .class_instance, .object, .user_defined, .pointer => true,
+                                .class_instance, .object, .user_defined => true,
                                 else => false,
                             };
                         }
@@ -4025,6 +4055,272 @@ pub const ExprEmitter = struct {
         try self.builder.emit("    {s} =d copy d_0.0\n", .{dest});
         return dest;
     }
+
+    /// Emit SPAWN WorkerName(args...) — packages arguments and starts
+    /// the worker on a background thread via the runtime.
+    fn emitSpawn(self: *ExprEmitter, worker_name: []const u8, arguments: []const ast.ExprPtr) EmitError![]const u8 {
+        try self.builder.emitComment("SPAWN worker");
+
+        // Look up the worker/function symbol for parameter type info.
+        var fn_upper_buf: [128]u8 = undefined;
+        const fn_base = SymbolMapper.stripSuffix(worker_name);
+        const fn_ulen = @min(fn_base.len, fn_upper_buf.len);
+        for (0..fn_ulen) |ui| fn_upper_buf[ui] = std.ascii.toUpper(fn_base[ui]);
+        const fn_upper = fn_upper_buf[0..fn_ulen];
+        const fn_sym = self.symbol_table.lookupFunction(fn_upper);
+
+        // Determine number of args and their types.
+        const num_args: i32 = @intCast(arguments.len);
+
+        // Allocate the args block: worker_args_alloc(num_args) → pointer.
+        const args_block = try self.builder.newTemp();
+        const num_args_str = try std.fmt.allocPrint(self.allocator, "w {d}", .{num_args});
+        try self.builder.emitCall(args_block, "l", "worker_args_alloc", num_args_str);
+
+        // Pack each argument into the args block.
+        for (arguments, 0..) |arg, i| {
+            var arg_val = try self.emitExpression(arg);
+
+            // Determine the argument type (double, int, or string pointer).
+            const declared_type: []const u8 = if (fn_sym) |fsym| blk: {
+                break :blk if (i < fsym.parameter_type_descs.len)
+                    fsym.parameter_type_descs[i].toQBEType()
+                else
+                    "d";
+            } else "d";
+
+            // Convert to match declared type if needed.
+            const expr_et = self.inferExprType(arg);
+            if (std.mem.eql(u8, declared_type, "d") and expr_et == .integer) {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
+                arg_val = cvt;
+            } else if (std.mem.eql(u8, declared_type, "w") and expr_et == .double) {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "w", "dtosi", arg_val);
+                arg_val = cvt;
+            }
+
+            // worker_args_set_TYPE(args_block, index, value)
+            const type_suffix_str: []const u8 = if (std.mem.eql(u8, declared_type, "d"))
+                "double"
+            else if (std.mem.eql(u8, declared_type, "w"))
+                "int"
+            else
+                "ptr";
+
+            const set_fn = try std.fmt.allocPrint(self.allocator, "worker_args_set_{s}", .{type_suffix_str});
+            const set_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}, {s} {s}", .{ args_block, i, declared_type, arg_val });
+            try self.builder.emitCall("", "", set_fn, set_args);
+        }
+
+        // Get the function pointer for the worker.
+        const mangled = try self.symbol_mapper.functionName(worker_name);
+        const func_ptr = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ func_ptr, mangled });
+
+        // Determine return type code for the runtime.
+        const ret_type_code: i32 = if (fn_sym) |fsym| blk: {
+            const rt = fsym.return_type_desc.toQBEType();
+            if (std.mem.eql(u8, rt, "d")) break :blk 0 // double
+            else if (std.mem.eql(u8, rt, "w")) break :blk 1 // int
+            else if (std.mem.eql(u8, rt, "l")) break :blk 2 // string/ptr
+            else break :blk 0;
+        } else 0;
+
+        // worker_spawn(func_ptr, args_block, num_args, ret_type) → handle (pointer)
+        const handle = try self.builder.newTemp();
+        const spawn_args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}, w {d}", .{ func_ptr, args_block, num_args, ret_type_code });
+        try self.builder.emitCall(handle, "l", "worker_spawn", spawn_args);
+
+        // Cast pointer to double for storage in DOUBLE variables.
+        // AWAIT/READY will cast back to pointer when calling the runtime.
+        const handle_d = try self.builder.newTemp();
+        try self.builder.emit("    {s} =d cast {s}\n", .{ handle_d, handle });
+
+        return handle_d;
+    }
+
+    /// Emit AWAIT future — blocks until the worker finishes and returns
+    /// the result.
+    fn emitAwait(self: *ExprEmitter, future_expr: *const ast.Expression) EmitError![]const u8 {
+        try self.builder.emitComment("AWAIT worker");
+        const handle_d = try self.emitExpression(future_expr);
+
+        // Cast double back to pointer (reverse of SPAWN's cast).
+        const handle = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast {s}\n", .{ handle, handle_d });
+
+        // Call worker_await which blocks and returns the result as a double.
+        // The runtime stores results as 64-bit values regardless of type.
+        const dest = try self.builder.newTemp();
+        const await_args = try std.fmt.allocPrint(self.allocator, "l {s}", .{handle});
+        try self.builder.emitCall(dest, "d", "worker_await", await_args);
+
+        return dest;
+    }
+
+    /// Emit READY(future) — non-blocking check, returns 1 or 0.
+    fn emitReady(self: *ExprEmitter, future_expr: *const ast.Expression) EmitError![]const u8 {
+        try self.builder.emitComment("READY check");
+        const handle_d = try self.emitExpression(future_expr);
+
+        // Cast double back to pointer (reverse of SPAWN's cast).
+        const handle = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast {s}\n", .{ handle, handle_d });
+
+        const dest = try self.builder.newTemp();
+        const ready_args = try std.fmt.allocPrint(self.allocator, "l {s}", .{handle});
+        try self.builder.emitCall(dest, "w", "worker_ready", ready_args);
+
+        return dest;
+    }
+
+    /// Emit MARSHALL(variable) — deep-copy an array or UDT into a portable
+    /// blob.  Returns the blob pointer cast to double for storage.
+    fn emitMarshall(self: *ExprEmitter, variable_name: []const u8) EmitError![]const u8 {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "MARSHALL({s})", .{variable_name}));
+
+        // Determine the variable type: array or UDT.
+        var upper_buf: [128]u8 = undefined;
+        const base = SymbolMapper.stripSuffix(variable_name);
+        const ulen = @min(base.len, upper_buf.len);
+        for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(base[i]);
+        const upper = upper_buf[0..ulen];
+
+        // Check arrays first.
+        if (self.symbol_table.lookupArray(upper)) |_| {
+            // Array: marshall_array(desc_ptr) → blob pointer
+            const desc_name = try self.symbol_mapper.arrayDescName(variable_name);
+            const desc_addr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
+
+            const blob = try self.builder.newTemp();
+            const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{desc_addr});
+            try self.builder.emitCall(blob, "l", "marshall_array", args);
+
+            // Cast blob pointer to double for storage — recovered via cast in UNMARSHALL.
+            const blob_d = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d cast {s}\n", .{ blob_d, blob });
+            return blob_d;
+        }
+
+        // Check UDT / class instance variables — first check function-local, then global.
+        const udt_info: ?struct { udt_name: []const u8, addr: []const u8, is_local: bool } = blk: {
+            // Function-local UDT or class instance (DIM v AS Vec3 / DIM obj AS MyClass inside WORKER/FUNCTION/SUB)
+            if (self.func_ctx) |fctx| {
+                if (fctx.local_addrs.get(upper)) |li| {
+                    if ((li.base_type == .user_defined or li.base_type == .class_instance) and li.as_type_name.len > 0) {
+                        break :blk .{ .udt_name = li.as_type_name, .addr = li.addr, .is_local = true };
+                    }
+                }
+            }
+            // Global UDT variable
+            if (self.symbol_table.lookupVariable(upper)) |vsym| {
+                if (vsym.type_desc.base_type == .user_defined and vsym.type_desc.udt_name.len > 0) {
+                    break :blk .{ .udt_name = vsym.type_desc.udt_name, .addr = "", .is_local = false };
+                }
+                // Global class instance variable
+                if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type and vsym.type_desc.class_name.len > 0) {
+                    break :blk .{ .udt_name = vsym.type_desc.class_name, .addr = "", .is_local = false };
+                }
+            }
+            break :blk null;
+        };
+
+        if (udt_info) |info| {
+            // Determine size: check if the type name refers to a CLASS (use object_size)
+            // or a UDT (use sizeOfUDT).
+            const obj_size: u32 = if (self.symbol_table.lookupClass(info.udt_name)) |cls|
+                @intCast(cls.object_size)
+            else
+                self.type_manager.sizeOfUDT(info.udt_name);
+
+            // Load the UDT/object pointer from the variable.
+            const udt_ptr = try self.builder.newTemp();
+            if (info.is_local) {
+                try self.builder.emitLoad(udt_ptr, "l", info.addr);
+            } else {
+                const var_name = try self.symbol_mapper.globalVarName(variable_name, null);
+                try self.builder.emitLoad(udt_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            }
+
+            // marshall_udt or marshall_udt_deep depending on string fields
+            const blob = try self.builder.newTemp();
+
+            // Check whether the type has string fields (offset table was emitted)
+            const has_strings = blk: {
+                if (self.symbol_table.lookupClass(info.udt_name)) |cls| {
+                    for (cls.fields) |field| {
+                        if (field.type_desc.base_type == .string) break :blk true;
+                    }
+                } else if (self.symbol_table.lookupType(info.udt_name)) |ts| {
+                    if (self.typeHasStringFields(ts)) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (has_strings) {
+                // Count string field offsets
+                const num_offsets: u32 = blk: {
+                    if (self.symbol_table.lookupClass(info.udt_name)) |cls| {
+                        var count: u32 = 0;
+                        for (cls.fields) |field| {
+                            if (field.type_desc.base_type == .string) count += 1;
+                        }
+                        break :blk count;
+                    } else if (self.symbol_table.lookupType(info.udt_name)) |ts| {
+                        break :blk self.countUDTStringFields(ts);
+                    }
+                    break :blk 0;
+                };
+                const offsets_label = try std.fmt.allocPrint(self.allocator, "$str_offsets_{s}", .{info.udt_name});
+                const args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}, l {s}, w {d}", .{ udt_ptr, obj_size, offsets_label, num_offsets });
+                try self.builder.emitCall(blob, "l", "marshall_udt_deep", args);
+            } else {
+                const args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}", .{ udt_ptr, obj_size });
+                try self.builder.emitCall(blob, "l", "marshall_udt", args);
+            }
+
+            // Cast blob pointer to double for storage — recovered via cast in UNMARSHALL.
+            const blob_d = try self.builder.newTemp();
+            try self.builder.emit("    {s} =d cast {s}\n", .{ blob_d, blob });
+            return blob_d;
+        }
+
+        // Fallback: treat as scalar — just load and return as double.
+        return self.emitVariableLoad(variable_name, null);
+    }
+
+    /// Check whether a UDT has any string fields (including nested UDTs).
+    fn typeHasStringFields(self: *ExprEmitter, ts: *const semantic.TypeSymbol) bool {
+        for (ts.fields) |field| {
+            if (field.type_desc.base_type == .string) return true;
+            if (field.type_desc.base_type == .user_defined) {
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                if (self.symbol_table.lookupType(nested_name)) |nested_ts| {
+                    if (self.typeHasStringFields(nested_ts)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// Count the total number of string fields in a UDT (including nested UDTs).
+    fn countUDTStringFields(self: *ExprEmitter, ts: *const semantic.TypeSymbol) u32 {
+        var count: u32 = 0;
+        for (ts.fields) |field| {
+            if (field.type_desc.base_type == .string) {
+                count += 1;
+            } else if (field.type_desc.base_type == .user_defined) {
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                if (self.symbol_table.lookupType(nested_name)) |nested_ts| {
+                    count += self.countUDTStringFields(nested_ts);
+                }
+            }
+        }
+        return count;
+    }
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -4364,6 +4660,8 @@ pub const BlockEmitter = struct {
             .data_stmt => {},
             .function => {}, // handled via function_cfgs
             .sub => {}, // handled via function_cfgs
+            .worker => {}, // handled via function_cfgs
+            .unmarshall => |um| try self.emitUnmarshallStatement(&um),
 
             // ── Fallback ────────────────────────────────────────────────
             else => {
@@ -5256,6 +5554,7 @@ pub const BlockEmitter = struct {
                                     .qbe_type = "w",
                                     .base_type = .integer,
                                     .suffix = @as(?Tag, .type_int),
+                                    .as_type_name = "",
                                 });
                             }
                         }
@@ -7056,6 +7355,117 @@ pub const BlockEmitter = struct {
         }
     }
 
+    /// Emit UNMARSHALL target, source — reconstruct array or UDT from
+    /// a marshalled blob pointer.
+    fn emitUnmarshallStatement(self: *BlockEmitter, um: *const ast.UnmarshallStmt) EmitError!void {
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "UNMARSHALL {s}", .{um.target_variable}));
+
+        // Evaluate the source expression (MARSHALLED blob pointer).
+        const src_val = try self.expr_emitter.emitExpression(um.source_expr);
+
+        // Cast from double back to pointer (reverse of MARSHALL's cast).
+        const blob_ptr = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast {s}\n", .{ blob_ptr, src_val });
+
+        // Determine the target variable type: array or UDT.
+        var upper_buf: [128]u8 = undefined;
+        const base = SymbolMapper.stripSuffix(um.target_variable);
+        const ulen = @min(base.len, upper_buf.len);
+        for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(base[i]);
+        const upper = upper_buf[0..ulen];
+
+        // Check arrays first.
+        if (self.symbol_table.lookupArray(upper)) |_| {
+            // Array: unmarshall_array(blob, desc_ptr)
+            const desc_name = try self.expr_emitter.symbol_mapper.arrayDescName(um.target_variable);
+            const desc_addr = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
+
+            const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ blob_ptr, desc_addr });
+            try self.builder.emitCall("", "", "unmarshall_array", args);
+            return;
+        }
+
+        // Check UDT / class instance variables — first check function-local, then global.
+        const udt_info: ?struct { udt_name: []const u8, addr: []const u8, is_local: bool } = blk: {
+            // Function-local UDT or class instance (DIM v AS Vec3 / DIM obj AS MyClass inside WORKER/FUNCTION/SUB)
+            if (self.func_ctx) |fctx| {
+                if (fctx.local_addrs.get(upper)) |li| {
+                    if ((li.base_type == .user_defined or li.base_type == .class_instance) and li.as_type_name.len > 0) {
+                        break :blk .{ .udt_name = li.as_type_name, .addr = li.addr, .is_local = true };
+                    }
+                }
+            }
+            // Global UDT variable
+            if (self.symbol_table.lookupVariable(upper)) |vsym| {
+                if (vsym.type_desc.base_type == .user_defined and vsym.type_desc.udt_name.len > 0) {
+                    break :blk .{ .udt_name = vsym.type_desc.udt_name, .addr = "", .is_local = false };
+                }
+                // Global class instance variable
+                if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.is_class_type and vsym.type_desc.class_name.len > 0) {
+                    break :blk .{ .udt_name = vsym.type_desc.class_name, .addr = "", .is_local = false };
+                }
+            }
+            break :blk null;
+        };
+
+        if (udt_info) |info| {
+            // Determine size: check if the type name refers to a CLASS (use object_size)
+            // or a UDT (use sizeOfUDT).
+            const obj_size: u32 = if (self.expr_emitter.symbol_table.lookupClass(info.udt_name)) |cls|
+                @intCast(cls.object_size)
+            else
+                self.expr_emitter.type_manager.sizeOfUDT(info.udt_name);
+
+            // Load the UDT/object pointer from the variable.
+            const udt_ptr = try self.builder.newTemp();
+            if (info.is_local) {
+                try self.builder.emitLoad(udt_ptr, "l", info.addr);
+            } else {
+                const var_name = try self.expr_emitter.symbol_mapper.globalVarName(um.target_variable, null);
+                try self.builder.emitLoad(udt_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            }
+
+            // unmarshall_udt or unmarshall_udt_deep depending on string fields
+            const has_strings = blk: {
+                if (self.expr_emitter.symbol_table.lookupClass(info.udt_name)) |cls| {
+                    for (cls.fields) |field| {
+                        if (field.type_desc.base_type == .string) break :blk true;
+                    }
+                } else if (self.expr_emitter.symbol_table.lookupType(info.udt_name)) |ts| {
+                    if (self.expr_emitter.typeHasStringFields(ts)) break :blk true;
+                }
+                break :blk false;
+            };
+
+            if (has_strings) {
+                const num_offsets: u32 = blk: {
+                    if (self.expr_emitter.symbol_table.lookupClass(info.udt_name)) |cls| {
+                        var count: u32 = 0;
+                        for (cls.fields) |field| {
+                            if (field.type_desc.base_type == .string) count += 1;
+                        }
+                        break :blk count;
+                    } else if (self.expr_emitter.symbol_table.lookupType(info.udt_name)) |ts| {
+                        break :blk self.expr_emitter.countUDTStringFields(ts);
+                    }
+                    break :blk 0;
+                };
+                const offsets_label = try std.fmt.allocPrint(self.allocator, "$str_offsets_{s}", .{info.udt_name});
+                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size, offsets_label, num_offsets });
+                try self.builder.emitCall("", "", "unmarshall_udt_deep", args);
+            } else {
+                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size });
+                try self.builder.emitCall("", "", "unmarshall_udt", args);
+            }
+            return;
+        }
+
+        // Fallback: treat as scalar assignment (store the value).
+        const resolved = try self.resolveVarAddr(um.target_variable, null);
+        try self.builder.emitStore(resolved.store_type, src_val, resolved.addr);
+    }
+
     fn emitLetStatement(self: *BlockEmitter, lt: *const ast.LetStmt) EmitError!void {
         // ── List subscript assignment: myList(n) = value → list_set_* ──
         if (lt.indices.len > 0 and lt.member_chain.len == 0 and self.expr_emitter.isListVariable(lt.variable)) {
@@ -7773,7 +8183,7 @@ pub const BlockEmitter = struct {
         const is_long_target = std.mem.eql(u8, target_qbe, "l") and to_bt.isInteger();
 
         // Pointer types (class_instance, object, user_defined) — no conversion
-        if (to_bt == .class_instance or to_bt == .object or to_bt == .pointer or to_bt == .user_defined) {
+        if (to_bt == .class_instance or to_bt == .object or to_bt == .user_defined) {
             return val;
         }
 
@@ -8083,11 +8493,34 @@ pub const BlockEmitter = struct {
             }
         }
 
+        // For UDT locals, also register in the symbol table so that
+        // inferUDTName can resolve the UDT type name for member access
+        // (e.g. v.X where v is DIM v AS Vec3 inside a WORKER/FUNCTION).
+        if (bt == .user_defined and arr.as_type_name.len > 0) {
+            if (self.func_ctx != null) {
+                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                    fctx.upper_name, upper_key,
+                });
+                const type_id = self.symbol_table.getTypeId(arr.as_type_name) orelse -1;
+                const mut_st: *semantic.SymbolTable = @constCast(self.symbol_table);
+                try mut_st.insertVariable(var_key, .{
+                    .name = arr.name,
+                    .type_desc = semantic.TypeDescriptor.fromUDT(arr.as_type_name, type_id),
+                    .type_name = arr.as_type_name,
+                    .is_declared = true,
+                    .first_use = .{},
+                    .scope = .{ .kind = .function, .name = fctx.func_name },
+                    .is_global = false,
+                });
+            }
+        }
+
         try fctx.local_addrs.put(upper_key, .{
             .addr = addr,
             .qbe_type = qbe_t,
             .base_type = bt,
             .suffix = arr.type_suffix,
+            .as_type_name = if (bt == .user_defined or bt == .class_instance) arr.as_type_name else "",
         });
     }
 
@@ -8373,12 +8806,13 @@ pub const BlockEmitter = struct {
                 .qbe_type = qbe_t,
                 .base_type = bt,
                 .suffix = lv.type_suffix,
+                .as_type_name = if (bt == .user_defined or bt == .class_instance) local_as_type_name else "",
             });
 
-            // For UDT locals, register in the symbol table so that
-            // inferUDTName can resolve the UDT type name for member
+            // For UDT / class locals, register in the symbol table so that
+            // inferUDTName can resolve the type name for member
             // access (e.g. P.X where P is LOCAL P AS Point).
-            if (bt == .user_defined and local_as_type_name.len > 0) {
+            if ((bt == .user_defined or bt == .class_instance) and local_as_type_name.len > 0) {
                 const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
                     fctx.upper_name, upper_key,
                 });
@@ -8500,6 +8934,9 @@ pub const CFGCodeGenerator = struct {
 
         // Phase 3b: CLASS vtables and class name strings
         try self.emitClassDeclarations(program);
+
+        // Phase 3c: MARSHALL string-offset tables for UDTs/classes with STRING fields
+        try self.emitStringOffsetTables();
 
         // Phase 4: Runtime declarations
         try self.runtime.emitDeclarations();
@@ -9070,6 +9507,81 @@ pub const CFGCodeGenerator = struct {
             try self.builder.emit("    l ${s}", .{method.mangled_name});
         }
 
+        try self.builder.raw("\n}\n");
+    }
+
+    /// Emit static data sections with string-field byte-offsets for every
+    /// UDT and CLASS that contains at least one STRING field.
+    ///
+    /// For each such type we emit:
+    ///   data $str_offsets_TYPENAME = { w off1, w off2, ... }
+    ///
+    /// These tables are referenced by marshall_udt_deep / unmarshall_udt_deep
+    /// at runtime to deep-copy string fields.
+    fn emitStringOffsetTables(self: *CFGCodeGenerator) !void {
+        const st = self.semantic.getSymbolTable();
+
+        // UDTs
+        var type_it = st.types.iterator();
+        while (type_it.next()) |entry| {
+            const ts = entry.value_ptr;
+            const offsets = try self.collectUDTStringOffsets(ts, 0);
+            if (offsets.len > 0) {
+                try self.emitOffsetDataSection(ts.name, offsets);
+            }
+        }
+
+        // Classes
+        var cls_it = st.classes.iterator();
+        while (cls_it.next()) |entry| {
+            const cls = entry.value_ptr;
+            var offsets_list: std.ArrayList(u32) = .empty;
+            defer offsets_list.deinit(self.allocator);
+            for (cls.fields) |field| {
+                if (field.type_desc.base_type == .string) {
+                    try offsets_list.append(self.allocator, @intCast(field.offset));
+                }
+            }
+            if (offsets_list.items.len > 0) {
+                try self.emitOffsetDataSection(cls.name, offsets_list.items);
+            }
+        }
+    }
+
+    /// Recursively collect byte-offsets of all STRING fields in a UDT.
+    fn collectUDTStringOffsets(self: *CFGCodeGenerator, ts: *const semantic.TypeSymbol, base_offset: u32) ![]u32 {
+        var offsets: std.ArrayList(u32) = .empty;
+        defer offsets.deinit(self.allocator);
+        var offset: u32 = base_offset;
+        for (ts.fields) |field| {
+            if (field.type_desc.base_type == .string) {
+                try offsets.append(self.allocator, offset);
+                offset += 8; // string pointer
+            } else if (field.type_desc.base_type == .user_defined) {
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                if (self.semantic.getSymbolTable().lookupType(nested_name)) |nested_ts| {
+                    const nested = try self.collectUDTStringOffsets(nested_ts, offset);
+                    for (nested) |off| {
+                        try offsets.append(self.allocator, off);
+                    }
+                }
+                offset += self.type_manager.sizeOfUDT(nested_name);
+            } else {
+                offset += self.type_manager.sizeOf(field.type_desc.base_type);
+            }
+        }
+        return try self.allocator.dupe(u32, offsets.items);
+    }
+
+    /// Emit a data section: data $str_offsets_NAME = { w val1, w val2, ... }
+    fn emitOffsetDataSection(self: *CFGCodeGenerator, type_name: []const u8, offsets: []const u32) !void {
+        const label = try std.fmt.allocPrint(self.allocator, "str_offsets_{s}", .{type_name});
+        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "String field offsets for {s} ({d} fields)", .{ type_name, offsets.len }));
+        try self.builder.emit("data ${s} = {{\n", .{label});
+        for (offsets, 0..) |off, i| {
+            if (i > 0) try self.builder.raw(",\n");
+            try self.builder.emit("    w {d}", .{off});
+        }
         try self.builder.raw("\n}\n");
     }
 

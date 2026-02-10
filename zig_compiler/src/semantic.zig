@@ -48,6 +48,9 @@ pub const BaseType = enum(u8) {
     string_desc, // string descriptor
     loop_index, // FOR loop index variable
 
+    // Marshalled blob (opaque pointer to deep-copied data)
+    marshalled,
+
     // Object system types
     object, // generic object reference
     class_instance, // typed class instance reference
@@ -65,7 +68,7 @@ pub const BaseType = enum(u8) {
             .long, .ulong => 64,
             .single => 32,
             .double => 64,
-            .pointer, .object, .class_instance, .array_desc, .string_desc, .string, .unicode => 64,
+            .pointer, .object, .class_instance, .array_desc, .string_desc, .string, .unicode, .marshalled => 64,
             .loop_index => 32,
             else => 0,
         };
@@ -112,6 +115,7 @@ pub const BaseType = enum(u8) {
             .single => "s",
             .double => "d",
             .string, .unicode, .pointer, .object, .class_instance, .array_desc, .string_desc, .user_defined => "l",
+            .marshalled => "d", // Internally uses double as carrier for blob pointer
             .void => "",
             .unknown => "w",
         };
@@ -127,6 +131,7 @@ pub const BaseType = enum(u8) {
             .single => "s",
             .double => "d",
             .string, .unicode, .pointer, .object, .class_instance, .array_desc, .string_desc, .user_defined => "l",
+            .marshalled => "d", // Internally uses double as carrier for blob pointer
             .void => "",
             .unknown => "w",
         };
@@ -316,6 +321,7 @@ pub fn baseTypeFromSuffix(suffix: ?Tag) BaseType {
         .kw_single => .single,
         .kw_double => .double,
         .kw_string_type => .string,
+        .kw_marshalled => .marshalled,
 
         else => .unknown,
     };
@@ -349,6 +355,7 @@ pub fn elementTypeFromName(name: []const u8) BaseType {
     if (std.mem.eql(u8, upper, "USHORT")) return .ushort;
     if (std.mem.eql(u8, upper, "OBJECT")) return .object;
     if (std.mem.eql(u8, upper, "ANY")) return .unknown;
+    if (std.mem.eql(u8, upper, "MARSHALLED")) return .marshalled;
     // Unknown element type name — could be a class/UDT name; treat as object
     return .object;
 }
@@ -369,6 +376,7 @@ pub fn descriptorFromKeyword(kw: Tag) TypeDescriptor {
             .kw_ubyte => .ubyte,
             .kw_short => .short,
             .kw_ushort => .ushort,
+            .kw_marshalled => .marshalled,
             else => .unknown,
         }),
     };
@@ -581,6 +589,8 @@ pub const FunctionSymbol = struct {
     definition: SourceLocation = .{},
     /// For DEF FN: the expression body (null for SUB/FUNCTION).
     body: ?*const ast.Expression = null,
+    /// True if this is a WORKER (isolated concurrency function).
+    is_worker: bool = false,
 };
 
 /// A line number symbol.
@@ -992,6 +1002,7 @@ pub const SemanticErrorType = enum {
     duplicate_class,
     circular_inheritance,
     class_error,
+    worker_isolation_violation,
 };
 
 /// A semantic error.
@@ -1033,6 +1044,7 @@ pub const SemanticAnalyzer = struct {
     current_line_number: i32 = 0,
     current_function_name: []const u8 = "",
     in_function: bool = false,
+    in_worker: bool = false,
 
     // Loop tracking stacks (we use ArrayLists as stacks)
     for_stack: std.ArrayList(ForContext),
@@ -1138,54 +1150,9 @@ pub const SemanticAnalyzer = struct {
     /// After all CLASS declarations have been collected, walk the class
     /// table and resolve every `parent_class` pointer.  This is safe
     /// because no more puts will happen until pass 2.
+    /// Uses the `parent_class_name` field stored in each ClassSymbol
+    /// during collectClassDeclaration.
     fn fixupClassParentPointers(self: *SemanticAnalyzer) void {
-        // First pass: collect parent-name → child-key pairs so we don't
-        // iterate and mutate the same map simultaneously.
-        // We just iterate the values and patch in-place (getPtr is stable
-        // as long as we don't insert/remove).
-        var it = self.symbol_table.classes.iterator();
-        while (it.next()) |entry| {
-            const cls = entry.value_ptr;
-            // If parent_class is already set (shouldn't be after our
-            // null-init strategy, but guard anyway) skip.
-            if (cls.parent_class != null) continue;
-
-            // Check if the ClassSymbol's AST-level parent name was
-            // recorded.  We stored it as an inherited field list —
-            // but we need the original parent name.  We can recover it
-            // by checking if inherited fields exist but parent_class is
-            // null.  Instead, let's just iterate the AST again… but we
-            // don't have the AST here.
-            //
-            // Simpler: we stored fields with `inherited = true`.  Walk
-            // all OTHER classes to find one whose non-inherited fields
-            // match our inherited fields (expensive but correct).
-            //
-            // Even simpler: during collectClassDeclaration we can stash
-            // the parent name.  For now, iterate all classes and match
-            // by class_id on inherited method origin.
-        }
-
-        // Better approach: iterate all classes, for each one that has
-        // inherited fields/methods, find the parent by matching the
-        // origin_class of the first inherited method, or by matching
-        // field offsets.  But this is fragile.
-        //
-        // The cleanest fix: store the parent class name alongside the
-        // ClassSymbol during collectClassDeclaration and use it here.
-        // We'll piggy-back on the destructor_mangled_name field... no,
-        // let's just do a second scan of the program AST from analyze().
-        // But we don't have the program pointer here.
-        //
-        // Actually the simplest: just iterate the class map and for each
-        // class, check every other class to see if it should be the parent
-        // (by checking inherited fields/methods).
-        //
-        // EVEN SIMPLER: we already set parent_class = null during put.
-        // Let's just add a `parent_class_name` field to ClassSymbol so
-        // we can resolve it here.
-
-        // Use the parent_class_name stored in ClassSymbol (we'll add it).
         var it2 = self.symbol_table.classes.iterator();
         while (it2.next()) |entry| {
             const cls = entry.value_ptr;
@@ -1226,6 +1193,9 @@ pub const SemanticAnalyzer = struct {
             },
             .sub => |sub| {
                 try self.collectSubDeclaration(&sub, stmt.loc);
+            },
+            .worker => |wkr| {
+                try self.collectWorkerDeclaration(&wkr, stmt.loc);
             },
             .constant => |con| {
                 try self.collectConstantDeclaration(&con, stmt.loc);
@@ -1392,6 +1362,30 @@ pub const SemanticAnalyzer = struct {
                     for (clause.block) |s| try self.collectDeclaration(s);
                 }
                 for (tc.finally_block) |s| try self.collectDeclaration(s);
+            },
+            // Recurse into MATCH TYPE blocks so declarations inside
+            // case arms are collected.
+            .match_type => |mt| {
+                for (mt.case_arms) |arm| {
+                    for (arm.body) |s| try self.collectDeclaration(s);
+                }
+                for (mt.case_else_body) |s| try self.collectDeclaration(s);
+            },
+            // Auto-register INPUT target variables (INPUT X%, Y$).
+            .input => |inp| {
+                for (inp.variables) |var_name| {
+                    const suffix: ?Tag = if (var_name.len > 0) switch (var_name[var_name.len - 1]) {
+                        '%' => @as(?Tag, .percent),
+                        '$' => @as(?Tag, .type_string),
+                        '#' => @as(?Tag, .hash),
+                        '!' => @as(?Tag, .exclamation),
+                        '&' => @as(?Tag, .ampersand),
+                        '^' => @as(?Tag, .caret),
+                        '@' => @as(?Tag, .at_suffix),
+                        else => @as(?Tag, null),
+                    } else null;
+                    try self.autoRegisterVariable(var_name, suffix, stmt.loc);
+                }
             },
             else => {},
         }
@@ -1756,8 +1750,7 @@ pub const SemanticAnalyzer = struct {
             // Build parameter type list
             var param_types_list: std.ArrayList(TypeDescriptor) = .empty;
             for (method.parameter_types, 0..) |pt, pi| {
-                if (pt) |tag| {
-                    _ = tag;
+                if (pt) |_| {
                     try param_types_list.append(self.allocator, descriptorFromSuffix(pt));
                 } else if (pi < method.parameter_as_types.len and method.parameter_as_types[pi].len > 0) {
                     const as_name = method.parameter_as_types[pi];
@@ -2019,6 +2012,98 @@ pub const SemanticAnalyzer = struct {
         }
 
         for (sub.body) |s| {
+            try self.collectDeclaration(s);
+        }
+    }
+
+    /// Collect a WORKER declaration — treated like a FUNCTION in the
+    /// symbol table, but with `.is_worker = true` and no BYREF params.
+    fn collectWorkerDeclaration(self: *SemanticAnalyzer, wkr: *const ast.WorkerStmt, loc: SourceLocation) AnalyzeError!void {
+        var upper_buf: [128]u8 = undefined;
+        const upper_name = upperBuf(wkr.worker_name, &upper_buf) orelse wkr.worker_name;
+
+        if (self.symbol_table.functions.contains(upper_name)) {
+            try self.addError(.function_redeclared, "Duplicate WORKER/FUNCTION declaration", loc);
+            return;
+        }
+
+        // Build parameter type descriptors (same logic as collectFunctionDeclaration).
+        var param_descs: std.ArrayList(TypeDescriptor) = .empty;
+        defer param_descs.deinit(self.allocator);
+        for (wkr.parameter_types, 0..) |pt, pi| {
+            if (pi < wkr.parameter_as_types.len and wkr.parameter_as_types[pi].len > 0) {
+                const as_name = wkr.parameter_as_types[pi];
+                const is_real_type_tag = if (pt) |tag| switch (tag) {
+                    .type_int, .percent, .type_float, .exclamation, .type_double, .hash, .type_string, .type_byte, .at_suffix, .type_short, .caret, .ampersand, .kw_integer, .kw_uinteger, .kw_long, .kw_ulong, .kw_short, .kw_ushort, .kw_byte, .kw_ubyte, .kw_single, .kw_double, .kw_string_type => true,
+                    else => false,
+                } else false;
+
+                if (is_real_type_tag) {
+                    try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                } else if (self.symbol_table.lookupClass(as_name) != null) {
+                    try param_descs.append(self.allocator, TypeDescriptor.fromClass(as_name));
+                } else {
+                    var as_upper_buf: [128]u8 = undefined;
+                    const as_upper = upperBuf(as_name, &as_upper_buf) orelse as_name;
+                    const tid = self.symbol_table.getTypeId(as_upper) orelse -1;
+                    if (tid >= 0) {
+                        try param_descs.append(self.allocator, TypeDescriptor.fromUDT(as_name, tid));
+                    } else {
+                        try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+                    }
+                }
+            } else {
+                try param_descs.append(self.allocator, descriptorFromSuffix(pt));
+            }
+        }
+
+        const return_desc = if (wkr.return_type_as_name.len > 0) blk_ret: {
+            const ret_as = wkr.return_type_as_name;
+            if (self.symbol_table.lookupClass(ret_as) != null) {
+                break :blk_ret TypeDescriptor.fromClass(ret_as);
+            }
+            const ret_tid = self.symbol_table.getTypeId(ret_as) orelse -1;
+            if (ret_tid >= 0) {
+                break :blk_ret TypeDescriptor.fromUDT(ret_as, ret_tid);
+            }
+            if (wkr.has_return_as_type)
+                break :blk_ret descriptorFromKeyword(wkr.return_type_suffix orelse .kw_double)
+            else
+                break :blk_ret descriptorFromSuffix(wkr.return_type_suffix);
+        } else if (wkr.has_return_as_type)
+            descriptorFromKeyword(wkr.return_type_suffix orelse .kw_double)
+        else
+            descriptorFromSuffix(wkr.return_type_suffix);
+
+        // Workers don't support BYREF — generate an all-false array.
+        const byref = try self.allocator.alloc(bool, wkr.parameters.len);
+        @memset(byref, false);
+
+        try self.symbol_table.functions.put(try self.allocator.dupe(u8, upper_name), .{
+            .name = wkr.worker_name,
+            .parameters = wkr.parameters,
+            .parameter_type_descs = try self.allocator.dupe(TypeDescriptor, param_descs.items),
+            .parameter_is_byref = byref,
+            .return_type_desc = return_desc,
+            .return_type_name = wkr.return_type_as_name,
+            .definition = loc,
+            .is_worker = true,
+        });
+
+        // Collect declarations inside the worker body.
+        const saved_func = self.current_function_name;
+        const saved_in_func = self.in_function;
+        const saved_in_worker = self.in_worker;
+        self.current_function_name = wkr.worker_name;
+        self.in_function = true;
+        self.in_worker = true;
+        defer {
+            self.current_function_name = saved_func;
+            self.in_function = saved_in_func;
+            self.in_worker = saved_in_worker;
+        }
+
+        for (wkr.body) |s| {
             try self.collectDeclaration(s);
         }
     }
@@ -2375,6 +2460,24 @@ pub const SemanticAnalyzer = struct {
                 }
                 for (sub.body) |s| try self.validateStatement(s);
             },
+            .worker => |wkr| {
+                const saved_func = self.current_function_name;
+                const saved_in_func = self.in_function;
+                const saved_in_worker = self.in_worker;
+                self.current_function_name = wkr.worker_name;
+                self.in_function = true;
+                self.in_worker = true;
+                defer {
+                    self.current_function_name = saved_func;
+                    self.in_function = saved_in_func;
+                    self.in_worker = saved_in_worker;
+                }
+                // Validate worker body with isolation checks
+                for (wkr.body) |s| try self.validateWorkerStatement(s);
+            },
+            .unmarshall => |um| {
+                try self.validateExpression(um.source_expr);
+            },
             .goto_stmt => |gt| {
                 if (gt.is_label) {
                     var upper_buf: [128]u8 = undefined;
@@ -2427,6 +2530,34 @@ pub const SemanticAnalyzer = struct {
             .console => |con| {
                 for (con.items) |item| try self.validateExpression(item.expr);
             },
+            // ── Statements that were previously falling through else => {} ──
+            .match_type => |mt| {
+                try self.validateExpression(mt.match_expression);
+                for (mt.case_arms) |arm| {
+                    for (arm.body) |s| try self.validateStatement(s);
+                }
+                for (mt.case_else_body) |s| try self.validateStatement(s);
+            },
+            .mid_assign => |ma| {
+                try self.validateExpression(ma.position);
+                if (ma.length) |l| try self.validateExpression(l);
+                try self.validateExpression(ma.replacement);
+            },
+            .on_goto => |og| {
+                try self.validateExpression(og.selector);
+            },
+            .on_gosub => |og| {
+                try self.validateExpression(og.selector);
+            },
+            .on_call => |oc| {
+                try self.validateExpression(oc.selector);
+            },
+            .delete => {},
+            .redim => |rd| {
+                for (rd.arrays) |arr| {
+                    for (arr.dimensions) |dim_expr| try self.validateExpression(dim_expr);
+                }
+            },
             .swap => {},
             .inc, .dec => |id| {
                 if (id.amount_expr) |ae| try self.validateExpression(ae);
@@ -2436,6 +2567,221 @@ pub const SemanticAnalyzer = struct {
                 for (es.arguments) |arg| try self.validateExpression(arg);
             },
             else => {},
+        }
+    }
+
+    /// Validate a statement inside a WORKER body.  This is the main
+    /// isolation enforcement — workers cannot access globals, do I/O,
+    /// use graphics/sprites/audio, or spawn nested workers.
+    fn validateWorkerStatement(self: *SemanticAnalyzer, stmt: *const ast.Statement) !void {
+        switch (stmt.data) {
+            // ── Forbidden: I/O ──────────────────────────────────────────
+            .print, .console => {
+                try self.addError(.worker_isolation_violation, "PRINT/CONSOLE not allowed inside a WORKER (no I/O in isolated threads)", stmt.loc);
+            },
+            .input, .input_at => {
+                try self.addError(.worker_isolation_violation, "INPUT not allowed inside a WORKER (no I/O in isolated threads)", stmt.loc);
+            },
+            // ── Forbidden: Global / Shared state ────────────────────────
+            .global => {
+                try self.addError(.worker_isolation_violation, "GLOBAL not allowed inside a WORKER (workers are isolated)", stmt.loc);
+            },
+            .shared => {
+                try self.addError(.worker_isolation_violation, "SHARED not allowed inside a WORKER (workers are isolated)", stmt.loc);
+            },
+            // ── Forbidden: File I/O ─────────────────────────────────────
+            .open, .close => {
+                try self.addError(.worker_isolation_violation, "File I/O not allowed inside a WORKER", stmt.loc);
+            },
+            // ── Forbidden: Graphics / Sprites / Audio ───────────────────
+            .cls,
+            .gcls,
+            .vsync,
+            .color,
+            .pset,
+            .line_stmt,
+            .rect,
+            .circle,
+            .hline,
+            .vline,
+            .at_stmt,
+            .textput,
+            .tchar,
+            .tgrid,
+            .tscroll,
+            .tclear,
+            .locate,
+            .sprload,
+            .sprfree,
+            .sprshow,
+            .sprhide,
+            .sprmove,
+            .sprpos,
+            .sprtint,
+            .sprscale,
+            .sprrot,
+            .sprexplode,
+            .play,
+            .play_sound,
+            .after,
+            .every,
+            .afterframes,
+            .everyframe,
+            .timer_stop,
+            .timer_interval,
+            => {
+                try self.addError(.worker_isolation_violation, "Graphics/sprites/audio/timer commands not allowed inside a WORKER", stmt.loc);
+            },
+            // ── Allowed: local assignments, control flow, etc. ──────────
+            .let => |lt| {
+                // Check that the variable isn't a GLOBAL.
+                try self.validateWorkerVarAccess(lt.variable, stmt.loc);
+                try self.validateWorkerExpression(lt.value, stmt.loc);
+                for (lt.indices) |idx| try self.validateWorkerExpression(idx, stmt.loc);
+            },
+            .dim => {},
+            .constant => {},
+            .return_stmt => |rs| {
+                if (rs.return_value) |rv| try self.validateWorkerExpression(rv, stmt.loc);
+            },
+            .if_stmt => |ifs| {
+                try self.validateWorkerExpression(ifs.condition, stmt.loc);
+                for (ifs.then_statements) |s| try self.validateWorkerStatement(s);
+                for (ifs.elseif_clauses) |clause| {
+                    try self.validateWorkerExpression(clause.condition, stmt.loc);
+                    for (clause.statements) |s| try self.validateWorkerStatement(s);
+                }
+                for (ifs.else_statements) |s| try self.validateWorkerStatement(s);
+            },
+            .for_stmt => |fs| {
+                try self.validateWorkerExpression(fs.start, stmt.loc);
+                try self.validateWorkerExpression(fs.end_expr, stmt.loc);
+                if (fs.step) |step| try self.validateWorkerExpression(step, stmt.loc);
+                for (fs.body) |s| try self.validateWorkerStatement(s);
+            },
+            .while_stmt => |ws| {
+                try self.validateWorkerExpression(ws.condition, stmt.loc);
+                for (ws.body) |s| try self.validateWorkerStatement(s);
+            },
+            .repeat_stmt => |rs| {
+                for (rs.body) |s| try self.validateWorkerStatement(s);
+                if (rs.condition) |cond| try self.validateWorkerExpression(cond, stmt.loc);
+            },
+            .do_stmt => |ds| {
+                if (ds.pre_condition) |pc| try self.validateWorkerExpression(pc, stmt.loc);
+                for (ds.body) |s| try self.validateWorkerStatement(s);
+                if (ds.post_condition) |pc| try self.validateWorkerExpression(pc, stmt.loc);
+            },
+            .case_stmt => |cs| {
+                for (cs.when_clauses) |clause| {
+                    for (clause.statements) |s| try self.validateWorkerStatement(s);
+                }
+                for (cs.otherwise_statements) |s| try self.validateWorkerStatement(s);
+            },
+            .call => |cs| {
+                // Allow calling other functions/subs, but check arguments.
+                for (cs.arguments) |arg| try self.validateWorkerExpression(arg, stmt.loc);
+            },
+            .swap => |sw| {
+                try self.validateWorkerVarAccess(sw.var1, stmt.loc);
+                try self.validateWorkerVarAccess(sw.var2, stmt.loc);
+            },
+            .inc, .dec => |id| {
+                try self.validateWorkerVarAccess(id.var_name, stmt.loc);
+            },
+            // Allow basic control flow
+            .next_stmt,
+            .wend,
+            .exit_stmt,
+            .end_stmt,
+            .label,
+            .rem,
+            .option,
+            .local,
+            .loop_stmt,
+            .until_stmt,
+            .redim,
+            .erase,
+            .delete,
+            .unmarshall,
+            => {},
+            // Worker definitions cannot be nested.
+            .worker => {
+                try self.addError(.worker_isolation_violation, "WORKER cannot be nested inside another WORKER", stmt.loc);
+            },
+            // Other statements: allow through (normal validation still
+            // runs in pass2 for the worker body via the .worker arm in
+            // validateStatement which recurses into body statements).
+            else => {},
+        }
+    }
+
+    /// Check that a variable access inside a WORKER doesn't reference
+    /// a GLOBAL variable.
+    fn validateWorkerVarAccess(self: *SemanticAnalyzer, var_name: []const u8, loc: SourceLocation) !void {
+        var upper_buf: [128]u8 = undefined;
+        const upper_name = upperBuf(var_name, &upper_buf) orelse var_name;
+
+        // First try the scoped key (e.g. "WORKERNAME.VARNAME") so we find
+        // worker-local / function-local variables before falling back to
+        // the bare name.  This prevents false positives when a global
+        // variable happens to share the same name as a worker-local one.
+        if (self.in_function and self.current_function_name.len > 0) {
+            var scoped_buf: [256]u8 = undefined;
+            const scoped = std.fmt.bufPrint(&scoped_buf, "{s}.{s}", .{ self.current_function_name, upper_name }) catch null;
+            if (scoped) |scoped_key| {
+                if (self.symbol_table.lookupVariable(scoped_key)) |_| {
+                    // Found as a local variable in this worker/function scope — safe.
+                    return;
+                }
+            }
+        }
+
+        // Fall back to bare-name lookup for globals.
+        if (self.symbol_table.lookupVariable(upper_name)) |vsym| {
+            if (vsym.is_global and vsym.scope.isGlobal()) {
+                // Variable was declared at global scope (not a worker-local variable).
+                try self.addError(.worker_isolation_violation, "Workers cannot access global variables (isolation violation)", loc);
+            }
+        }
+    }
+
+    /// Check that an expression inside a WORKER doesn't use forbidden
+    /// constructs (spawn, global variable references, etc.).
+    fn validateWorkerExpression(self: *SemanticAnalyzer, expr: *const ast.Expression, loc: SourceLocation) !void {
+        switch (expr.data) {
+            .binary => |b| {
+                try self.validateWorkerExpression(b.left, loc);
+                try self.validateWorkerExpression(b.right, loc);
+            },
+            .unary => |u| {
+                try self.validateWorkerExpression(u.operand, loc);
+            },
+            .spawn => {
+                try self.addError(.worker_isolation_violation, "SPAWN not allowed inside a WORKER (no nested workers)", loc);
+            },
+            .variable => |v| {
+                try self.validateWorkerVarAccess(v.name, loc);
+            },
+            .function_call => |fc| {
+                for (fc.arguments) |arg| try self.validateWorkerExpression(arg, loc);
+            },
+            .iif => |i| {
+                try self.validateWorkerExpression(i.condition, loc);
+                try self.validateWorkerExpression(i.true_value, loc);
+                try self.validateWorkerExpression(i.false_value, loc);
+            },
+            .array_access => |aa| {
+                for (aa.indices) |idx| try self.validateWorkerExpression(idx, loc);
+            },
+            .member_access => |ma| {
+                // Recurse into the object expression so that e.g.
+                // globalObj.field is caught, while localObj.field is allowed.
+                try self.validateWorkerExpression(ma.object, loc);
+            },
+            else => {
+                // Allow numbers, strings, ME, NOTHING, AWAIT, READY, etc.
+            },
         }
     }
 
@@ -2505,6 +2851,16 @@ pub const SemanticAnalyzer = struct {
             .registry_function => |rf| {
                 for (rf.arguments) |arg| try self.validateExpression(arg);
             },
+            .spawn => |sp| {
+                for (sp.arguments) |arg| try self.validateExpression(arg);
+            },
+            .await_expr => |aw| {
+                try self.validateExpression(aw.future);
+            },
+            .ready => |rd| {
+                try self.validateExpression(rd.future);
+            },
+            .marshall => {}, // Variable name validated at codegen time
         }
     }
 
@@ -2520,8 +2876,8 @@ pub const SemanticAnalyzer = struct {
             .unary => |u| self.inferExpressionType(u.operand),
             .function_call => |fc| self.inferFunctionReturnType(fc.name),
             .iif => |i| self.inferExpressionType(i.true_value),
-            .member_access => TypeDescriptor.fromBase(.double), // TODO: field type lookup
-            .method_call => TypeDescriptor.fromBase(.double), // TODO: method return type
+            .member_access => |ma| self.inferMemberAccessType(ma),
+            .method_call => |mc| self.inferMethodCallType(mc),
             .new => |n| TypeDescriptor.fromClass(n.class_name),
             .create => |cr| TypeDescriptor.fromUDT(cr.type_name, self.symbol_table.getTypeId(cr.type_name) orelse -1),
             .me => TypeDescriptor.fromBase(.class_instance),
@@ -2529,10 +2885,67 @@ pub const SemanticAnalyzer = struct {
             .is_type => TypeDescriptor.fromBase(.integer),
             .list_constructor => TypeDescriptor.fromBase(.object),
             .array_access => |aa| self.inferArrayElementType(aa.name),
-            .array_binop => TypeDescriptor.fromBase(.double),
-            .super_call => TypeDescriptor.fromBase(.double),
+            .array_binop => |ab| self.inferArrayBinopType(ab),
+            .super_call => |sc| self.inferSuperCallType(sc),
             .registry_function => TypeDescriptor.fromBase(.double),
+            .spawn => TypeDescriptor.fromBase(.long), // FUTURE handle is a pointer (64-bit)
+            .await_expr => TypeDescriptor.fromBase(.double), // AWAIT returns double (runtime converts)
+            .ready => TypeDescriptor.fromBase(.integer), // READY returns 0 or 1
+            .marshall => TypeDescriptor.fromBase(.marshalled), // MARSHALL returns opaque blob pointer
         };
+    }
+
+    /// Infer the type of a member access expression (e.g. obj.field).
+    /// Resolves the object's class/UDT type and looks up the field.
+    fn inferMemberAccessType(self: *const SemanticAnalyzer, ma: ast.MemberAccessExpr) TypeDescriptor {
+        const obj_type = self.inferExpressionType(ma.object);
+        if (obj_type.base_type == .class_instance) {
+            if (self.symbol_table.lookupClass(obj_type.object_type_name)) |cls| {
+                if (cls.findField(ma.member_name)) |field| return field.type_desc;
+            }
+        } else if (obj_type.base_type == .udt) {
+            if (self.symbol_table.lookupType(obj_type.object_type_name)) |typ| {
+                if (typ.findField(ma.member_name)) |field| return field.type_desc;
+            }
+        }
+        return TypeDescriptor.fromBase(.double);
+    }
+
+    /// Infer the return type of a method call expression (e.g. obj.Method()).
+    fn inferMethodCallType(self: *const SemanticAnalyzer, mc: ast.MethodCallExpr) TypeDescriptor {
+        const obj_type = self.inferExpressionType(mc.object);
+        if (obj_type.base_type == .class_instance) {
+            if (self.symbol_table.lookupClass(obj_type.object_type_name)) |cls| {
+                if (cls.findMethod(mc.method_name)) |method| return method.return_type;
+            }
+        }
+        return TypeDescriptor.fromBase(.double);
+    }
+
+    /// Infer the return type of a SUPER.Method() call.
+    fn inferSuperCallType(self: *const SemanticAnalyzer, sc: ast.SuperCallExpr) TypeDescriptor {
+        // SUPER calls occur inside a class method — look up the current
+        // function's class context and find the method in the parent.
+        if (self.in_function) {
+            // current_function_name is "ClassName__MethodName" for methods
+            if (std.mem.indexOf(u8, self.current_function_name, "__")) |sep| {
+                const class_name = self.current_function_name[0..sep];
+                if (self.symbol_table.lookupClass(class_name)) |cls| {
+                    if (cls.parent_class) |parent| {
+                        if (parent.findMethod(sc.method_name)) |method| return method.return_type;
+                    }
+                }
+            }
+        }
+        return TypeDescriptor.fromBase(.double);
+    }
+
+    /// Infer the type of an array binary operation (e.g. a() + 5).
+    fn inferArrayBinopType(self: *const SemanticAnalyzer, ab: ast.ArrayBinopExpr) TypeDescriptor {
+        // The left operand is the array expression — infer its type.
+        const arr_type = self.inferExpressionType(ab.left_array);
+        if (arr_type.base_type != .double and arr_type.base_type != .unknown) return arr_type;
+        return TypeDescriptor.fromBase(.double);
     }
 
     fn inferVariableType(self: *const SemanticAnalyzer, var_name: []const u8, suffix: ?Tag) TypeDescriptor {

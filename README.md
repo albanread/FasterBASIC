@@ -1,15 +1,60 @@
 # FasterBASIC
 
-> **Note:** A next-generation version of this compiler is currently being developed in **Zig** to improve memory safety and strictness.
+> **The compiler is now written in Zig.** The Zig-based compiler (`zig_compiler/`) is the primary and actively maintained implementation, replacing the earlier C++ prototype. All new features — Workers, MARSHALL/UNMARSHALL, deep string marshalling — are Zig-only.
 
 [![Build Status](https://github.com/albanread/FasterBASIC/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FasterBASIC/actions)
 
-A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon).
+A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon). The compiler is written in **Zig** with a hybrid **Zig + C** runtime, and targets the **QBE** SSA backend.
 
-## 🎉 Latest Features (February 2025)
+## 🎉 Latest Features (February 2026)
+
+### Workers & Concurrency
+**NEW:** Lightweight worker threads with structured data passing!
+
+```basic
+TYPE Task
+  Name AS STRING
+  Value AS DOUBLE
+END TYPE
+
+DIM t AS Task
+t.Name = "compute"
+t.Value = 42.0
+
+MARSHALL t INTO buf
+WORKER result = MyWorker(buf)
+' ...
+UNMARSHALL result INTO t2 AS Task
+PRINT t2.Name; " = "; t2.Value
+```
+
+Workers run in parallel via `pthreads`. Data is passed between threads using `MARSHALL`/`UNMARSHALL`, which deep-copies all string fields to ensure thread safety.
+
+### MARSHALL / UNMARSHALL
+**NEW:** Type-safe binary serialisation for UDTs and CLASS objects!
+
+```basic
+TYPE Person
+  Name AS STRING
+  Age AS DOUBLE
+END TYPE
+
+DIM p AS Person
+p.Name = "Alice"
+p.Age = 30
+
+MARSHALL p INTO buf          ' deep-copy (strings are cloned)
+UNMARSHALL buf INTO q AS Person
+PRINT q.Name                 ' Output: Alice
+```
+
+- Works with UDTs and CLASS instances (including inherited fields)
+- Automatic deep-copy of STRING fields via static offset tables
+- Scalar-only types use a fast flat `memcpy` path
+- Can be used anywhere — not restricted to workers
 
 ### Array Expressions & SIMD Math
-**NEW:** Complete array expression engine with NEON SIMD acceleration, reductions, and fused multiply-add!
+Complete array expression engine with NEON SIMD acceleration, reductions, and fused multiply-add.
 
 ```basic
 DIM A(1000) AS SINGLE, B(1000) AS SINGLE, C(1000) AS SINGLE, D(1000) AS SINGLE
@@ -26,7 +71,7 @@ B() = ABS(A())                ' element-wise absolute value
 Supports all numeric types including `BYTE` (16 elements/register) and `SHORT` (8 elements/register). See [Array Expressions](articles/array-expressions.md) for full documentation.
 
 ### Object-Oriented Programming
-**NEW:** Full CLASS system with inheritance, polymorphism, and virtual dispatch!
+Full CLASS system with inheritance, polymorphism, and virtual dispatch.
 
 ```basic
 CLASS Animal
@@ -50,7 +95,7 @@ PRINT pet.Speak()  ' Output: Woof!
 ```
 
 ### HashMaps
-**NEW:** Native hashmap support for key-value storage!
+Native hashmap support for key-value storage.
 
 ```basic
 DIM users AS HASHMAP
@@ -60,7 +105,7 @@ PRINT users("alice")  ' Output: Alice Smith
 ```
 
 ### Lists with Pattern Matching
-**NEW:** Dynamic lists with type-safe pattern matching!
+Dynamic lists with type-safe pattern matching.
 
 ```basic
 DIM items AS LIST OF ANY
@@ -78,7 +123,7 @@ NEXT
 ```
 
 ### NEON SIMD Acceleration
-**NEW:** Automatic vectorization for ARM64 platforms!
+Automatic vectorization for ARM64 platforms.
 
 ```basic
 TYPE Vec4
@@ -94,23 +139,26 @@ result = v1 + v2  ' ← Compiles to NEON SIMD instructions!
 
 ---
 
-> **⚠️ Important Build Note:** This project has a single build location. Always build using:
+> **⚠️ Build Instructions (Zig Compiler):**
 > ```bash
-> cd qbe_basic_integrated && ./build_qbe_basic.sh
+> cd zig_compiler && zig build
 > ```
-> The `qbe_basic` executable at the project root is a **symlink** to `qbe_basic_integrated/qbe_basic`.
+> The compiler executable is `zig_compiler/zig-out/bin/fbc`.
 > See [BUILD.md](BUILD.md) for detailed build instructions.
 >
 > **📁 Project Structure:** See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for an overview of the repository organization.
 
 ## Overview
 
-FasterBASIC is a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, and SIMD acceleration. It compiles to native machine code through the QBE (Quick Backend) intermediate representation.
+FasterBASIC is a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, and SIMD acceleration. The compiler is written in **Zig** and compiles to native machine code through the **QBE** (Quick Backend) intermediate representation.
 
 ### Key Features
 
 - **Native Compilation** - Compiles to machine code, not interpreted
+- **Zig Compiler** - Written in Zig for memory safety and performance
 - **Object-Oriented** - Classes, inheritance, polymorphism, virtual dispatch
+- **Workers** - Lightweight concurrent threads with structured data passing
+- **MARSHALL/UNMARSHALL** - Type-safe binary serialisation with deep string copy
 - **Modern Collections** - Lists, HashMaps, pattern matching
 - **Exception Handling** - TRY/CATCH/FINALLY blocks
 - **SIMD Acceleration** - Automatic NEON vectorization on ARM64
@@ -132,9 +180,19 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 
 ## Project Status
 
-**Latest Update (February 2025)**: Full object-oriented programming with classes, inheritance, and polymorphism. HashMaps, Lists with pattern matching, NEON SIMD acceleration, and a comprehensive plugin system.
+**Latest Update (February 2026)**: Compiler fully rewritten in Zig. Workers with `MARSHALL`/`UNMARSHALL` for thread-safe data passing. Deep string marshalling via static offset tables. 312 end-to-end tests passing (100%). Full OOP, HashMaps, Lists, NEON SIMD, and plugin system.
 
 ### ✅ Core Language Features
+
+**Workers & Marshalling:**
+- ✅ WORKER threads via pthreads
+- ✅ MARSHALL / UNMARSHALL for UDTs and CLASS objects
+- ✅ Deep-copy of STRING fields via static offset tables (marshalling.zig)
+- ✅ Fast flat memcpy path for scalar-only types
+- ✅ Array marshalling (descriptor + data blob)
+- ✅ MARSHALL/UNMARSHALL usable anywhere (not restricted to workers)
+- ✅ Nested UDTs and inherited CLASS fields fully supported
+- ✅ Worker AWAIT / READY for synchronisation
 
 **Object-Oriented Programming:**
 - ✅ CLASS/END CLASS declarations
@@ -287,8 +345,8 @@ FasterBASIC is a modern BASIC compiler that combines the ease of traditional BAS
 ```bash
 git clone https://github.com/albanread/FasterBASIC.git
 cd FasterBASIC
-cd qbe_basic_integrated
-./build_qbe_basic.sh
+cd zig_compiler
+zig build
 ```
 
 ### Your First Program
@@ -303,32 +361,31 @@ END
 Compile and run:
 
 ```bash
-./qbe_basic -o hello hello.bas
+./zig_compiler/zig-out/bin/fbc hello.bas -o hello
 ./hello
 ```
 
 ### Using the Compiler
 
-The integrated `qbe_basic` compiler provides single-command compilation:
+The Zig-based `fbc` compiler provides single-command compilation:
 
 ```bash
 # Compile to executable
-./qbe_basic -o program input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -o program
+./program
 
 # Generate QBE IL only (for debugging)
-./qbe_basic -i -o output.qbe input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -i -o output.qbe
 
 # Generate assembly only
-./qbe_basic -c -o output.s input.bas
-
-# Target specific architecture
-./qbe_basic -t arm64_apple -o program input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -c -o output.s
 ```
 
 **Features:**
 - Single command compilation from BASIC → executable
+- Written in Zig with a hybrid Zig + C runtime
 - Optimized for macOS ARM64 (Apple Silicon)
-- Smart runtime caching (10x faster on subsequent builds)
+- Smart runtime caching (fast subsequent builds)
 - Self-contained with bundled runtime library
 
 ### Examples
@@ -392,12 +449,14 @@ END TRY
 ### Testing
 
 ```bash
-# Run the full test suite
-./scripts/run_tests_simple.sh
+# Run the full parallel test suite (312 tests)
+bash run_tests_parallel.sh
 
 # Run specific test categories
-./scripts/run_tests_simple.sh classes
-./scripts/run_tests_simple.sh lists
+bash run_e2e_tests.sh marshall
+bash run_e2e_tests.sh workers
+bash run_e2e_tests.sh classes
+bash run_e2e_tests.sh lists
 ```
 
 ### Developer Resources
@@ -419,11 +478,11 @@ The compiler uses the QBE backend which supports multiple architectures (AMD64, 
 
 ### Runtime Library
 
-The runtime library is compiled on-demand with smart caching:
-- First compilation: builds runtime to `.o` files (~500ms)
-- Subsequent compilations: uses cached objects (~43ms, 10x faster)
-- Automatic rebuild when source files are modified
-- Self-contained in `qbe_basic_integrated/runtime/` directory
+The runtime is built by Zig's build system alongside the compiler:
+- Zig runtime modules are compiled as static object files
+- C runtime modules are compiled via Zig's C compiler integration
+- QBE backend is also compiled and linked in
+- Self-contained in `zig_compiler/runtime/` directory
 
 ### Cross-Compilation
 
@@ -438,33 +497,36 @@ The QBE backend supports cross-compilation to other architectures, though primar
          │
          ▼
 ┌─────────────────┐
-│     Lexer       │  Tokenization
+│  Lexer (Zig)    │  Tokenization
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│     Parser      │  AST Construction
+│  Parser (Zig)   │  AST Construction
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│    Semantic     │  Type checking, symbol resolution
-│    Analyzer     │
+│   Semantic      │  Type checking, symbol resolution
+│  Analyzer (Zig) │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│   CFG Builder   │  Control Flow Graph construction
+│  CFG Builder    │  Control Flow Graph construction
+│     (Zig)       │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  QBE CodeGen    │  Generate QBE IL (SSA form)
+│     (Zig)       │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│   QBE Compiler  │  QBE → Assembly
+│  QBE Compiler   │  QBE → Assembly
+│      (C)        │
 └────────┬────────┘
          │
          ▼
@@ -474,79 +536,66 @@ The QBE backend supports cross-compilation to other architectures, though primar
          │
          ▼
 ┌─────────────────┐
-│     Linker      │  Link with runtime → Executable
+│     Linker      │  Link with Zig + C runtime → Executable
 └─────────────────┘
 ```
+
+### Runtime Libraries
+
+The runtime is a hybrid of **Zig** and **C** modules linked together by the Zig build system:
+
+| Module | Language | Purpose |
+|--------|----------|---------|
+| `string_utf32.zig` | Zig | UTF-32 string pool, `string_clone` |
+| `marshalling.zig` | Zig | MARSHALL/UNMARSHALL deep-copy with offset tables |
+| `class_runtime.zig` | Zig | Object allocation, vtable dispatch |
+| `samm_runtime.zig` | Zig | Scope-Aware Memory Manager |
+| `list_runtime.zig` | Zig | LIST OF type / LIST OF ANY |
+| `hashmap_runtime.zig` | Zig | HASHMAP operations |
+| `worker_runtime.c` | C | Worker threads (pthreads, futures) |
+| `runtime_basic.c` | C | Core PRINT, INPUT, math, exceptions |
+| `array_descriptor.c` | C | Array allocation, bounds checking |
 
 ## Building
 
 ### Prerequisites
 
-- C++17 compatible compiler (GCC 7+, Clang 5+, or MSVC 2017+)
-- Standard build tools (make, as, gcc/clang)
+- **Zig** (0.13+ recommended) — the compiler and runtime are built with Zig
+- Standard build tools (`as`, `cc`) — for assembling and linking
 - QBE is included in the repository (no separate installation needed)
 
-### Build the Integrated Compiler (Recommended)
+### Build the Zig Compiler (Recommended)
 
 ```bash
-cd qbe_basic_integrated
-./build_qbe_basic.sh
+cd zig_compiler
+zig build
 ```
 
-This builds `qbe_basic`, a single executable that combines:
-- FasterBASIC compiler (lexer, parser, semantic analyzer, CFG builder)
-- QBE code generator
-- QBE SSA optimizer and code emitter
-- Integrated runtime library with smart caching
+This builds `fbc`, a single executable that combines:
+- FasterBASIC compiler (lexer, parser, semantic analyzer, CFG builder) — all Zig
+- QBE code generator (Zig)
+- QBE SSA optimizer and code emitter (bundled C)
+- Hybrid Zig + C runtime libraries
 
-**What gets built:**
-- `qbe_basic` - The integrated compiler executable
-- `runtime/` - Runtime library source files (auto-compiled on first use)
+The compiler executable is at `zig_compiler/zig-out/bin/fbc`.
 
-### Using the Integrated Compiler
+### Using the Compiler
 
 ```bash
 # Compile BASIC directly to executable (one command!)
-./qbe_basic -o myprogram input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -o myprogram
 ./myprogram
 
 # Generate QBE IL only (for inspection/debugging)
-./qbe_basic -i -o output.qbe input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -i -o output.qbe
 
 # Generate assembly only (for manual linking)
-./qbe_basic -c -o output.s input.bas
+./zig_compiler/zig-out/bin/fbc input.bas -c -o output.s
 ```
 
-### Alternative: Build Separate Tools
+### Legacy C++ Compiler
 
-For compiler development or debugging the pipeline:
-
-```bash
-cd fsh
-./build_fbc_qbe.sh
-```
-
-This produces separate tools:
-- `fbc_qbe` - FasterBASIC to QBE IL compiler
-- `basic` - Wrapper script for running programs
-
-**Manual compilation pipeline:**
-```bash
-# Step 1: Compile BASIC to QBE IL
-./fbc_qbe program.bas  # produces a.out (QBE IL)
-
-# Step 2: Compile QBE IL to assembly
-qbe a.out > program.s
-
-# Step 3: Assemble and link
-as program.s -o program.o
-gcc program.o runtime_stubs.o -o program
-
-# Step 4: Run
-./program
-```
-
-**Note:** Most users should use the integrated `qbe_basic` compiler for simplicity and speed.
+The original C++ compiler remains in `qbe_basic_integrated/` for reference but is **no longer maintained**. All active development uses the Zig compiler.
 
 ## Example Programs
 
@@ -818,7 +867,22 @@ Generated QBE:
 
 ## Testing
 
-Comprehensive test suite covering:
+**312 end-to-end tests — 100% pass rate.** Comprehensive test suite covering:
+
+**Marshall/Unmarshall Tests** (`tests/marshall/`)
+- UDT scalar, string, and mixed field marshalling
+- CLASS scalar and string field marshalling
+- All-strings and empty-string edge cases
+- Multiple marshalls from the same object
+- MARSHALL/UNMARSHALL inside SUB
+- Nested UDTs (scalar and string at both levels)
+- CLASS inheritance (3-level, with and without strings)
+
+**Worker Tests** (`tests/workers/`)
+- Worker spawn and await
+- CLASS + STRING across worker boundary
+- String round-trip via worker (create in worker, return marshalled)
+- MARSHALL/UNMARSHALL without workers
 
 **Exception Handling Tests** (`tests/exceptions/`)
 - TRY/CATCH with specific error codes
@@ -844,26 +908,27 @@ Comprehensive test suite covering:
 - ON GOTO / ON GOSUB
 
 **Additional Tests**
+- Classes, inheritance, polymorphism
+- Lists and pattern matching
+- HashMaps
 - Recursive functions
-- Multi-function programs
 - String operations
 - Arithmetic and bitwise operations
 - Type conversions
+- NEON SIMD operations
 
 Run the full test suite:
 ```bash
-./test_basic_suite.sh
+# Parallel execution (recommended)
+bash run_tests_parallel.sh
 
-# Or run specific test categories
-./test_basic_suite.sh exceptions
-./test_basic_suite.sh arrays
-
-# Or run a single test
-cd fsh
-./basic --run ../tests/exceptions/test_try_catch_basic.bas
+# Filtered by category
+bash run_e2e_tests.sh marshall
+bash run_e2e_tests.sh workers
+bash run_e2e_tests.sh classes
 ```
 
-All tests pass on macOS ARM64. CI runs on every commit via GitHub Actions.
+All tests pass on macOS ARM64.
 
 ## Key Implementation Insights
 
@@ -892,33 +957,50 @@ For detailed technical information, see [docs/CRITICAL_IMPLEMENTATION_NOTES.md](
 
 ## Runtime
 
-Comprehensive C runtime (`fsh/FasterBASICT/runtime_c/`) provides:
+Hybrid **Zig + C** runtime (`zig_compiler/runtime/`) provides:
 
-**Core Functions:**
+**Core Functions (C):**
 - `basic_init()` / `basic_cleanup()` - initialization/cleanup
 - `basic_print_*()` - output functions for all types
 - `basic_input_*()` - input functions
 
-**Exception Handling:**
+**Exception Handling (C):**
 - `basic_exception_push()` / `basic_exception_pop()` - context management
 - `basic_throw()` - throw exception with error code and line number
 - `basic_err()` / `basic_erl()` - get current error info
 - `basic_rethrow()` - propagate unhandled exceptions
 
-**Array Operations:**
+**String Operations (Zig):**
+- UTF-32 string pool management (`string_utf32.zig`)
+- `string_clone` — deep-copy a string descriptor
+- String concatenation, slicing, comparison
+
+**Marshalling (Zig):**
+- `marshall_udt` / `unmarshall_udt` — flat memcpy for scalar-only types
+- `marshall_udt_deep` / `unmarshall_udt_deep` — deep-copy with string offset table
+- `marshall_array` / `unmarshall_array` — descriptor + element data blob
+
+**Object System (Zig):**
+- `class_runtime.zig` — object allocation, vtable dispatch, inheritance
+- `samm_runtime.zig` — Scope-Aware Memory Manager for automatic cleanup
+
+**Collections (Zig):**
+- `list_runtime.zig` — typed lists and LIST OF ANY
+- `hashmap_runtime.zig` — hash map operations
+
+**Workers (C):**
+- `worker_runtime.c` — thread spawn/await/ready via pthreads
+
+**Array Operations (C):**
 - `array_descriptor_erase()` - free array memory (with string cleanup)
 - Array allocation and bounds checking
-- String array element management
-
-**String Operations:**
-- UTF-32 string pool management
-- String concatenation, slicing, comparison
-- Memory management with reference counting
 
 ## Contributing
 
 FasterBASIC explores modern compiler techniques applied to a classic language:
+- **Zig compiler** with hybrid Zig + C runtime
 - Object-oriented programming in BASIC with virtual dispatch
+- Workers and deep marshalling for concurrency
 - SSA-based compilation via QBE backend
 - SIMD optimization for ARM64 NEON
 - Pattern matching and type dispatch for heterogeneous collections
@@ -929,7 +1011,7 @@ FasterBASIC explores modern compiler techniques applied to a classic language:
 1. Read [START_HERE.md](START_HERE.md) for project overview
 2. Check [docs/CRITICAL_IMPLEMENTATION_NOTES.md](docs/CRITICAL_IMPLEMENTATION_NOTES.md) for technical details
 3. Review the [Wiki](https://github.com/albanread/FasterBASIC/wiki) for language documentation
-4. Run `./scripts/run_tests_simple.sh` to ensure all tests pass
+4. Run `bash run_tests_parallel.sh` to ensure all 312 tests pass
 5. Add tests for new features
 
 **Areas for contribution:**

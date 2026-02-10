@@ -568,6 +568,11 @@ fn listCFiles(dir_path: []const u8, allocator: std.mem.Allocator) ![][]const u8 
         const name = entry.name;
         if (name.len < 3) continue;
         if (!std.mem.endsWith(u8, name, ".c")) continue;
+        // Skip test stub files — they provide weak no-op stubs for
+        // unit-testing runtime modules in isolation and must NOT be
+        // linked into production binaries (they shadow the real
+        // Zig runtime implementations, causing NULL-pointer crashes).
+        if (std.mem.startsWith(u8, name, "test_")) continue;
         const full = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, name });
         try results.append(allocator, full);
     }
@@ -1035,6 +1040,7 @@ pub fn main() !void {
                         "io_ops_format",
                         "io_ops",
                         "array_ops",
+                        "marshalling",
                     };
                     for (zig_runtime_libs) |lib_name| {
                         const zig_lib_path = std.fmt.allocPrint(allocator, "{s}/../lib/lib{s}.a", .{ exe_dir, lib_name }) catch {

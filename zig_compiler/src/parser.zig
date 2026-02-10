@@ -131,8 +131,8 @@ pub const Parser = struct {
         var i: usize = 0;
         while (i < self.tokens.len) : (i += 1) {
             const tok = self.tokens[i];
-            if (tok.tag == .kw_function or tok.tag == .kw_sub) {
-                const is_func = tok.tag == .kw_function;
+            if (tok.tag == .kw_function or tok.tag == .kw_sub or tok.tag == .kw_worker) {
+                const is_func = tok.tag == .kw_function or tok.tag == .kw_worker;
                 // Next token should be the name.
                 if (i + 1 < self.tokens.len and self.tokens[i + 1].tag == .identifier) {
                     const name = self.tokens[i + 1].lexeme;
@@ -281,6 +281,8 @@ pub const Parser = struct {
             .kw_option => self.parseOptionStatement(),
             .kw_function => self.parseFunctionStatement(),
             .kw_sub => self.parseSubStatement(),
+            .kw_worker => self.parseWorkerStatement(),
+            .kw_unmarshall => self.parseUnmarshallStatement(),
             .kw_call => self.parseCallStatement(),
             .kw_def => self.parseDefStatement(),
             .kw_class => self.parseClassDeclaration(),
@@ -2131,6 +2133,122 @@ pub const Parser = struct {
         } });
     }
 
+    /// Parse WORKER ... END WORKER declaration.
+    /// Workers are isolated functions for concurrency — similar to FUNCTION
+    /// but with semantic restrictions (no globals, no I/O, no shared state).
+    fn parseWorkerStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume WORKER
+
+        if (!self.check(.identifier)) {
+            try self.addError("Expected worker name after WORKER");
+            return error.ParseError;
+        }
+        const worker_name = self.current().lexeme;
+        _ = self.advance();
+
+        var return_suffix: ?Tag = null;
+        if (self.isTypeSuffix()) {
+            return_suffix = self.current().tag;
+            _ = self.advance();
+        }
+
+        // Parameters (no BYREF in workers — everything is copied).
+        const params = try self.parseParameterList();
+
+        // Optional AS return type.
+        var return_as_name: []const u8 = "";
+        var has_return_as_type = false;
+        if (self.check(.kw_as)) {
+            _ = self.advance();
+            has_return_as_type = true;
+            if (self.isTypeKeyword() or self.check(.identifier)) {
+                return_as_name = self.current().lexeme;
+                return_suffix = self.current().tag;
+                _ = self.advance();
+            }
+        }
+
+        if (self.check(.end_of_line)) _ = self.advance();
+
+        // Parse body until END WORKER.
+        var body: std.ArrayList(ast.StmtPtr) = .empty;
+        defer body.deinit(self.allocator);
+
+        while (!self.isAtEnd()) {
+            self.skipBlankLines();
+            if (self.check(.kw_endworker)) {
+                _ = self.advance();
+                break;
+            }
+            if (self.check(.number)) {
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_endworker) {
+                    _ = self.advance();
+                    _ = self.advance();
+                    break;
+                }
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_end) {
+                    if (self.pos + 2 < self.tokens.len and self.tokens[self.pos + 2].tag == .kw_worker) {
+                        _ = self.advance();
+                        _ = self.advance();
+                        _ = self.advance();
+                        break;
+                    }
+                }
+            }
+            if (self.check(.kw_end)) {
+                if (self.pos + 1 < self.tokens.len and self.tokens[self.pos + 1].tag == .kw_worker) {
+                    _ = self.advance();
+                    _ = self.advance();
+                    break;
+                }
+                break;
+            }
+
+            const line = try self.parseProgramLine();
+            for (line.statements) |s| {
+                try body.append(self.allocator, s);
+            }
+        }
+        if (self.check(.end_of_line)) _ = self.advance();
+
+        return self.builder.stmt(loc, .{ .worker = .{
+            .worker_name = worker_name,
+            .return_type_suffix = return_suffix,
+            .return_type_as_name = return_as_name,
+            .has_return_as_type = has_return_as_type,
+            .parameters = params.names,
+            .parameter_types = params.types,
+            .parameter_as_types = params.as_types,
+            .body = try self.allocator.dupe(ast.StmtPtr, body.items),
+        } });
+    }
+
+    /// Parse UNMARSHALL target, source
+    /// Reconstructs a marshalled blob into the target variable (array or UDT).
+    fn parseUnmarshallStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume UNMARSHALL
+
+        if (!self.check(.identifier)) {
+            try self.addError("Expected target variable name after UNMARSHALL");
+            return error.ParseError;
+        }
+        const target_name = self.current().lexeme;
+        _ = self.advance();
+
+        // Skip optional type suffix on target name
+        if (self.isTypeSuffix()) _ = self.advance();
+
+        _ = try self.consume(.comma, "Expected ',' between target and source in UNMARSHALL");
+        const source = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{ .unmarshall = .{
+            .target_variable = target_name,
+            .source_expr = source,
+        } });
+    }
+
     fn parseCallStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
 
@@ -3744,6 +3862,67 @@ pub const Parser = struct {
             .kw_nothing => {
                 _ = self.advance();
                 return self.builder.expr(loc, .{ .nothing = {} });
+            },
+            .kw_spawn => {
+                _ = self.advance(); // consume SPAWN
+                if (!self.check(.identifier)) {
+                    try self.addError("Expected worker name after SPAWN");
+                    return error.ParseError;
+                }
+                const wname = self.current().lexeme;
+                _ = self.advance();
+                // Skip optional type suffix on worker name
+                if (self.isTypeSuffix()) _ = self.advance();
+
+                var args: std.ArrayList(ast.ExprPtr) = .empty;
+                defer args.deinit(self.allocator);
+                if (self.check(.lparen)) {
+                    _ = self.advance();
+                    if (!self.check(.rparen)) {
+                        try args.append(self.allocator, try self.parseExpression());
+                        while (self.check(.comma)) {
+                            _ = self.advance();
+                            try args.append(self.allocator, try self.parseExpression());
+                        }
+                    }
+                    _ = try self.consume(.rparen, "Expected ')' after SPAWN arguments");
+                }
+                return self.builder.expr(loc, .{ .spawn = .{
+                    .worker_name = wname,
+                    .arguments = try self.allocator.dupe(ast.ExprPtr, args.items),
+                } });
+            },
+            .kw_await => {
+                _ = self.advance(); // consume AWAIT
+                const future_expr = try self.parsePrimary();
+                return self.builder.expr(loc, .{ .await_expr = .{
+                    .future = future_expr,
+                } });
+            },
+            .kw_ready => {
+                _ = self.advance(); // consume READY
+                _ = try self.consume(.lparen, "Expected '(' after READY");
+                const future_expr = try self.parseExpression();
+                _ = try self.consume(.rparen, "Expected ')' after READY argument");
+                return self.builder.expr(loc, .{ .ready = .{
+                    .future = future_expr,
+                } });
+            },
+            .kw_marshall => {
+                _ = self.advance(); // consume MARSHALL
+                _ = try self.consume(.lparen, "Expected '(' after MARSHALL");
+                if (!self.check(.identifier)) {
+                    try self.addError("Expected variable name in MARSHALL(variable)");
+                    return error.ParseError;
+                }
+                const var_name = self.current().lexeme;
+                _ = self.advance();
+                // Skip optional type suffix
+                if (self.isTypeSuffix()) _ = self.advance();
+                _ = try self.consume(.rparen, "Expected ')' after MARSHALL variable");
+                return self.builder.expr(loc, .{ .marshall = .{
+                    .variable_name = var_name,
+                } });
             },
             .kw_not => {
                 _ = self.advance();
