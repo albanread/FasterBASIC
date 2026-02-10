@@ -12,18 +12,18 @@ HEADER_LINES = 2
 FOOTER_LINES = 2
 TAB_SIZE = 4
 
-REM Special key codes (returned by KBGET for non-ASCII keys)
-KEY_UP = 256
-KEY_DOWN = 257
-KEY_LEFT = 258
-KEY_RIGHT = 259
-KEY_HOME = 260
-KEY_END = 261
-KEY_PGUP = 262
-KEY_PGDN = 263
-KEY_DELETE = 264
-KEY_INSERT = 265
-CONSTANT KEY_F1 = 290
+REM Special key codes (must match terminal_io.zig runtime values)
+KEY_UP = 328
+KEY_DOWN = 336
+KEY_LEFT = 331
+KEY_RIGHT = 333
+KEY_HOME = 327
+KEY_END = 335
+KEY_PGUP = 329
+KEY_PGDN = 337
+KEY_DELETE = 339
+KEY_INSERT = 338
+CONSTANT KEY_F1 = 315
 
 REM Control key codes
 CTRL_B = 2
@@ -86,9 +86,9 @@ SUB init_editor()
     initialized = 0
     status_msg$ = "Welcome to BASED! Press F1 for help"
 
-    REM Get terminal size (assume 80x24 if not detectable)
-    screen_width = 80
-    screen_height = 24
+    REM Detect terminal size dynamically (falls back to 80x24)
+    screen_width = SCREENWIDTH
+    screen_height = SCREENHEIGHT
     edit_height = screen_height - HEADER_LINES - FOOTER_LINES
 
     REM Check for command-line filename argument BEFORE entering raw mode
@@ -99,6 +99,10 @@ SUB init_editor()
 
     REM Enable raw keyboard mode AFTER file loading
     KBRAW 1
+
+    REM Switch to alternate screen buffer (like vim/nano) so quitting
+    REM restores the user's original terminal content
+    SCREEN_ALTERNATE
 
     REM Clear screen and hide cursor during initial draw
     CLS
@@ -112,8 +116,11 @@ SUB cleanup()
     REM Restore terminal state
     KBRAW 0
     CURSOR_SHOW
-    CLS
-    LOCATE 0, 0
+    COLOR 7, 0
+
+    REM Switch back to main screen buffer — restores original terminal content
+    SCREEN_MAIN
+
     PRINT "Thanks for using BASED!"
 END SUB
 
@@ -148,7 +155,7 @@ SUB draw_header()
     NEXT i
     line_text$ = line_text$ + right_text$
 
-    PRINT line_text$
+    WRSTR line_text$
 
     REM Draw separator line on row 1
     LOCATE 0, 1
@@ -157,7 +164,7 @@ SUB draw_header()
     FOR i = 0 TO screen_width - 1
         line_text$ = line_text$ + "="
     NEXT i
-    PRINT line_text$
+    WRSTR line_text$
 
     COLOR 7, 0
 END SUB
@@ -197,9 +204,9 @@ SUB draw_line(line_num AS INTEGER, screen_row AS INTEGER)
     REM Position and print the complete line
     LOCATE 0, screen_row
     COLOR 6, 0
-    PRINT LEFT$(line_text$, 7);
+    WRSTR LEFT$(line_text$, 7)
     COLOR 7, 0
-    PRINT MID$(line_text$, 8, screen_width - 7)
+    WRSTR MID$(line_text$, 8, screen_width - 7)
 END SUB
 
 SUB draw_editor()
@@ -229,7 +236,7 @@ SUB draw_status()
     FOR i = 0 TO screen_width - 1
         line_text$ = line_text$ + "="
     NEXT i
-    PRINT line_text$
+    WRSTR line_text$
 
     REM Draw help line on status_row + 1
     LOCATE 0, status_row + 1
@@ -240,7 +247,7 @@ SUB draw_status()
     FOR i = LEN(help$) TO screen_width - 1
         line_text$ = line_text$ + " "
     NEXT i
-    PRINT line_text$
+    WRSTR line_text$
 
     COLOR 7, 0
 END SUB
@@ -259,6 +266,7 @@ SUB show_status_message(msg$ AS STRING)
     DIM line_text$ AS STRING
     DIM i%
 
+    BEGINPAINT
     LOCATE 0, status_row
     COLOR 0, 7
 
@@ -266,17 +274,20 @@ SUB show_status_message(msg$ AS STRING)
     FOR i = LEN(line_text$) TO screen_width - 1
         line_text$ = line_text$ + " "
     NEXT i
-    PRINT line_text$
+    WRSTR line_text$
 
     COLOR 7, 0
+    ENDPAINT
 END SUB
 
 SUB refresh_screen()
-    REM Redraw entire screen
+    REM Redraw entire screen (batched for performance)
+    BEGINPAINT
     CALL draw_header()
     CALL draw_editor()
     CALL draw_status()
     CALL position_cursor()
+    ENDPAINT
 END SUB
 
 SUB position_cursor()
@@ -298,6 +309,7 @@ SUB position_cursor()
 
     CURSOR_SHOW
     LOCATE screen_col, screen_row
+    FLUSH
 END SUB
 
 REM ============================================================================
@@ -938,9 +950,11 @@ SUB main()
         IF needs_full_redraw = 1 THEN
             CALL refresh_screen()
         ELSEIF needs_content_redraw = 1 THEN
+            BEGINPAINT
             CALL draw_editor()
             CALL draw_status()
             CALL position_cursor()
+            ENDPAINT
         ELSE
             REM Just move cursor for navigation
             CALL position_cursor()

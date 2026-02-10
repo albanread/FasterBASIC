@@ -8,6 +8,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+// String runtime functions
+extern fn string_to_utf8(desc: ?*anyopaque) callconv(.c) [*:0]const u8;
+
 // Terminal state
 var terminal_initialized: bool = false;
 var raw_mode_enabled: bool = false;
@@ -16,6 +19,10 @@ var mouse_enabled: bool = false;
 // Current cursor position (1-based, like BASIC)
 var current_row: i32 = 1;
 var current_col: i32 = 1;
+
+// Paint mode: when true, suppress per-call fflush for batched output.
+// Use basic_begin_draw() / basic_end_draw() to bracket screen redraws.
+var paint_mode: bool = false;
 
 // Original terminal settings (for restoration)
 var original_termios: if (builtin.os.tag != .windows) std.posix.termios else void = undefined;
@@ -37,30 +44,32 @@ var mouse_buttons: i32 = 0; // Bit flags: 1=left, 2=middle, 4=right
 // C stdio functions for consistent output
 extern fn fflush(stream: ?*anyopaque) c_int;
 extern fn fprintf(stream: ?*anyopaque, format: [*:0]const u8, ...) c_int;
+extern fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: ?*anyopaque) usize;
 extern const __stdoutp: *anyopaque;
 
+// C atexit for registering cleanup on program exit
+extern fn atexit(func: *const fn () callconv(.c) void) c_int;
+
 fn writeStdout(bytes: []const u8) void {
-    // CRITICAL FIX: Use C stdio (fprintf) for ALL output!
+    // CRITICAL FIX: Use C stdio for ALL output!
     // This ensures PRINT (which uses printf) and terminal control sequences
     // (LOCATE, colors, etc.) all go through the SAME buffered stream.
     // Mixing printf() with posix.write() causes output reordering because
     // they are different streams (C stdio buffer vs raw file descriptor).
 
-    // We need a null-terminated string for fprintf
-    var buf: [512]u8 = undefined;
-    if (bytes.len >= buf.len) {
-        // Fallback: if too large, just write what fits
-        @memcpy(buf[0 .. buf.len - 1], bytes[0 .. buf.len - 1]);
-        buf[buf.len - 1] = 0;
-        _ = fprintf(__stdoutp, "%s", @as([*:0]const u8, @ptrCast(&buf)));
-    } else {
-        @memcpy(buf[0..bytes.len], bytes);
-        buf[bytes.len] = 0;
-        _ = fprintf(__stdoutp, "%s", @as([*:0]const u8, @ptrCast(&buf)));
-    }
+    if (bytes.len == 0) return;
 
-    // Flush immediately so ANSI sequences take effect
-    _ = fflush(__stdoutp);
+    // Use fwrite instead of fprintf — handles arbitrary lengths, no
+    // null-termination needed, and doesn't interpret format specifiers.
+    _ = fwrite(bytes.ptr, 1, bytes.len, __stdoutp);
+
+    // In normal mode, flush immediately so ANSI sequences take effect.
+    // In paint mode (between begin_draw/end_draw), skip the flush —
+    // output accumulates in C stdio's buffer and gets flushed once at
+    // the end of the redraw for dramatically fewer syscalls.
+    if (!paint_mode) {
+        _ = fflush(__stdoutp);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -79,6 +88,17 @@ pub export fn terminal_init() void {
         // Save original terminal settings on Unix
         original_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
     }
+
+    // Register atexit handler so terminal state is ALWAYS restored,
+    // even if the program crashes, calls exit(), or forgets to clean up.
+    // This prevents leaving the terminal in raw mode with cursor hidden.
+    _ = atexit(&atexit_cleanup);
+}
+
+/// atexit callback — restores terminal to a sane state on program exit.
+/// Safe to call multiple times (terminal_cleanup checks initialized flag).
+fn atexit_cleanup() callconv(.c) void {
+    terminal_cleanup();
 }
 
 /// Cleanup terminal I/O (called at program exit)
@@ -337,10 +357,82 @@ pub export fn basic_get_cursor_pos() i32 {
     return (@as(i32, current_row) << 16) | (@as(i32, current_col) & 0xFFFF);
 }
 
-/// Flush stdout buffer
+// ═══════════════════════════════════════════════════════════════════════════
+// Terminal Size Detection
+// ═══════════════════════════════════════════════════════════════════════════
+
+// C ioctl for terminal size query
+extern fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+// TIOCGWINSZ request code (platform-specific)
+const TIOCGWINSZ: c_ulong = if (builtin.os.tag == .macos)
+    0x40087468 // macOS
+else if (builtin.os.tag == .linux)
+    0x5413 // Linux
+else
+    0;
+
+// struct winsize layout: { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel }
+const Winsize = extern struct {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+};
+
+/// Get terminal width (columns). Returns 80 as fallback if detection fails.
+pub export fn terminal_get_width() i32 {
+    if (builtin.os.tag == .windows) return 80;
+    var ws: Winsize = .{ .ws_row = 0, .ws_col = 0, .ws_xpixel = 0, .ws_ypixel = 0 };
+    const ret = ioctl(@as(c_int, std.posix.STDOUT_FILENO), TIOCGWINSZ, &ws);
+    if (ret == 0 and ws.ws_col > 0) {
+        return @intCast(ws.ws_col);
+    }
+    return 80;
+}
+
+/// Get terminal height (rows). Returns 24 as fallback if detection fails.
+pub export fn terminal_get_height() i32 {
+    if (builtin.os.tag == .windows) return 24;
+    var ws: Winsize = .{ .ws_row = 0, .ws_col = 0, .ws_xpixel = 0, .ws_ypixel = 0 };
+    const ret = ioctl(@as(c_int, std.posix.STDOUT_FILENO), TIOCGWINSZ, &ws);
+    if (ret == 0 and ws.ws_row > 0) {
+        return @intCast(ws.ws_row);
+    }
+    return 24;
+}
+
+/// Flush stdout buffer — pushes all pending output to the terminal.
+/// Call this after a sequence of WRSTR/WRCH/LOCATE/COLOR calls to
+/// ensure everything is visible, especially in paint mode.
 pub export fn terminal_flush() void {
+    _ = fflush(__stdoutp);
+}
+
+/// Explicit flush callable from BASIC as FLUSH
+pub export fn basic_flush() void {
+    _ = fflush(__stdoutp);
+}
+
+/// Begin a batched paint operation.
+/// Suppresses per-call fflush so all output (LOCATE, COLOR, WRSTR, WRCH, etc.)
+/// accumulates in C stdio's buffer. Call basic_end_draw() when done to flush
+/// everything in one go. This dramatically reduces syscalls during screen redraws.
+pub export fn basic_begin_draw() void {
     if (!terminal_initialized) terminal_init();
-    // Flush is implicit with direct write syscalls
+    paint_mode = true;
+}
+
+/// End a batched paint operation and flush all accumulated output.
+pub export fn basic_end_draw() void {
+    paint_mode = false;
+    _ = fflush(__stdoutp);
+}
+
+/// Query whether paint mode is active (for use by other runtime modules).
+/// Returns 1 if in paint mode, 0 otherwise.
+pub export fn basic_is_paint_mode() i32 {
+    return if (paint_mode) 1 else 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -369,6 +461,36 @@ fn enableWindowsVTS() !void {
 
     if (kernel32.SetConsoleMode(stdout_handle, mode) == 0) {
         return error.SetConsoleModeFailed;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Character Output Functions
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Write a single character to stdout (like BBC BASIC WRCH or VDU)
+/// Does NOT add newline - writes character as-is
+pub export fn basic_wrch(ch: i32) void {
+    if (!terminal_initialized) terminal_init();
+
+    var buf: [1]u8 = undefined;
+    buf[0] = @intCast(@mod(ch, 256));
+    writeStdout(&buf);
+}
+
+/// Write a string to stdout without any newline.
+/// Uses string_to_utf8 to get the C string from the descriptor,
+/// then writes it directly via writeStdout. No printf, no newline.
+pub export fn basic_wrstr(desc: ?*anyopaque) void {
+    if (!terminal_initialized) terminal_init();
+    if (desc == null) return;
+
+    const utf8: [*:0]const u8 = string_to_utf8(desc);
+    // Walk the null-terminated string to find length
+    var len: usize = 0;
+    while (utf8[len] != 0) : (len += 1) {}
+    if (len > 0) {
+        writeStdout(utf8[0..len]);
     }
 }
 
@@ -684,9 +806,10 @@ fn setUnixRawMode(enable: bool) !void {
         raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
         raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
 
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, raw);
+        // Use TCSANOW for immediate effect (better for macOS than FLUSH)
+        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
     } else {
-        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, original_termios);
+        try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, original_termios);
     }
 }
 
@@ -695,7 +818,7 @@ fn setUnixEcho(enable: bool) !void {
 
     var current = try std.posix.tcgetattr(std.posix.STDIN_FILENO);
     current.lflag.ECHO = enable;
-    try std.posix.tcsetattr(std.posix.STDIN_FILENO, .FLUSH, current);
+    try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, current);
 }
 
 fn checkUnixKeyAvailable() i32 {
@@ -805,7 +928,16 @@ fn parseEscapeSequence() i32 {
     else
         std.posix.STDIN_FILENO;
 
-    // Read up to 16 bytes for the escape sequence
+    // On Unix, temporarily set non-blocking mode for escape sequence parsing
+    // This prevents hanging when ESC is pressed alone
+    if (builtin.os.tag != .windows) {
+        var temp_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return 0x1B;
+        temp_termios.cc[@intFromEnum(std.posix.V.MIN)] = 0;  // Don't block
+        temp_termios.cc[@intFromEnum(std.posix.V.TIME)] = 1; // 0.1 second timeout
+        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, temp_termios) catch {};
+    }
+
+    // Read up to 16 bytes for the escape sequence with timeout
     while (len < buf.len) {
         var ch: [1]u8 = undefined;
 
@@ -815,7 +947,7 @@ fn parseEscapeSequence() i32 {
             if (read == 0) break;
         } else {
             const n = std.posix.read(stdin, &ch) catch break;
-            if (n == 0) break;
+            if (n == 0) break; // Timeout or no more data - sequence is complete
         }
 
         buf[len] = ch[0];
@@ -827,30 +959,51 @@ fn parseEscapeSequence() i32 {
             if (buf[0] == '[') {
                 // Mouse event: ESC [ < Cb ; Cx ; Cy M/m
                 if (len >= 2 and buf[1] == '<') {
-                    return parseMouseEvent(buf[0..len]);
+                    const result = parseMouseEvent(buf[0..len]);
+                    // Restore blocking mode
+                    if (builtin.os.tag != .windows) {
+                        setUnixRawMode(true) catch {};
+                    }
+                    return result;
                 }
 
                 // Arrow keys and other sequences
                 if (len >= 2) {
                     const last = buf[len - 1];
 
-                    // Single char sequences
+                    // Single char sequences (complete when letter or ~ is found)
                     if (last >= 'A' and last <= 'Z' or last >= 'a' and last <= 'z' or last == '~') {
-                        return parseCSISequence(buf[0..len]);
+                        const result = parseCSISequence(buf[0..len]);
+                        // Restore blocking mode
+                        if (builtin.os.tag != .windows) {
+                            setUnixRawMode(true) catch {};
+                        }
+                        return result;
                     }
                 }
             }
             // SS3 sequences: ESC O ...
             else if (buf[0] == 'O' and len >= 2) {
-                return parseSS3Sequence(buf[0..len]);
+                const result = parseSS3Sequence(buf[0..len]);
+                // Restore blocking mode
+                if (builtin.os.tag != .windows) {
+                    setUnixRawMode(true) catch {};
+                }
+                return result;
             }
         }
 
-        // Timeout to avoid blocking forever
-        if (len >= 3) break;
+        // Safety limit to avoid reading too much
+        if (len >= 8) break;
     }
 
-    // Return ESC if we couldn't parse
+    // Restore blocking mode before returning
+    if (builtin.os.tag != .windows) {
+        setUnixRawMode(true) catch {};
+    }
+
+    // If we only got ESC or couldn't parse, return ESC
+    // This happens when ESC is pressed alone (len == 0 after timeout)
     return 0x1B;
 }
 

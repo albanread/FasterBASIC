@@ -35,6 +35,16 @@ extern fn fabs(x: f64) f64;
 // stdout
 extern const __stdoutp: *anyopaque;
 
+// Paint mode query from terminal_io.zig — when paint mode is active,
+// we skip per-call fflush to allow output batching (BEGINPAINT/ENDPAINT).
+extern fn basic_is_paint_mode() i32;
+
+fn flushIfNeeded() void {
+    if (basic_is_paint_mode() == 0) {
+        _ = fflush(__stdoutp);
+    }
+}
+
 // =========================================================================
 // StringDescriptor — opaque to this module, accessed via string_to_utf8
 // =========================================================================
@@ -385,5 +395,5 @@ export fn basic_print_using(format: ?*StringDescriptor, count: i64, args: ?[*]?*
         }
     }
 
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }

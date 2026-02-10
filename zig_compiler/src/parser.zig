@@ -249,6 +249,8 @@ pub const Parser = struct {
 
         return switch (tok.tag) {
             .kw_print => self.parsePrintStatement(),
+            .kw_wrch => self.parseWrchStatement(),
+            .kw_wrstr => self.parseWrstrStatement(),
             .kw_console => self.parseConsoleStatement(),
             .kw_input => self.parseInputStatement(),
             .kw_line => self.parseInputStatement(),
@@ -319,7 +321,10 @@ pub const Parser = struct {
             .kw_screen_main => self.parseSimpleStatement(.kw_screen_main),
             .kw_kbraw => self.parseKbRawStatement(),
             .kw_kbecho => self.parseKbEchoStatement(),
-            .kw_kbflush, .kw_kbclear => self.parseSimpleStatement(.kw_kbflush),
+            .kw_kbflush, .kw_kbclear => self.parseKbFlushStatement(),
+            .kw_flush => self.parseSimpleStatement(.kw_flush),
+            .kw_beginpaint => self.parseSimpleStatement(.kw_beginpaint),
+            .kw_endpaint => self.parseSimpleStatement(.kw_endpaint),
             .kw_wait => self.parseWaitStatement(),
             .kw_wait_ms => self.parseWaitMsStatement(),
             .kw_sleep => self.parseSleepStatement(),
@@ -362,6 +367,31 @@ pub const Parser = struct {
     }
 
     // ── Individual statement parsers ─────────────────────────────────────
+
+    fn parseWrchStatement(self: *Parser) ExprError!ast.StmtPtr {
+        // WRCH expr - write a single character (0-255)
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume 'WRCH'
+
+        const expr = try self.parseExpression();
+
+        const stmt = try self.allocator.create(ast.Statement);
+        stmt.* = .{
+            .loc = loc,
+            .data = .{ .wrch = .{ .expr = expr } },
+        };
+        return stmt;
+    }
+
+    fn parseWrstrStatement(self: *Parser) ExprError!ast.StmtPtr {
+        // WRSTR expr - write a string without newline
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume 'WRSTR'
+
+        const expr = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{ .wrstr = .{ .expr = expr } });
+    }
 
     fn parsePrintStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
@@ -2924,9 +2954,18 @@ pub const Parser = struct {
             .kw_normal => .{ .normal = {} },
             .kw_screen_alternate => .{ .screen_alternate = {} },
             .kw_screen_main => .{ .screen_main = {} },
+            .kw_flush => .{ .flush = {} },
+            .kw_beginpaint => .{ .begin_paint = {} },
+            .kw_endpaint => .{ .end_paint = {} },
             else => unreachable,
         };
         return self.builder.stmt(loc, stmt_data);
+    }
+
+    fn parseKbFlushStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume KBFLUSH / KBCLEAR
+        return self.builder.stmt(loc, .{ .kbflush = {} });
     }
 
     fn parseKbRawStatement(self: *Parser) ExprError!ast.StmtPtr {
@@ -4105,6 +4144,20 @@ pub const Parser = struct {
                 _ = self.advance();
                 return self.builder.expr(loc, .{ .function_call = .{
                     .name = "KBCOUNT",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_screenwidth => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "SCREENWIDTH",
+                    .arguments = &.{},
+                } });
+            },
+            .kw_screenheight => {
+                _ = self.advance();
+                return self.builder.expr(loc, .{ .function_call = .{
+                    .name = "SCREENHEIGHT",
                     .arguments = &.{},
                 } });
             },

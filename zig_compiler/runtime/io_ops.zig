@@ -67,6 +67,16 @@ const SEEK_END: c_int = 2;
 extern const __stdoutp: *anyopaque;
 extern const __stdinp: *anyopaque;
 
+// Paint mode query from terminal_io.zig — when paint mode is active,
+// we skip per-call fflush to allow output batching (BEGINPAINT/ENDPAINT).
+extern fn basic_is_paint_mode() i32;
+
+fn flushIfNeeded() void {
+    if (basic_is_paint_mode() == 0) {
+        _ = fflush(__stdoutp);
+    }
+}
+
 // POSIX (for INKEY$)
 extern fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;
@@ -103,69 +113,69 @@ pub const BasicFile = extern struct {
 
 export fn basic_print_int(value: i64) callconv(.c) void {
     _ = printf("%lld", value);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_long(value: i64) callconv(.c) void {
     _ = printf("%lld", value);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_float(value: f32) callconv(.c) void {
     _ = printf("%g", @as(f64, value));
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_double(value: f64) callconv(.c) void {
     _ = printf("%g", value);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_string(str: ?*BasicString) callconv(.c) void {
     const s = str orelse return;
     const data = s.data orelse return;
     _ = printf("%s", data);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_cstr(str: ?[*:0]const u8) callconv(.c) void {
     const s = str orelse return;
     _ = printf("%s", s);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_string_desc(desc: ?*anyopaque) callconv(.c) void {
     const d = desc orelse return;
     const utf8 = string_to_utf8(d);
     _ = printf("%s", utf8);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_hex(value: i64) callconv(.c) void {
     _ = printf("0x%llx", value);
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_pointer(ptr: ?*anyopaque) callconv(.c) void {
     _ = printf("0x%llx", @intFromPtr(ptr));
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn debug_print_hashmap(map: ?*anyopaque) callconv(.c) void {
     _ = printf("[HASHMAP@");
     basic_print_pointer(map);
     _ = printf("]");
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_newline() callconv(.c) void {
     _ = printf("\n");
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_tab() callconv(.c) void {
     _ = printf("\t");
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 export fn basic_print_at(row: i32, col: i32, str: ?*BasicString) callconv(.c) void {
@@ -175,7 +185,7 @@ export fn basic_print_at(row: i32, col: i32, str: ?*BasicString) callconv(.c) vo
             _ = printf("%s", data);
         }
     }
-    _ = fflush(__stdoutp);
+    flushIfNeeded();
 }
 
 // =========================================================================

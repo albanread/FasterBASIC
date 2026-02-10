@@ -198,6 +198,8 @@ pub const Statement = struct {
 pub const StmtData = union(enum) {
     // ── Output / Input ──────────────────────────────────────────────────
     print: PrintStmt,
+    wrch: WrchStmt,
+    wrstr: WrstrStmt,
     console: ConsoleStmt,
     input: InputStmt,
     input_at: InputAtStmt,
@@ -304,6 +306,9 @@ pub const StmtData = union(enum) {
     normal: void,
     screen_alternate: void,
     screen_main: void,
+    flush: void,
+    begin_paint: void,
+    end_paint: void,
 
     // ── Keyboard input ──────────────────────────────────────────────────
     kbraw: KbRawStmt,
@@ -374,6 +379,14 @@ pub const PrintStmt = struct {
     has_using: bool = false,
     format_expr: ?ExprPtr = null,
     using_values: []ExprPtr = &.{},
+};
+
+pub const WrchStmt = struct {
+    expr: ExprPtr,
+};
+
+pub const WrstrStmt = struct {
+    expr: ExprPtr,
 };
 
 pub const ConsoleStmt = struct {
