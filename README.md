@@ -1,15 +1,24 @@
 # FasterBASIC
 
+A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon).
+
+True to historical BASIC with some modern extensions.
+
+Aims to be a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, SIMD acceleration and multiple CPUs.
+
 > **The compiler is now written in Zig.** The Zig-based compiler (`zig_compiler/`) is the primary and actively maintained implementation, replacing the earlier C++ prototype. All new features — Workers, MARSHALL/UNMARSHALL, deep string marshalling — are Zig-only.
 
 [![Build Status](https://github.com/albanread/FasterBASIC/actions/workflows/build.yml/badge.svg)](https://github.com/albanread/FasterBASIC/actions)
 
-A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon). The compiler is written in **Zig** with a hybrid **Zig + C** runtime, and targets the **QBE** SSA backend.
+ The compiler is written in **Zig** with a hybrid **Zig + C** runtime, and targets the **QBE** SSA backend.
 
 ## 🎉 Latest Features (February 2026)
 
 ### Workers & Concurrency
-**NEW:** Lightweight worker threads with structured data passing!
+
+Most computers have many CPUs now.
+
+**NEW:**  safe worker threads with structured data passing!
 
 ```basic
 TYPE Task
@@ -54,6 +63,9 @@ PRINT q.Name                 ' Output: Alice
 - Can be used anywhere — not restricted to workers
 
 ### Array Expressions & SIMD Math
+
+Most computers have 'vector accelerators' now.
+
 Complete array expression engine with NEON SIMD acceleration, reductions, and fused multiply-add.
 
 ```basic
@@ -71,7 +83,10 @@ B() = ABS(A())                ' element-wise absolute value
 Supports all numeric types including `BYTE` (16 elements/register) and `SHORT` (8 elements/register). See [Array Expressions](articles/array-expressions.md) for full documentation.
 
 ### Object-Oriented Programming
-Full CLASS system with inheritance, polymorphism, and virtual dispatch.
+
+You can organize larger progams into simple classes.
+
+Simple CLASS system with inheritance, polymorphism, and virtual dispatch.
 
 ```basic
 CLASS Animal
@@ -95,7 +110,10 @@ PRINT pet.Speak()  ' Output: Woof!
 ```
 
 ### HashMaps
+
 Native hashmap support for key-value storage.
+
+Handy addition to now many languages.
 
 ```basic
 DIM users AS HASHMAP
@@ -105,6 +123,9 @@ PRINT users("alice")  ' Output: Alice Smith
 ```
 
 ### Lists with Pattern Matching
+
+Most computers have a lot of memory now, lists can help organize it.
+
 Dynamic lists with type-safe pattern matching.
 
 ```basic
@@ -123,6 +144,7 @@ NEXT
 ```
 
 ### NEON SIMD Acceleration
+
 Automatic vectorization for ARM64 platforms.
 
 ```basic
