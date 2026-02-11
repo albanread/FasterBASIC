@@ -37,6 +37,9 @@ var mouse_x: i32 = 0;
 var mouse_y: i32 = 0;
 var mouse_buttons: i32 = 0; // Bit flags: 1=left, 2=middle, 4=right
 
+// Signal state — set by signal handler, checked by kbget
+var signal_received: bool = false;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Low-level write functions
 // ═══════════════════════════════════════════════════════════════════════════
@@ -49,6 +52,14 @@ extern const __stdoutp: *anyopaque;
 
 // C atexit for registering cleanup on program exit
 extern fn atexit(func: *const fn () callconv(.c) void) c_int;
+
+// C signal handling for SIGWINCH (terminal resize)
+const SIGWINCH: c_int = 28; // macOS and Linux
+extern fn signal(sig: c_int, handler: *const fn (c_int) callconv(.c) void) ?*const fn (c_int) callconv(.c) void;
+
+fn sigwinchHandler(_: c_int) callconv(.c) void {
+    signal_received = true;
+}
 
 fn writeStdout(bytes: []const u8) void {
     // CRITICAL FIX: Use C stdio for ALL output!
@@ -87,6 +98,9 @@ pub export fn terminal_init() void {
     } else {
         // Save original terminal settings on Unix
         original_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return;
+
+        // Install SIGWINCH handler for terminal resize detection
+        _ = signal(SIGWINCH, &sigwinchHandler);
     }
 
     // Register atexit handler so terminal state is ALWAYS restored,
@@ -510,6 +524,7 @@ pub export fn basic_kbraw(enable: i32) void {
     }
 
     raw_mode_enabled = (enable != 0);
+    signal_received = false;
 }
 
 /// Enable/disable keyboard echo
@@ -525,8 +540,14 @@ pub export fn basic_kbecho(enable: i32) void {
 
 /// Check if a key is available (non-blocking)
 /// Returns 1 if key available, 0 otherwise
+/// Returns -1 if a signal (e.g. SIGWINCH resize) was received
 pub export fn basic_kbhit() i32 {
     if (!terminal_initialized) terminal_init();
+
+    // Check for signal first (e.g. SIGWINCH terminal resize)
+    if (signal_received) {
+        return -1;
+    }
 
     // Check if we have buffered input
     if (input_buffer_pos < input_buffer_len) {
@@ -541,8 +562,20 @@ pub export fn basic_kbhit() i32 {
     }
 }
 
+/// Clear the signal flag (call after handling resize etc.)
+pub export fn basic_signal_clear() void {
+    signal_received = false;
+}
+
+/// Check if a signal was received (e.g. SIGWINCH)
+pub export fn basic_signal_check() i32 {
+    return if (signal_received) 1 else 0;
+}
+
 /// Get a single character from keyboard (blocking)
 /// Returns ASCII code, or special key codes for function keys, arrows, etc.
+/// Returns 0 if interrupted by a signal (e.g. SIGWINCH for terminal resize)
+/// Returns -1 on error
 pub export fn basic_kbget() i32 {
     if (!terminal_initialized) terminal_init();
 
@@ -557,20 +590,43 @@ pub export fn basic_kbget() i32 {
         return @intCast(ch);
     }
 
-    // Read from stdin
+    // Read from stdin — with VMIN=0, VTIME=1 this will return after
+    // 0.1 seconds if no data is available, allowing signal handling
     var buf: [1]u8 = undefined;
-    const stdin = if (builtin.os.tag == .windows)
-        std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return -1
-    else
-        std.posix.STDIN_FILENO;
 
     if (builtin.os.tag == .windows) {
-        var read: std.os.windows.DWORD = 0;
-        if (std.os.windows.kernel32.ReadFile(stdin, &buf, 1, &read, null) == 0) return -1;
-        if (read == 0) return -1;
+        const stdin = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return -1;
+        var bytes_read: std.os.windows.DWORD = 0;
+        if (std.os.windows.kernel32.ReadFile(stdin, &buf, 1, &bytes_read, null) == 0) return -1;
+        if (bytes_read == 0) return -1;
     } else {
-        const n = std.posix.read(stdin, &buf) catch return -1;
-        if (n == 0) return -1;
+        // Loop until we get a character, handling signals (EINTR) and
+        // VTIME timeouts (read returns 0) gracefully
+        while (true) {
+            // Check for pending signal before blocking
+            if (signal_received) {
+                return 0; // Signal received — caller should handle (e.g. resize)
+            }
+
+            const n = std.posix.read(std.posix.STDIN_FILENO, &buf) catch |err| {
+                if (err == std.posix.ReadError.WouldBlock) {
+                    // VTIME timeout — no data yet, loop and check signals
+                    continue;
+                }
+                // For EINTR (signal during read), Zig's posix.read retries
+                // automatically, but if we get here it's a real error
+                return -1;
+            };
+            if (n == 0) {
+                // VTIME timeout expired with no data — check for signals
+                // and loop back to try again (this is normal with VMIN=0, VTIME=1)
+                if (signal_received) {
+                    return 0;
+                }
+                continue;
+            }
+            break; // Got a character
+        }
     }
 
     const ch = buf[0];
@@ -801,10 +857,18 @@ fn setUnixRawMode(enable: bool) !void {
         // Set character size to 8 bits
         raw.cflag.CSIZE = .CS8;
 
-        // Minimum characters for non-canonical read
-        // VMIN=1, VTIME=0 makes read() block until at least 1 character is available
-        raw.cc[@intFromEnum(std.posix.V.MIN)] = 1;
-        raw.cc[@intFromEnum(std.posix.V.TIME)] = 0;
+        // CRITICAL FIX: Match the working C++ terminal_io settings.
+        // VMIN=0, VTIME=1 means:
+        //   - read() returns immediately if data is available
+        //   - read() returns 0 after 0.1 seconds if no data (timeout)
+        //   - read() NEVER blocks forever
+        // This enables responsive signal handling (SIGWINCH for resize),
+        // proper escape sequence parsing, and event-loop-style architecture.
+        //
+        // The old VMIN=1, VTIME=0 caused read() to block forever, making
+        // it impossible to handle signals, timeouts, or build an editor.
+        raw.cc[@intFromEnum(std.posix.V.MIN)] = 0;
+        raw.cc[@intFromEnum(std.posix.V.TIME)] = 1; // 0.1 second timeout
 
         // Use TCSANOW for immediate effect (better for macOS than FLUSH)
         try std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, raw);
@@ -823,6 +887,9 @@ fn setUnixEcho(enable: bool) !void {
 
 fn checkUnixKeyAvailable() i32 {
     if (builtin.os.tag == .windows) return 0;
+
+    // Check for pending signal (e.g. SIGWINCH)
+    if (signal_received) return -1;
 
     var fds: [1]std.posix.pollfd = [_]std.posix.pollfd{
         .{
@@ -919,35 +986,55 @@ const KEY_F11: i32 = 256 + 133;
 const KEY_F12: i32 = 256 + 134;
 
 fn parseEscapeSequence() i32 {
-    // Read next character after ESC
+    // Parse escape sequence after ESC (0x1B) has been read.
+    //
+    // ARCHITECTURE: Use poll() to check for data availability BEFORE each
+    // read, just like the working C++ shell does with kbhit()+select().
+    // This is instant (no 100ms delay for standalone ESC) and doesn't
+    // require changing terminal settings back and forth.
+    //
+    // With VMIN=0, VTIME=1 already set in raw mode, reads will also
+    // time out naturally, but poll() gives us a faster path.
+
     var buf: [16]u8 = undefined;
     var len: usize = 0;
 
-    const stdin = if (builtin.os.tag == .windows)
-        std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return 0x1B
-    else
-        std.posix.STDIN_FILENO;
-
-    // On Unix, temporarily set non-blocking mode for escape sequence parsing
-    // This prevents hanging when ESC is pressed alone
-    if (builtin.os.tag != .windows) {
-        var temp_termios = std.posix.tcgetattr(std.posix.STDIN_FILENO) catch return 0x1B;
-        temp_termios.cc[@intFromEnum(std.posix.V.MIN)] = 0;  // Don't block
-        temp_termios.cc[@intFromEnum(std.posix.V.TIME)] = 1; // 0.1 second timeout
-        std.posix.tcsetattr(std.posix.STDIN_FILENO, .NOW, temp_termios) catch {};
-    }
-
-    // Read up to 16 bytes for the escape sequence with timeout
+    // Read up to 16 bytes for the escape sequence
     while (len < buf.len) {
         var ch: [1]u8 = undefined;
 
         if (builtin.os.tag == .windows) {
-            var read: std.os.windows.DWORD = 0;
-            if (std.os.windows.kernel32.ReadFile(stdin, &ch, 1, &read, null) == 0) break;
-            if (read == 0) break;
+            const stdin = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return 0x1B;
+            var bytes_read: std.os.windows.DWORD = 0;
+            if (std.os.windows.kernel32.ReadFile(stdin, &ch, 1, &bytes_read, null) == 0) break;
+            if (bytes_read == 0) break;
         } else {
-            const n = std.posix.read(stdin, &ch) catch break;
-            if (n == 0) break; // Timeout or no more data - sequence is complete
+            // Use poll() with a short timeout to check if more data is available.
+            // This mirrors the C++ kbhit() pattern: instant return if no data,
+            // no need to temporarily change VMIN/VTIME terminal settings.
+            //
+            // First byte after ESC: use a slightly longer timeout (50ms) to
+            // allow escape sequences from arrow keys to arrive.
+            // Subsequent bytes: use a very short timeout (10ms) since they
+            // should arrive almost immediately if they're coming.
+            const timeout_ms: i32 = if (len == 0) 50 else 10;
+            var fds: [1]std.posix.pollfd = [_]std.posix.pollfd{
+                .{
+                    .fd = std.posix.STDIN_FILENO,
+                    .events = std.posix.POLL.IN,
+                    .revents = 0,
+                },
+            };
+
+            const poll_result = std.posix.poll(&fds, timeout_ms) catch break;
+            if (poll_result == 0 or (fds[0].revents & std.posix.POLL.IN) == 0) {
+                // Timeout — no more data coming, sequence is complete
+                break;
+            }
+
+            // Data is available, read it (should not block)
+            const n = std.posix.read(std.posix.STDIN_FILENO, &ch) catch break;
+            if (n == 0) break;
         }
 
         buf[len] = ch[0];
@@ -959,12 +1046,7 @@ fn parseEscapeSequence() i32 {
             if (buf[0] == '[') {
                 // Mouse event: ESC [ < Cb ; Cx ; Cy M/m
                 if (len >= 2 and buf[1] == '<') {
-                    const result = parseMouseEvent(buf[0..len]);
-                    // Restore blocking mode
-                    if (builtin.os.tag != .windows) {
-                        setUnixRawMode(true) catch {};
-                    }
-                    return result;
+                    return parseMouseEvent(buf[0..len]);
                 }
 
                 // Arrow keys and other sequences
@@ -972,24 +1054,14 @@ fn parseEscapeSequence() i32 {
                     const last = buf[len - 1];
 
                     // Single char sequences (complete when letter or ~ is found)
-                    if (last >= 'A' and last <= 'Z' or last >= 'a' and last <= 'z' or last == '~') {
-                        const result = parseCSISequence(buf[0..len]);
-                        // Restore blocking mode
-                        if (builtin.os.tag != .windows) {
-                            setUnixRawMode(true) catch {};
-                        }
-                        return result;
+                    if ((last >= 'A' and last <= 'Z') or (last >= 'a' and last <= 'z') or last == '~') {
+                        return parseCSISequence(buf[0..len]);
                     }
                 }
             }
             // SS3 sequences: ESC O ...
             else if (buf[0] == 'O' and len >= 2) {
-                const result = parseSS3Sequence(buf[0..len]);
-                // Restore blocking mode
-                if (builtin.os.tag != .windows) {
-                    setUnixRawMode(true) catch {};
-                }
-                return result;
+                return parseSS3Sequence(buf[0..len]);
             }
         }
 
@@ -997,13 +1069,8 @@ fn parseEscapeSequence() i32 {
         if (len >= 8) break;
     }
 
-    // Restore blocking mode before returning
-    if (builtin.os.tag != .windows) {
-        setUnixRawMode(true) catch {};
-    }
-
     // If we only got ESC or couldn't parse, return ESC
-    // This happens when ESC is pressed alone (len == 0 after timeout)
+    // This happens when ESC is pressed alone (poll times out with len == 0)
     return 0x1B;
 }
 
@@ -1143,6 +1210,51 @@ fn parseMouseEvent(seq: []const u8) i32 {
 // ═══════════════════════════════════════════════════════════════════════════
 // Testing
 // ═══════════════════════════════════════════════════════════════════════════
+
+/// Wait for a key with timeout (in milliseconds).
+/// Returns the key code, 0 if timeout expired, or -1 on error.
+/// This is useful for editor main loops that need to poll for keys
+/// while also handling signals and redraws.
+pub export fn basic_kbwait(timeout_ms: i32) i32 {
+    if (!terminal_initialized) terminal_init();
+
+    // Check buffered input first
+    if (input_buffer_pos < input_buffer_len) {
+        return basic_kbget();
+    }
+
+    // Check for pending signal
+    if (signal_received) return 0;
+
+    if (builtin.os.tag != .windows) {
+        var fds: [1]std.posix.pollfd = [_]std.posix.pollfd{
+            .{
+                .fd = std.posix.STDIN_FILENO,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+
+        const poll_result = std.posix.poll(&fds, timeout_ms) catch return -1;
+        if (poll_result == 0) {
+            // Timeout — check for signal
+            if (signal_received) return 0;
+            return 0; // No key available
+        }
+
+        if ((fds[0].revents & std.posix.POLL.IN) != 0) {
+            return basic_kbget();
+        }
+
+        return 0;
+    } else {
+        // Windows: just use basic_kbget for now
+        if (basic_kbhit() > 0) {
+            return basic_kbget();
+        }
+        return 0;
+    }
+}
 
 test "terminal_io basic functions" {
     // These are export functions that will be called from compiled BASIC programs

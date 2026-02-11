@@ -4,7 +4,7 @@ This article provides a high-level overview of the experimental FasterBASIC comp
 
 ## Architectural Overview
 
-The Zig implementation follows a classic multi-pass compiler architecture, but with a significant structural difference in code generation: it uses an explicit Control Flow Graph (CFG) rather than direct AST walking.
+The Zig implementation follows a classic multi-pass compiler architecture.
 
 ### Compilation Pipeline
 
