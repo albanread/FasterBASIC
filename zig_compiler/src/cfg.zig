@@ -268,12 +268,17 @@ pub const CFG = struct {
     analyzed: bool = false,
     /// Number of unreachable blocks found.
     unreachable_count: u32 = 0,
+    /// Block indices that are GOSUB return points (for sparse dispatch).
+    /// Populated by processGosubStatement; used by codegen to emit the
+    /// RETURN dispatch chain.
+    gosub_return_blocks: std.AutoHashMap(u32, void),
 
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) CFG {
         return .{
             .allocator = allocator,
+            .gosub_return_blocks = std.AutoHashMap(u32, void).init(allocator),
         };
     }
 
@@ -288,6 +293,7 @@ pub const CFG = struct {
         }
         self.loops.deinit(self.allocator);
         self.rpo_order.deinit(self.allocator);
+        self.gosub_return_blocks.deinit();
     }
 
     /// Create a new basic block and return its index.
@@ -1039,6 +1045,7 @@ pub const CFGBuilder = struct {
             .do_stmt => |ds| try self.processDoStatement(stmt, &ds),
             .repeat_stmt => |rs| try self.processRepeatStatement(stmt, &rs),
             .case_stmt => |cs| try self.processCaseStatement(stmt, &cs),
+            .match_type => |mt| try self.processMatchTypeStatement(stmt, &mt),
             .try_catch => |tc| try self.processTryCatchStatement(stmt, &tc),
 
             // ── Unstructured control flow ───────────────────────────────
@@ -1476,6 +1483,57 @@ pub const CFGBuilder = struct {
         self.current_block = merge_block;
     }
 
+    // ── MATCH TYPE ──────────────────────────────────────────────────────
+
+    fn processMatchTypeStatement(self: *CFGBuilder, stmt: *const ast.Statement, mt: *const ast.MatchTypeStmt) !void {
+        // The MATCH TYPE statement goes into the current block (it holds
+        // the match expression for later codegen to evaluate).
+        try self.cfg.getBlock(self.current_block).addStatement(self.allocator, stmt);
+        const match_entry = self.current_block;
+        const merge_block = try self.cfg.newBlock(.merge);
+
+        var prev_test_block = match_entry;
+
+        for (mt.case_arms) |arm| {
+            // Test block: compare atom type tag
+            const test_block = try self.cfg.newBlock(.case_test);
+            try self.cfg.addEdge(prev_test_block, test_block, if (prev_test_block == match_entry) .fallthrough else .case_next);
+
+            // Body block: statements for this CASE arm
+            const body_block = try self.cfg.newBlock(.case_body);
+            try self.cfg.addEdge(test_block, body_block, .case_match);
+
+            self.current_block = body_block;
+            for (arm.body) |s| {
+                try self.processStatement(s);
+            }
+            if (!self.cfg.getBlock(self.current_block).hasTerminator()) {
+                try self.cfg.addEdge(self.current_block, merge_block, .fallthrough);
+            }
+
+            prev_test_block = test_block;
+        }
+
+        // CASE ELSE
+        if (mt.case_else_body.len > 0) {
+            const otherwise_block = try self.cfg.newBlock(.case_otherwise);
+            try self.cfg.addEdge(prev_test_block, otherwise_block, .case_next);
+
+            self.current_block = otherwise_block;
+            for (mt.case_else_body) |s| {
+                try self.processStatement(s);
+            }
+            if (!self.cfg.getBlock(self.current_block).hasTerminator()) {
+                try self.cfg.addEdge(self.current_block, merge_block, .fallthrough);
+            }
+        } else {
+            // No CASE ELSE: fall through from last test to merge.
+            try self.cfg.addEdge(prev_test_block, merge_block, .case_next);
+        }
+
+        self.current_block = merge_block;
+    }
+
     // ── TRY / CATCH / FINALLY ───────────────────────────────────────────
 
     fn processTryCatchStatement(self: *CFGBuilder, stmt: *const ast.Statement, tc: *const ast.TryCatchStmt) !void {
@@ -1593,6 +1651,9 @@ pub const CFGBuilder = struct {
 
         const return_block = try self.cfg.newBlock(.normal);
 
+        // Track this block as a GOSUB return point for sparse dispatch.
+        try self.cfg.gosub_return_blocks.put(return_block, {});
+
         if (gs.is_label) {
             if (self.label_map.get(gs.label)) |target_block| {
                 try self.cfg.addEdge(self.current_block, target_block, .gosub_call);
@@ -1705,6 +1766,8 @@ pub const CFGBuilder = struct {
         }
 
         const next = try self.cfg.newBlock(.normal);
+        // Track this block as a GOSUB return point for sparse dispatch.
+        try self.cfg.gosub_return_blocks.put(next, {});
         try self.cfg.addEdge(from, next, .gosub_return);
         self.current_block = next;
     }
@@ -1715,11 +1778,25 @@ pub const CFGBuilder = struct {
         try self.cfg.getBlock(self.current_block).addStatement(self.allocator, stmt);
 
         if (rs.return_value != null) {
-            // RETURN <value> — exits the function.
+            // RETURN <value> — exits the function (FUNCTION return).
             try self.cfg.addEdge(self.current_block, self.cfg.exit, .exit);
         } else {
-            // RETURN without value — could be GOSUB return or function return.
-            try self.cfg.addEdge(self.current_block, self.cfg.exit, .exit);
+            // RETURN without value — GOSUB return (runtime dispatch).
+            // The codegen will emit a sparse dispatch that pops the return
+            // block ID from the gosub return stack and jumps to the
+            // matching return-point block.  We use a gosub_return edge
+            // (targeting exit as a sentinel) so the terminator emitter
+            // can distinguish this from a normal function exit.
+            if (self.cfg.gosub_return_blocks.count() > 0) {
+                // There are GOSUB call sites → this is a GOSUB RETURN.
+                try self.cfg.addEdge(self.current_block, self.cfg.exit, .gosub_return);
+            } else {
+                // No GOSUBs seen (yet) — treat as void function return.
+                // NOTE: forward GOSUBs may not be registered yet, so we
+                // conservatively emit gosub_return and let codegen fall
+                // back to plain ret when gosub_return_blocks is empty.
+                try self.cfg.addEdge(self.current_block, self.cfg.exit, .gosub_return);
+            }
         }
 
         // New block after RETURN (unreachable unless targeted).

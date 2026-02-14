@@ -4,7 +4,7 @@
 /* Check if MADD fusion is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_madd_fusion_enabled(void)
 {
 	static int checked = 0;
@@ -402,7 +402,7 @@ fixarg(Ref *pr, int sz, int t, E *e)
  * so nothing after i could have been reading the MUL value through that
  * register.  In that case we return 0 (safe) without scanning.
  */
-static int
+int
 prev_result_used_later(Ins *i, Blk *b, Ref prev_to)
 {
 	Ins *j, *end;
@@ -598,7 +598,7 @@ try_msub_fusion(Ins *i, Ins *prev, E *e, Blk *b)
 /* Check if shifted operand fusion is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_shift_fusion_enabled(void)
 {
 	static int checked = 0;
@@ -618,7 +618,7 @@ is_shift_fusion_enabled(void)
 /* Check if LDP/STP pairing is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_ldp_stp_fusion_enabled(void)
 {
 	static int checked = 0;
@@ -638,7 +638,7 @@ is_ldp_stp_fusion_enabled(void)
 /* Check if indexed addressing fusion is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_indexed_addr_enabled(void)
 {
 	static int checked = 0;
@@ -658,7 +658,7 @@ is_indexed_addr_enabled(void)
 /* Check if NEON copy optimization is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_neon_copy_enabled(void)
 {
 	static int checked = 0;
@@ -678,7 +678,7 @@ is_neon_copy_enabled(void)
 /* Check if NEON arithmetic is enabled via environment variable
  * Returns 1 if enabled, 0 if disabled (default: enabled)
  */
-static int
+int
 is_neon_arith_enabled(void)
 {
 	static int checked = 0;
@@ -919,7 +919,7 @@ try_shift_fusion(Ins *i, Ins *prev, E *e, Blk *b)
  *   4 = 8-byte float   (D registers)
  * The pair class encodes both the size and the register bank.
  */
-static int
+int
 mem_pair_class(Ins *i)
 {
 	/* Stores */
@@ -951,7 +951,7 @@ mem_pair_class(Ins *i)
 }
 
 /* Size in bytes for a given pair class. */
-static int
+int
 pair_class_size(int pc)
 {
 	switch (pc) {
@@ -964,7 +964,7 @@ pair_class_size(int pc)
 }
 
 /* Register class (for rname) for a given pair class. */
-static int
+int
 pair_class_k(int pc)
 {
 	switch (pc) {

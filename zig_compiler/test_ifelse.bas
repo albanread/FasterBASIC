@@ -1,0 +1,12 @@
+FUNCTION GetVal() AS INTEGER
+  RETURN 42
+END FUNCTION
+
+DIM x AS INTEGER
+x = GetVal()
+IF x > 10 THEN
+  PRINT "big"
+ELSE
+  PRINT "small"
+ENDIF
+END

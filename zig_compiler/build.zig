@@ -31,6 +31,8 @@ pub fn build(b: *std.Build) void {
         "util.c",
         // Our bridge replaces main.c
         "qbe_bridge.c",
+        // JIT collector: walks post-regalloc Fn* → JitInst[]
+        "jit_collect.c",
     };
 
     const qbe_amd64_sources = &[_][]const u8{
@@ -63,6 +65,46 @@ pub fn build(b: *std.Build) void {
         "-Wno-unused-function",
     };
 
+    // ── Capstone Disassembler C source files ───────────────────────────
+    //
+    // We compile only the core engine + AArch64 architecture from the
+    // capstone/ directory (sibling to zig_compiler/).  This gives us
+    // ARM64 disassembly for the JIT verbose report without pulling in
+    // every architecture Capstone supports.
+
+    const capstone_core_sources = &[_][]const u8{
+        "cs.c",
+        "MCInst.c",
+        "MCInstPrinter.c",
+        "MCInstrDesc.c",
+        "MCRegisterInfo.c",
+        "Mapping.c",
+        "SStream.c",
+        "utils.c",
+    };
+
+    const capstone_aarch64_sources = &[_][]const u8{
+        "arch/AArch64/AArch64BaseInfo.c",
+        "arch/AArch64/AArch64Disassembler.c",
+        "arch/AArch64/AArch64DisassemblerExtension.c",
+        "arch/AArch64/AArch64InstPrinter.c",
+        "arch/AArch64/AArch64Mapping.c",
+        "arch/AArch64/AArch64Module.c",
+    };
+
+    const capstone_c_flags = &[_][]const u8{
+        "-std=c99",
+        "-DCAPSTONE_HAS_AARCH64",
+        "-DCAPSTONE_USE_SYS_DYN_MEM",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-Wno-sign-compare",
+        "-Wno-missing-field-initializers",
+        "-Wno-unused-function",
+        "-Wno-unused-variable",
+        "-Wno-implicit-fallthrough",
+    };
+
     // ── Main compiler executable ───────────────────────────────────────
 
     const exe_mod = b.createModule(.{
@@ -73,8 +115,12 @@ pub fn build(b: *std.Build) void {
     });
 
     // Add QBE include path so qbe.zig's C imports and the C sources
-    // can find all.h, config.h, ops.h, qbe_bridge.h
+    // can find all.h, config.h, ops.h, qbe_bridge.h, jit_collect.h
     exe_mod.addIncludePath(b.path("qbe"));
+
+    // Add runtime include path so C headers (basic_runtime.h,
+    // array_descriptor.h, etc.) are found when compiling runtime C files.
+    exe_mod.addIncludePath(b.path("runtime"));
 
     // Compile all QBE C sources into the module
     exe_mod.addCSourceFiles(.{
@@ -98,21 +144,65 @@ pub fn build(b: *std.Build) void {
         .flags = qbe_c_flags,
     });
 
+    // Add Capstone include paths (public headers + internal headers)
+    exe_mod.addIncludePath(b.path("../capstone/include"));
+    exe_mod.addIncludePath(b.path("../capstone"));
+
+    // Compile Capstone C sources into the module
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("../capstone"),
+        .files = capstone_core_sources,
+        .flags = capstone_c_flags,
+    });
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("../capstone"),
+        .files = capstone_aarch64_sources,
+        .flags = capstone_c_flags,
+    });
+
+    // ── Runtime C sources compiled directly into fbc ───────────────────
+    //
+    // basic_runtime.c and worker_runtime.c are the remaining C files in
+    // the runtime.  They are compiled into the fbc binary so that JIT-
+    // executed code can call the real runtime functions in-process via
+    // dlsym(RTLD_DEFAULT, ...).
+
+    const runtime_c_flags = &[_][]const u8{
+        "-std=c99",
+        "-Wall",
+        "-Wno-unused-parameter",
+        "-Wno-missing-field-initializers",
+    };
+
+    exe_mod.addCSourceFiles(.{
+        .root = b.path("runtime"),
+        .files = &[_][]const u8{
+            "basic_runtime.c",
+            "worker_runtime.c",
+            "hashmap_runtime.c",
+            "runtime_shims.c",
+        },
+        .flags = runtime_c_flags,
+    });
+
     const exe = b.addExecutable(.{
         .name = "fbc",
         .root_module = exe_mod,
     });
 
+    // Export all symbols so dlsym(RTLD_DEFAULT, ...) can find runtime
+    // functions linked into the binary.  Without this, the JIT linker's
+    // dlsym fallback would fail to resolve _basic_print_int etc.
+    exe.rdynamic = true;
+
     b.installArtifact(exe);
 
     // ── Zig Runtime Libraries ─────────────────────────────────────────
-
-    // Create zig-out/lib directory first
-    const mkdir_cmd = b.addSystemCommand(&[_][]const u8{
-        "mkdir",
-        "-p",
-        "zig-out/lib",
-    });
+    //
+    // Each runtime Zig module is compiled as a static library.  They are
+    // both installed to zig-out/lib/ (for the AOT linker path) AND linked
+    // into the fbc binary itself (so JIT-executed code can reach the real
+    // runtime functions via dlsym).
 
     const zig_runtime_libs = [_][]const u8{
         "samm_pool",
@@ -137,25 +227,142 @@ pub fn build(b: *std.Build) void {
         "terminal_io",
     };
 
-    var zig_rt_steps: [zig_runtime_libs.len]std.Build.Step.Run = undefined;
-    for (zig_runtime_libs, 0..) |lib_name, i| {
+    for (zig_runtime_libs) |lib_name| {
         const src_path = b.fmt("runtime/{s}.zig", .{lib_name});
-        const out_path = b.fmt("zig-out/lib/lib{s}.a", .{lib_name});
-        zig_rt_steps[i] = b.addSystemCommand(&[_][]const u8{
-            "zig",
-            "build-lib",
-            src_path,
-            "-lc",
-            "-O",
-            "ReleaseFast",
-            b.fmt("-femit-bin={s}", .{out_path}),
-        }).*;
-        zig_rt_steps[i].step.dependOn(&mkdir_cmd.step);
+        const rt_mod = b.createModule(.{
+            .root_source_file = b.path(src_path),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+        });
+        // Runtime Zig files #include C headers from the runtime/ directory
+        rt_mod.addIncludePath(b.path("runtime"));
+
+        const rt_lib = b.addLibrary(.{
+            .name = lib_name,
+            .root_module = rt_mod,
+        });
+
+        // Install to zig-out/lib/ for AOT linking (cc links against these)
+        b.installArtifact(rt_lib);
+
+        // Link into fbc binary so JIT can find symbols via dlsym
+        exe.linkLibrary(rt_lib);
     }
 
-    for (&zig_rt_steps) |*step| {
-        b.getInstallStep().dependOn(&step.step);
-    }
+    // ── JIT Encoder standalone test ────────────────────────────────────
+    //
+    // Runs the jit_encode.zig + arm64_encoder.zig test suites.
+    // These are pure Zig tests with no C dependencies.
+
+    const jit_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_encode.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const jit_tests = b.addTest(.{
+        .root_module = jit_test_mod,
+    });
+    const run_jit_tests = b.addRunArtifact(jit_tests);
+
+    const jit_test_step = b.step("test-jit", "Run JIT encoder unit tests");
+    jit_test_step.dependOn(&run_jit_tests.step);
+
+    // ── JIT Memory manager test ────────────────────────────────────────
+    //
+    // Runs the jit_memory.zig tests: W^X allocation, trampoline stubs,
+    // icache invalidation, and platform-specific memory management.
+    // Pure Zig tests with libc dependency (mmap, pthread, dlsym).
+
+    const jit_memory_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_memory.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const jit_memory_tests = b.addTest(.{
+        .root_module = jit_memory_test_mod,
+    });
+    const run_jit_memory_tests = b.addRunArtifact(jit_memory_tests);
+
+    jit_test_step.dependOn(&run_jit_memory_tests.step);
+
+    // ── JIT Linker test ────────────────────────────────────────────────
+    //
+    // Runs the jit_linker.zig tests: data relocations, trampoline island
+    // generation, external symbol resolution (dlsym), and BL patching.
+    // Depends on jit_encode.zig and jit_memory.zig (pure Zig imports).
+
+    const jit_linker_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_linker.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const jit_linker_tests = b.addTest(.{
+        .root_module = jit_linker_test_mod,
+    });
+    const run_jit_linker_tests = b.addRunArtifact(jit_linker_tests);
+
+    jit_test_step.dependOn(&run_jit_linker_tests.step);
+
+    // ── JIT Runtime test ───────────────────────────────────────────────
+    //
+    // Runs the jit_runtime.zig tests: execution harness, RuntimeContext,
+    // signal handling, and JitExecResult formatting.
+    // Depends on jit_encode.zig, jit_memory.zig, jit_linker.zig.
+
+    const jit_runtime_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_runtime.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const jit_runtime_tests = b.addTest(.{
+        .root_module = jit_runtime_test_mod,
+    });
+    const run_jit_runtime_tests = b.addRunArtifact(jit_runtime_tests);
+
+    jit_test_step.dependOn(&run_jit_runtime_tests.step);
+
+    // ── JIT Capstone disassembler test ─────────────────────────────────
+    //
+    // Runs the jit_capstone.zig tests: Capstone init/deinit, instruction
+    // disassembly, buffer disassembly, classification helpers.
+    // Requires Capstone C sources linked in.
+
+    const jit_capstone_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/jit_capstone.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // Capstone needs its include paths
+    jit_capstone_test_mod.addIncludePath(b.path("../capstone/include"));
+    jit_capstone_test_mod.addIncludePath(b.path("../capstone"));
+    // Compile Capstone C sources into the test module
+    jit_capstone_test_mod.addCSourceFiles(.{
+        .root = b.path("../capstone"),
+        .files = capstone_core_sources,
+        .flags = capstone_c_flags,
+    });
+    jit_capstone_test_mod.addCSourceFiles(.{
+        .root = b.path("../capstone"),
+        .files = capstone_aarch64_sources,
+        .flags = capstone_c_flags,
+    });
+    const jit_capstone_tests = b.addTest(.{
+        .root_module = jit_capstone_test_mod,
+    });
+    const run_jit_capstone_tests = b.addRunArtifact(jit_capstone_tests);
+
+    jit_test_step.dependOn(&run_jit_capstone_tests.step);
+
+    const capstone_test_step = b.step("test-capstone", "Run Capstone disassembler unit tests");
+    capstone_test_step.dependOn(&run_jit_capstone_tests.step);
+
+    // Also add to the main test step
+    // (added below after test_step is defined)
 
     // ── Run step ───────────────────────────────────────────────────────
 
@@ -174,6 +381,13 @@ pub fn build(b: *std.Build) void {
     // linked in so the extern symbols resolve.
 
     const test_step = b.step("test", "Run unit tests");
+
+    // Include JIT encoder + memory + linker + runtime + capstone tests in the main test suite
+    test_step.dependOn(&run_jit_tests.step);
+    test_step.dependOn(&run_jit_memory_tests.step);
+    test_step.dependOn(&run_jit_linker_tests.step);
+    test_step.dependOn(&run_jit_runtime_tests.step);
+    test_step.dependOn(&run_jit_capstone_tests.step);
 
     // Add SAMM pool unit tests
     const samm_pool_test_mod = b.createModule(.{
@@ -283,6 +497,21 @@ pub fn build(b: *std.Build) void {
                 .root = b.path("qbe"),
                 .files = qbe_rv64_sources,
                 .flags = qbe_c_flags,
+            });
+
+            // Capstone include paths + sources (needed transitively by
+            // jit_encode.zig → jit_capstone.zig → @cImport)
+            mod.addIncludePath(b.path("../capstone/include"));
+            mod.addIncludePath(b.path("../capstone"));
+            mod.addCSourceFiles(.{
+                .root = b.path("../capstone"),
+                .files = capstone_core_sources,
+                .flags = capstone_c_flags,
+            });
+            mod.addCSourceFiles(.{
+                .root = b.path("../capstone"),
+                .files = capstone_aarch64_sources,
+                .flags = capstone_c_flags,
             });
         }
 

@@ -50,6 +50,7 @@ const OutputMode = enum {
     executable,
     il_only,
     asm_only,
+    jit,
 };
 
 const Options = struct {
@@ -65,6 +66,7 @@ const Options = struct {
     show_version: bool = false,
     show_tokens: bool = false,
     run_after_compile: bool = false,
+    jit_verbose: bool = false,
     cc_path: []const u8 = "cc",
     runtime_dir: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
@@ -103,6 +105,11 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
             opts.trace_cfg = true;
         } else if (std.mem.eql(u8, arg, "--show-tokens")) {
             opts.show_tokens = true;
+        } else if (std.mem.eql(u8, arg, "--jit") or std.mem.eql(u8, arg, "-J")) {
+            opts.mode = .jit;
+        } else if (std.mem.eql(u8, arg, "--jit-verbose")) {
+            opts.mode = .jit;
+            opts.jit_verbose = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
@@ -147,6 +154,7 @@ fn printHelp(writer: anytype) void {
         \\  (default)                Compile to native executable
         \\  -i, --il                 Emit QBE Intermediate Language only
         \\  -c, --asm                Emit assembly only
+        \\  -J, --jit                JIT compile and execute in-process (ARM64)
         \\
         \\Options:
         \\  -o <path>                Output file path (default: derived from input)
@@ -154,6 +162,9 @@ fn printHelp(writer: anytype) void {
         \\  -v, --verbose            Verbose compiler output
         \\  -h, --help               Show this help message
         \\  -V, --version            Show version information
+        \\
+        \\JIT Options:
+        \\  --jit-verbose            JIT mode with full pipeline/link/layout report
         \\
         \\Debug / Trace:
         \\  --show-il                Print generated QBE IL to stderr
@@ -176,6 +187,8 @@ fn printHelp(writer: anytype) void {
         \\  fbc hello.bas -i -o hello.qbe    # Write QBE IL to hello.qbe
         \\  fbc hello.bas --show-il          # Compile and show IL on stderr
         \\  fbc hello.bas -r                 # Compile and run
+        \\  fbc hello.bas --jit              # JIT compile and execute in-process
+        \\  fbc hello.bas --jit-verbose      # JIT with full diagnostic report
         \\
         \\
     , .{version_string}) catch {};
@@ -215,6 +228,7 @@ fn deriveOutputPath(input_path: []const u8, mode: OutputMode, allocator: std.mem
         .executable => try allocator.dupe(u8, stem),
         .il_only => try std.fmt.allocPrint(allocator, "{s}.qbe", .{stem}),
         .asm_only => try std.fmt.allocPrint(allocator, "{s}.s", .{stem}),
+        .jit => try allocator.dupe(u8, stem), // JIT doesn't need output path, but handle for completeness
     };
 }
 
@@ -690,7 +704,7 @@ pub fn main() !void {
         stderr.print("Warning: input file '{s}' does not have a .bas extension\n", .{input_path}) catch {};
     }
 
-    if (opts.verbose) {
+    if (opts.verbose or (opts.mode == .jit and opts.jit_verbose)) {
         stderr.print("{s}\n", .{version_string}) catch {};
         stderr.print("Input: {s}\n", .{input_path}) catch {};
         stderr.print("Mode: {s}\n", .{@tagName(opts.mode)}) catch {};
@@ -885,6 +899,103 @@ pub fn main() !void {
     // ── Phase 6: Output ─────────────────────────────────────────────────
 
     switch (opts.mode) {
+        .jit => {
+            // ── JIT Mode: QBE IL → ARM64 machine code → execute in-process ──
+
+            if (opts.verbose or opts.jit_verbose) {
+                stderr.print("JIT: compiling QBE IL ({d} bytes)...\n", .{il.len}) catch {};
+            }
+
+            // Step 1: QBE IL → JitModule (compile + encode)
+            const jit_result = qbe.compileILJit(allocator, il, null) catch |err| {
+                stderr.print("Error: JIT compilation failed: {s}\n", .{@errorName(err)}) catch {};
+                std.process.exit(1);
+            };
+
+            if (opts.jit_verbose) {
+                const pr = jit_result.pipelineReport();
+                stderr.print("\n{s}\n", .{pr}) catch {};
+            }
+
+            if (opts.verbose or opts.jit_verbose) {
+                stderr.print("JIT: {d} instructions, {d} functions, {d} data items\n", .{
+                    jit_result.inst_count,
+                    jit_result.func_count,
+                    jit_result.data_count,
+                }) catch {};
+                stderr.print("JIT: code={d} bytes, data={d} bytes\n", .{
+                    jit_result.module.code_len,
+                    jit_result.module.data_len,
+                }) catch {};
+            }
+
+            // Step 2: Import JIT runtime and create execution session
+            const jit_runtime = @import("jit_runtime.zig");
+            const jit_stubs = @import("jit_stubs.zig");
+
+            // Build RuntimeContext — the real runtime is linked into fbc,
+            // so all symbols are resolved via dlsym(RTLD_DEFAULT, ...).
+            const ctx = jit_stubs.buildJitRuntimeContext();
+
+            // Create execution session from the compiled module.
+            // The runtime is linked into fbc, so the linker's dlsym
+            // fallback resolves every external call to the real
+            // implementation (print, strings, SAMM, arrays, etc.).
+            var session = jit_runtime.JitSession.compileFromModule(
+                allocator,
+                jit_result.module,
+                &ctx,
+                null, // insts — not needed, module has load_addr_relocs
+                0, // ninst
+                jit_result.inst_count,
+                jit_result.func_count,
+                jit_result.data_count,
+                jit_result.pipelineReport(),
+            ) catch |err| {
+                stderr.print("Error: JIT session creation failed: {s}\n", .{@errorName(err)}) catch {};
+                std.process.exit(1);
+            };
+            defer session.deinit();
+
+            if (opts.jit_verbose) {
+                session.dumpFullReport(stderr) catch {};
+            }
+
+            if (!session.finalized) {
+                stderr.print("Error: JIT session failed to finalize (linking errors)\n", .{}) catch {};
+                // Dump link diagnostics
+                session.link_result.dumpReport(stderr) catch {};
+                std.process.exit(1);
+            }
+
+            if (opts.verbose or opts.jit_verbose) {
+                stderr.print("JIT: executing...\n", .{}) catch {};
+            }
+
+            // Step 3: Execute
+            const exec_result = session.execute();
+
+            if (opts.jit_verbose) {
+                exec_result.dump(stderr) catch {};
+            }
+
+            if (exec_result.completed) {
+                if (opts.verbose or opts.jit_verbose) {
+                    stderr.print("JIT: exit code = {d}\n", .{exec_result.exit_code}) catch {};
+                }
+                if (exec_result.exit_code != 0) {
+                    std.process.exit(@intCast(@as(u32, @bitCast(exec_result.exit_code)) & 0xFF));
+                }
+            } else {
+                stderr.print("Error: JIT execution did not complete", .{}) catch {};
+                if (exec_result.signal != 0) {
+                    stderr.print(" (signal {d})", .{exec_result.signal}) catch {};
+                }
+                stderr.print("\n", .{}) catch {};
+                std.process.exit(1);
+            }
+        },
+
         .il_only => {
             // Write IL to stdout or file
             if (opts.output_path) |out_path| {

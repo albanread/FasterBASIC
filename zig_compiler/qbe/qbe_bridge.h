@@ -86,6 +86,31 @@ const char **qbe_available_targets(void);
  */
 const char *qbe_version(void);
 
+/* ── JIT compilation API ────────────────────────────────────────────────
+ *
+ * qbe_compile_il_jit()
+ *
+ *   Compiles QBE IL text through the full optimization pipeline but
+ *   instead of emitting assembly text, populates a JitCollector with
+ *   structured JitInst records that can be consumed by the Zig ARM64
+ *   encoder (jit_encode.zig) to produce machine code in memory.
+ *
+ *   il_text       — pointer to the QBE IL source text
+ *   il_len        — length of il_text in bytes
+ *   jc            — pointer to an initialized JitCollector
+ *   target_name   — target name string, or NULL for host default
+ *
+ *   Returns QBE_OK (0) on success, negative error code on failure.
+ *   The JitCollector must have been initialized with jit_collector_init()
+ *   before calling this function.
+ *
+ *   Thread safety: NOT thread-safe (same as qbe_compile_il).
+ */
+struct JitCollector;
+
+int qbe_compile_il_jit(const char *il_text, size_t il_len,
+                       struct JitCollector *jc, const char *target_name);
+
 #ifdef __cplusplus
 }
 #endif

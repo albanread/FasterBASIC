@@ -4594,6 +4594,19 @@ const CaseContext = struct {
     selector_type: ExprEmitter.ExprType,
 };
 
+/// Context saved when a MATCH TYPE is emitted so that case_test blocks
+/// can compare the atom type tag from the FOR EACH cursor.
+const MatchTypeContext = struct {
+    /// Temp holding the atom type tag (result of list_iter_type).
+    type_tag_temp: []const u8,
+    /// Temp holding the cursor pointer (for value extraction in body blocks).
+    cursor_temp: []const u8,
+    /// The MATCH TYPE AST node arms for per-arm metadata.
+    arms: []const ast.MatchTypeStmt.CaseArm,
+    /// Index of the current arm being tested (incremented per case_test block).
+    current_arm: u32,
+};
+
 /// Emits code for the statements within a single basic block and emits
 /// the block's terminator (branch / jump / return) based on CFG edges.
 pub const BlockEmitter = struct {
@@ -4628,6 +4641,9 @@ pub const BlockEmitter = struct {
 
     /// CASE selector contexts, keyed by the case entry block index.
     case_contexts: std.AutoHashMap(u32, CaseContext),
+
+    /// MATCH TYPE contexts, keyed by the match entry block index.
+    match_type_contexts: std.AutoHashMap(u32, MatchTypeContext),
 
     /// Pre-allocated FOR loop slots, keyed by uppercase variable name.
     for_pre_allocs: std.StringHashMap(ForPreAlloc),
@@ -4665,6 +4681,7 @@ pub const BlockEmitter = struct {
             .foreach_list_contexts = std.AutoHashMap(u32, ForEachListContext).init(allocator),
             .foreach_hashmap_contexts = std.AutoHashMap(u32, ForEachHashmapContext).init(allocator),
             .case_contexts = std.AutoHashMap(u32, CaseContext).init(allocator),
+            .match_type_contexts = std.AutoHashMap(u32, MatchTypeContext).init(allocator),
             .for_pre_allocs = std.StringHashMap(ForPreAlloc).init(allocator),
             .field_mappings = std.StringHashMap(FieldMapping).init(allocator),
         };
@@ -4676,6 +4693,7 @@ pub const BlockEmitter = struct {
         self.foreach_list_contexts.deinit();
         self.foreach_hashmap_contexts.deinit();
         self.case_contexts.deinit();
+        self.match_type_contexts.deinit();
         self.for_pre_allocs.deinit();
         self.field_mappings.deinit();
     }
@@ -4816,7 +4834,16 @@ pub const BlockEmitter = struct {
             .let => |lt| try self.emitLetStatement(&lt),
             .dim => |dim| try self.emitDimStatement(&dim),
             .call => |cs| try self.emitCallStatement(&cs),
-            .return_stmt => |rs| try self.emitReturnStatement(&rs),
+            .return_stmt => |rs| {
+                // Check if this is a GOSUB return (bare RETURN with
+                // gosub_return edge).  If so, do NOT emit QBE `ret` —
+                // the terminator will emit the sparse dispatch instead.
+                if (rs.return_value == null and self.isGosubReturn(block)) {
+                    // Bare RETURN from GOSUB — handled by emitTerminator.
+                } else {
+                    try self.emitReturnStatement(&rs);
+                }
+            },
             .inc => |id| try self.emitIncDec(&id, true),
             .dec => |id| try self.emitIncDec(&id, false),
             .swap => |sw| try self.emitSwapStatement(&sw),
@@ -4870,6 +4897,7 @@ pub const BlockEmitter = struct {
             .sub => {}, // handled via function_cfgs
             .worker => {}, // handled via function_cfgs
             .unmarshall => |um| try self.emitUnmarshallStatement(&um),
+            .match_type => |mt| try self.emitMatchTypeInit(&mt, block),
 
             // ── Terminal I/O ────────────────────────────────────────────
             .cls => try self.emitCLS(),
@@ -4935,7 +4963,9 @@ pub const BlockEmitter = struct {
         var case_next_target: ?u32 = null;
         var has_return_edge = false;
         var has_gosub_call = false;
+        var has_gosub_return_edge = false;
         var gosub_target: ?u32 = null;
+        var gosub_return_target: ?u32 = null; // return-point block for GOSUB
 
         for (edges) |edge| {
             if (edge.from != block.index) continue;
@@ -4953,7 +4983,10 @@ pub const BlockEmitter = struct {
                     has_gosub_call = true;
                     gosub_target = edge.to;
                 },
-                .gosub_return => {}, // handled after gosub_call
+                .gosub_return => {
+                    has_gosub_return_edge = true;
+                    gosub_return_target = edge.to;
+                },
                 .exception => {}, // TRY/CATCH: handled below
                 .finally => {}, // TRY/CATCH: handled below
                 .computed_branch => {}, // ON GOTO: handled below
@@ -4970,6 +5003,29 @@ pub const BlockEmitter = struct {
                     break;
                 },
                 else => {},
+            }
+        }
+
+        // ── GOSUB RETURN: bare RETURN with gosub_return edge ────────────
+        // This must be checked BEFORE the exit-edge early-return below,
+        // because emitReturnStatement may have already emitted a QBE `ret`
+        // which is wrong for GOSUB returns.  We detect this case and emit
+        // the sparse dispatch instead.
+        if (has_return_edge and has_gosub_return_edge) {
+            if (self.cfg.gosub_return_blocks.count() > 0) {
+                // This is a GOSUB RETURN — emit sparse dispatch.
+                // Note: emitReturnStatement already emitted a `ret` which
+                // terminated the builder. We need to undo that by resetting
+                // the terminated flag so we can emit the dispatch code.
+                // Actually, we prevent `ret` from being emitted in the first
+                // place by checking in emitStatement — see the gosub_return
+                // handling there.
+                try self.emitGosubReturnDispatch();
+                return;
+            } else {
+                // No GOSUB return blocks — treat as void function return.
+                // emitReturnStatement already emitted `ret`.
+                return;
             }
         }
 
@@ -5017,11 +5073,36 @@ pub const BlockEmitter = struct {
             return;
         }
 
-        // ── GOSUB: jump to target (return handled by runtime) ───────────
+        // ── ON GOTO: computed branch dispatch ───────────────────────────
+        // Must be checked BEFORE single GOSUB, because ON GOSUB also
+        // creates gosub_call edges and would be mishandled by the single-
+        // target GOSUB handler.
+        for (block.statements.items) |stmt| {
+            switch (stmt.data) {
+                .on_goto => |og| {
+                    try self.emitOnGotoDispatch(block, &og);
+                    return;
+                },
+                .on_gosub => |ogs| {
+                    try self.emitOnGosubDispatch(block, &ogs, gosub_return_target);
+                    return;
+                },
+                else => {},
+            }
+        }
+
+        // ── GOSUB: push return block ID, then jump to target ────────────
         if (has_gosub_call) {
             if (gosub_target) |t| {
-                try self.builder.emitComment("GOSUB call");
-                try self.builder.emitJump(try blockLabel(self.cfg, t, self.allocator));
+                if (gosub_return_target) |ret_blk| {
+                    try self.builder.emitComment("GOSUB: push return point, jump to subroutine");
+                    try self.emitPushReturnBlock(ret_blk);
+                    try self.builder.emitJump(try blockLabel(self.cfg, t, self.allocator));
+                } else {
+                    // No return edge found — fallback to plain jump
+                    try self.builder.emitComment("GOSUB call (no return point)");
+                    try self.builder.emitJump(try blockLabel(self.cfg, t, self.allocator));
+                }
                 return;
             }
         }
@@ -5064,7 +5145,14 @@ pub const BlockEmitter = struct {
         // ── Case test block: compare selector vs value ──────────────────
         if (block.kind == .case_test) {
             if (case_match_target != null and case_next_target != null) {
-                try self.emitCaseTest(block, case_match_target.?, case_next_target.?);
+                // Check if this is a MATCH TYPE test by looking for a
+                // match_type context reachable from this block's predecessors.
+                const mt_ctx = self.findMatchTypeContext(block);
+                if (mt_ctx != null) {
+                    try self.emitMatchTypeTest(block, case_match_target.?, case_next_target.?);
+                } else {
+                    try self.emitCaseTest(block, case_match_target.?, case_next_target.?);
+                }
                 return;
             }
             // Fallback: if we have match but no next, just jump to match
@@ -5139,6 +5227,280 @@ pub const BlockEmitter = struct {
         if (block.successors.items.len > 0) {
             try self.builder.emitJump(try blockLabel(self.cfg, block.successors.items[0], self.allocator));
         }
+    }
+
+    // ── ON GOTO / ON GOSUB dispatch ─────────────────────────────────────
+
+    /// Emit ON GOTO dispatch: evaluate selector, chain of comparisons
+    /// to jump to the correct target, fall through if out of range.
+    fn emitOnGotoDispatch(self: *BlockEmitter, block: *const cfg_mod.BasicBlock, og: *const ast.OnGotoStmt) EmitError!void {
+        const dispatch_id = self.builder.nextLabelId();
+        try self.builder.emitComment("ON GOTO dispatch");
+
+        // 1. Evaluate the selector expression
+        const selector = try self.expr_emitter.emitExpression(og.selector);
+
+        // 2. Collect computed_branch targets in order from CFG edges
+        var targets: std.ArrayList(u32) = .empty;
+        defer targets.deinit(self.allocator);
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .computed_branch) {
+                try targets.append(self.allocator, edge.to);
+            }
+        }
+
+        // 3. Find the fallthrough target (out-of-range case)
+        var ft_target: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .fallthrough) {
+                ft_target = edge.to;
+                break;
+            }
+        }
+
+        if (targets.items.len == 0) {
+            // No targets — just fall through
+            if (ft_target) |ft| {
+                try self.builder.emitJump(try blockLabel(self.cfg, ft, self.allocator));
+            }
+            return;
+        }
+
+        // 4. Emit range check: if selector < 1 or selector > count, fall through
+        const fallthrough_label = try std.fmt.allocPrint(self.allocator, "on_goto_ft_{d}", .{dispatch_id});
+
+        // 5. Chain of comparisons: selector == 1 → target[0], selector == 2 → target[1], ...
+        for (targets.items, 0..) |target_block, i| {
+            const idx_val = try std.fmt.allocPrint(self.allocator, "{d}", .{i + 1});
+            const cmp_tmp = try self.builder.newTemp();
+            try self.builder.emitBinary(cmp_tmp, "w", "ceqw", selector, idx_val);
+
+            const target_label = try blockLabel(self.cfg, target_block, self.allocator);
+
+            if (i == targets.items.len - 1) {
+                // Last target — if no match, fall through
+                try self.builder.emitBranch(cmp_tmp, target_label, fallthrough_label);
+            } else {
+                const next_check = try std.fmt.allocPrint(self.allocator, "on_goto_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                try self.builder.emitBranch(cmp_tmp, target_label, next_check);
+                try self.builder.emitLabel(next_check);
+            }
+        }
+
+        // 6. Fallthrough label — jump to next block (out of range)
+        try self.builder.emitLabel(fallthrough_label);
+        if (ft_target) |ft| {
+            try self.builder.emitJump(try blockLabel(self.cfg, ft, self.allocator));
+        }
+    }
+
+    /// Emit ON GOSUB dispatch: push return block, evaluate selector,
+    /// chain of comparisons to jump to the correct subroutine target,
+    /// fall through if out of range.
+    fn emitOnGosubDispatch(self: *BlockEmitter, block: *const cfg_mod.BasicBlock, ogs: *const ast.OnGosubStmt, gosub_return_target_opt: ?u32) EmitError!void {
+        const dispatch_id = self.builder.nextLabelId();
+        try self.builder.emitComment("ON GOSUB dispatch");
+
+        // 1. Evaluate the selector expression
+        const selector = try self.expr_emitter.emitExpression(ogs.selector);
+
+        // 2. Collect gosub_call targets in order from CFG edges
+        var targets: std.ArrayList(u32) = .empty;
+        defer targets.deinit(self.allocator);
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .gosub_call) {
+                try targets.append(self.allocator, edge.to);
+            }
+        }
+
+        // 3. Find the gosub_return target (continuation block after ON GOSUB)
+        var ft_target: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .gosub_return) {
+                ft_target = edge.to;
+                break;
+            }
+        }
+
+        if (targets.items.len == 0) {
+            // No targets — just fall through to return point
+            if (ft_target) |ft| {
+                try self.builder.emitJump(try blockLabel(self.cfg, ft, self.allocator));
+            }
+            return;
+        }
+
+        // 4. Push return block onto GOSUB stack BEFORE dispatching
+        //    (only if selector is in range — check range first)
+        const fallthrough_label = try std.fmt.allocPrint(self.allocator, "on_gosub_ft_{d}", .{dispatch_id});
+        const dispatch_label = try std.fmt.allocPrint(self.allocator, "on_gosub_dispatch_{d}", .{dispatch_id});
+
+        // Range check: selector < 1 or selector > count → fall through
+        const count_str = try std.fmt.allocPrint(self.allocator, "{d}", .{targets.items.len});
+        const lt_one = try self.builder.newTemp();
+        try self.builder.emitBinary(lt_one, "w", "csltw", selector, "1");
+        const gt_count = try self.builder.newTemp();
+        try self.builder.emitBinary(gt_count, "w", "csgtw", selector, count_str);
+        const out_of_range = try self.builder.newTemp();
+        try self.builder.emitBinary(out_of_range, "w", "or", lt_one, gt_count);
+        try self.builder.emitBranch(out_of_range, fallthrough_label, dispatch_label);
+
+        // 5. In-range: push return block, then dispatch
+        try self.builder.emitLabel(dispatch_label);
+        if (gosub_return_target_opt) |ret_blk| {
+            try self.emitPushReturnBlock(ret_blk);
+        }
+
+        // 6. Chain of comparisons: selector == 1 → target[0], ...
+        for (targets.items, 0..) |target_block, i| {
+            const idx_val = try std.fmt.allocPrint(self.allocator, "{d}", .{i + 1});
+            const cmp_tmp = try self.builder.newTemp();
+            try self.builder.emitBinary(cmp_tmp, "w", "ceqw", selector, idx_val);
+
+            const target_label = try blockLabel(self.cfg, target_block, self.allocator);
+
+            if (i == targets.items.len - 1) {
+                // Last target — unconditional jump (we already range-checked)
+                try self.builder.emitJump(target_label);
+            } else {
+                const next_check = try std.fmt.allocPrint(self.allocator, "on_gosub_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                try self.builder.emitBranch(cmp_tmp, target_label, next_check);
+                try self.builder.emitLabel(next_check);
+            }
+        }
+
+        // 7. Fallthrough label — out of range, continue to next statement
+        try self.builder.emitLabel(fallthrough_label);
+        if (ft_target) |ft| {
+            try self.builder.emitJump(try blockLabel(self.cfg, ft, self.allocator));
+        }
+    }
+
+    // ── GOSUB/RETURN helpers ────────────────────────────────────────────
+
+    /// Check whether a block's bare RETURN statement is a GOSUB return
+    /// (i.e. it has a gosub_return outgoing edge).
+    fn isGosubReturn(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) bool {
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .gosub_return) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Push a return-point block ID onto the GOSUB return stack.
+    /// Mirrors the C++ emitPushReturnBlock().
+    fn emitPushReturnBlock(self: *BlockEmitter, return_block_id: u32) EmitError!void {
+        try self.builder.emitComment(
+            try std.fmt.allocPrint(self.allocator, "Push return block {d} onto GOSUB return stack", .{return_block_id}),
+        );
+
+        // 1. Load current stack pointer
+        const sp = try self.builder.newTemp();
+        try self.builder.emitLoad(sp, "w", "$gosub_return_sp");
+
+        // 2. Convert SP to long for address calculation
+        const sp_long = try self.builder.newTemp();
+        try self.builder.emitExtend(sp_long, "l", "extsw", sp);
+
+        // 3. Calculate byte offset: SP * 4 (GOSUB_ENTRY_BYTES)
+        const byte_offset = try self.builder.newTemp();
+        try self.builder.emitBinary(byte_offset, "l", "mul", sp_long, "4");
+
+        // 4. Calculate stack address: $gosub_return_stack + offset
+        const stack_addr = try self.builder.newTemp();
+        try self.builder.emitBinary(stack_addr, "l", "add", "$gosub_return_stack", byte_offset);
+
+        // 5. Store return block ID at that address
+        const blk_id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{return_block_id});
+        try self.builder.emitStore("w", blk_id_str, stack_addr);
+
+        // 6. Increment stack pointer
+        const new_sp = try self.builder.newTemp();
+        try self.builder.emitBinary(new_sp, "w", "add", sp, "1");
+        try self.builder.emitStore("w", new_sp, "$gosub_return_sp");
+    }
+
+    /// Emit the GOSUB RETURN sparse dispatch: pop block ID from the
+    /// return stack and chain jnz comparisons against all known
+    /// return-point blocks.  Mirrors the C++ emitGosubReturnEdge().
+    fn emitGosubReturnDispatch(self: *BlockEmitter) EmitError!void {
+        // Use a unique ID per dispatch site to avoid label collisions
+        // when multiple RETURN statements exist.
+        const dispatch_id = self.builder.nextLabelId();
+
+        try self.builder.emitComment("RETURN from GOSUB - sparse dispatch");
+
+        // 1. Load current stack pointer
+        const sp = try self.builder.newTemp();
+        try self.builder.emitLoad(sp, "w", "$gosub_return_sp");
+
+        // 2. Decrement stack pointer
+        const new_sp = try self.builder.newTemp();
+        try self.builder.emitBinary(new_sp, "w", "sub", sp, "1");
+        try self.builder.emitStore("w", new_sp, "$gosub_return_sp");
+
+        // 3. Convert new SP to long for address calculation
+        const new_sp_long = try self.builder.newTemp();
+        try self.builder.emitExtend(new_sp_long, "l", "extsw", new_sp);
+
+        // 4. Calculate byte offset: SP * 4
+        const byte_offset = try self.builder.newTemp();
+        try self.builder.emitBinary(byte_offset, "l", "mul", new_sp_long, "4");
+
+        // 5. Calculate stack address
+        const stack_addr = try self.builder.newTemp();
+        try self.builder.emitBinary(stack_addr, "l", "add", "$gosub_return_stack", byte_offset);
+
+        // 6. Load return block ID
+        const ret_id = try self.builder.newTemp();
+        try self.builder.emitLoad(ret_id, "w", stack_addr);
+
+        // 7. Sparse dispatch — compare against known GOSUB return points
+        // Collect and sort return block IDs for deterministic output.
+        var return_blocks: std.ArrayList(u32) = .empty;
+        defer return_blocks.deinit(self.allocator);
+        var rb_it = self.cfg.gosub_return_blocks.iterator();
+        while (rb_it.next()) |entry| {
+            try return_blocks.append(self.allocator, entry.key_ptr.*);
+        }
+        std.mem.sort(u32, return_blocks.items, {}, std.sort.asc(u32));
+
+        if (return_blocks.items.len == 0) {
+            // No return blocks — should not happen, emit error and ret.
+            try self.builder.emitComment("ERROR: No GOSUB return blocks found");
+            try self.builder.emitReturn("0");
+            return;
+        }
+
+        try self.builder.emitComment(
+            try std.fmt.allocPrint(self.allocator, "Sparse RETURN dispatch - checking {d} return points", .{return_blocks.items.len}),
+        );
+
+        for (return_blocks.items, 0..) |blk_id, i| {
+            const is_match = try self.builder.newTemp();
+            const blk_id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{blk_id});
+            try self.builder.emitCompare(is_match, "w", "eq", ret_id, blk_id_str);
+
+            const target_label = try blockLabel(self.cfg, blk_id, self.allocator);
+            const is_last = (i + 1 == return_blocks.items.len);
+
+            if (is_last) {
+                // Last check — if no match, fall through to error
+                const error_label = try std.fmt.allocPrint(self.allocator, "gosub_ret_err_{d}", .{dispatch_id});
+                try self.builder.emitBranch(is_match, target_label, error_label);
+                try self.builder.emitLabel(error_label);
+            } else {
+                const next_check = try std.fmt.allocPrint(self.allocator, "gosub_ret_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                try self.builder.emitBranch(is_match, target_label, next_check);
+                try self.builder.emitLabel(next_check);
+            }
+        }
+
+        // Error fallthrough — invalid return address
+        try self.builder.emitComment("RETURN stack error - exiting program");
+        try self.builder.emitReturn("0");
     }
 
     // ── FOR loop helpers ────────────────────────────────────────────────
@@ -6085,6 +6447,268 @@ pub const BlockEmitter = struct {
         } else {
             // No condition: unconditional match (OTHERWISE-like)
             try self.builder.emitJump(try blockLabel(self.cfg, match_target, self.allocator));
+        }
+    }
+
+    // ── MATCH TYPE codegen ──────────────────────────────────────────────
+
+    /// Evaluate the MATCH TYPE expression and get the atom type tag
+    /// from the FOR EACH cursor. Store context for case_test blocks.
+    fn emitMatchTypeInit(self: *BlockEmitter, mt: *const ast.MatchTypeStmt, block: *const cfg_mod.BasicBlock) EmitError!void {
+        _ = mt.match_expression; // The match expression is the FOR EACH variable
+
+        // Find the enclosing FOR EACH list cursor by walking CFG
+        // predecessors from the current block to the nearest block
+        // that has an entry in foreach_list_contexts (the FOR EACH
+        // header block).  This is reliable even when multiple loops
+        // reuse the same iterator variable name.
+        var cursor_addr: ?[]const u8 = null;
+        {
+            var visited: [64]u32 = undefined;
+            var visited_count: usize = 0;
+            // Seed the walk with the current block and its direct predecessors.
+            var queue: [64]u32 = undefined;
+            var queue_len: usize = 0;
+
+            // Start with current block itself.
+            queue[queue_len] = block.index;
+            queue_len += 1;
+
+            while (queue_len > 0) {
+                queue_len -= 1;
+                const idx = queue[queue_len];
+
+                // Check if already visited.
+                var already = false;
+                for (visited[0..visited_count]) |v| {
+                    if (v == idx) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (already) continue;
+                if (visited_count >= 64) break;
+                visited[visited_count] = idx;
+                visited_count += 1;
+
+                // Check if this block is a FOR EACH header.
+                if (self.foreach_list_contexts.getPtr(idx)) |flc| {
+                    cursor_addr = flc.cursor_addr;
+                    break;
+                }
+
+                // Enqueue predecessors.
+                const pred_block = self.cfg.getBlockConst(idx);
+                for (pred_block.predecessors.items) |pred_idx| {
+                    if (queue_len < 64) {
+                        queue[queue_len] = pred_idx;
+                        queue_len += 1;
+                    }
+                }
+            }
+        }
+
+        if (cursor_addr == null) {
+            try self.builder.emitComment("WARN: MATCH TYPE — no FOR EACH cursor found");
+            return;
+        }
+
+        // Load cursor and get the atom type tag
+        const cursor = try self.builder.newTemp();
+        try self.builder.emitLoad(cursor, "l", cursor_addr.?);
+
+        const type_tag = try self.builder.newTemp();
+        const cursor_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{cursor});
+        try self.builder.emitCall(type_tag, "w", "list_iter_type", cursor_arg);
+
+        try self.match_type_contexts.put(block.index, .{
+            .type_tag_temp = type_tag,
+            .cursor_temp = cursor,
+            .arms = mt.case_arms,
+            .current_arm = 0,
+        });
+    }
+
+    /// Find the MatchTypeContext that governs a given case_test block by
+    /// walking back through predecessor (case_next) edges to the entry
+    /// block where the context was registered.
+    fn findMatchTypeContext(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) ?*MatchTypeContext {
+        // Direct lookup first.
+        if (self.match_type_contexts.getPtr(block.index)) |ptr| return ptr;
+
+        // Walk predecessors: case_test blocks chain via case_next edges
+        // back to the match entry block where the context is stored.
+        var visited: [64]u32 = undefined;
+        var visited_count: usize = 0;
+        var current = block;
+        while (visited_count < 64) {
+            // Mark visited to avoid infinite loops.
+            var already_visited = false;
+            for (visited[0..visited_count]) |v| {
+                if (v == current.index) {
+                    already_visited = true;
+                    break;
+                }
+            }
+            if (already_visited) break;
+            visited[visited_count] = current.index;
+            visited_count += 1;
+
+            // Check if this block has a context.
+            if (self.match_type_contexts.getPtr(current.index)) |ptr| return ptr;
+
+            // Walk to predecessor blocks.
+            var found_pred = false;
+            for (current.predecessors.items) |pred_idx| {
+                if (self.match_type_contexts.getPtr(pred_idx)) |ptr| return ptr;
+                // Follow to the predecessor block and keep walking.
+                current = self.cfg.getBlockConst(pred_idx);
+                found_pred = true;
+                break;
+            }
+            if (!found_pred) break;
+        }
+
+        return null;
+    }
+
+    /// Emit the type comparison for a MATCH TYPE case_test block.
+    /// Compares the atom type tag against the expected type for this arm,
+    /// and for class matches calls class_is_instance.
+    fn emitMatchTypeTest(self: *BlockEmitter, block: *const cfg_mod.BasicBlock, match_target: u32, next_target: u32) EmitError!void {
+        // Find the match type context by walking predecessors to the entry block.
+        const ctx = self.findMatchTypeContext(block);
+
+        if (ctx == null) {
+            try self.builder.emitComment("WARN: MATCH TYPE test — no context found");
+            try self.builder.emitJump(try blockLabel(self.cfg, next_target, self.allocator));
+            return;
+        }
+
+        const mc = ctx.?;
+        const arm_idx = mc.current_arm;
+        if (arm_idx >= mc.arms.len) {
+            try self.builder.emitJump(try blockLabel(self.cfg, next_target, self.allocator));
+            return;
+        }
+
+        const arm = mc.arms[arm_idx];
+        mc.current_arm += 1;
+
+        if (arm.is_class_match) {
+            // Class match: check if the atom is an OBJECT (type == 5),
+            // then call class_is_instance on the pointer value.
+            const is_obj = try self.builder.newTemp();
+            try self.builder.emitCompare(is_obj, "w", "eq", mc.type_tag_temp, "5");
+
+            // We need to branch: if not an object, skip to next arm.
+            const check_class_label = try std.fmt.allocPrint(self.allocator, "mt_chkcls_{d}", .{block.index});
+            try self.builder.emitBranch(
+                is_obj,
+                check_class_label,
+                try blockLabel(self.cfg, next_target, self.allocator),
+            );
+            try self.builder.emitLabel(check_class_label);
+
+            // Load the object pointer from the cursor
+            const obj_ptr = try self.builder.newTemp();
+            const cur_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{mc.cursor_temp});
+            try self.builder.emitCall(obj_ptr, "l", "list_iter_value_ptr", cur_arg);
+
+            // Look up class_id from symbol table
+            const class_name = arm.match_class_name;
+            var class_id: i32 = 0;
+            if (self.symbol_table.lookupClass(class_name)) |ci| {
+                class_id = ci.class_id;
+            }
+
+            // Call class_is_instance(obj_ptr, class_id)
+            const is_inst = try self.builder.newTemp();
+            const ci_args = try std.fmt.allocPrint(self.allocator, "l {s}, l {d}", .{ obj_ptr, class_id });
+            try self.builder.emitCall(is_inst, "w", "class_is_instance", ci_args);
+
+            // Store the object pointer into the binding variable
+            if (arm.binding_variable.len > 0) {
+                const resolved = try self.resolveVarAddr(arm.binding_variable, arm.binding_suffix);
+                try self.builder.emitStore("l", obj_ptr, resolved.addr);
+            }
+
+            try self.builder.emitBranch(
+                is_inst,
+                try blockLabel(self.cfg, match_target, self.allocator),
+                try blockLabel(self.cfg, next_target, self.allocator),
+            );
+        } else {
+            // Basic type match: compare atom type tag against known constants.
+            // ATOM_INT=1, ATOM_FLOAT=2, ATOM_STRING=3, ATOM_LIST=4, ATOM_OBJECT=5
+            var expected_tag: []const u8 = "0";
+            const upper = if (arm.type_keyword.len > 0) arm.type_keyword else "";
+
+            if (std.ascii.eqlIgnoreCase(upper, "INTEGER")) {
+                expected_tag = "1";
+            } else if (std.ascii.eqlIgnoreCase(upper, "DOUBLE") or std.ascii.eqlIgnoreCase(upper, "SINGLE")) {
+                expected_tag = "2";
+            } else if (std.ascii.eqlIgnoreCase(upper, "STRING")) {
+                expected_tag = "3";
+            } else if (std.ascii.eqlIgnoreCase(upper, "LIST")) {
+                expected_tag = "4";
+            } else if (std.ascii.eqlIgnoreCase(upper, "OBJECT")) {
+                expected_tag = "5";
+            }
+
+            // Load the value into the binding variable before the comparison
+            // (so it's available if the arm matches).
+            if (arm.binding_variable.len > 0) {
+                const resolved = try self.resolveVarAddr(arm.binding_variable, arm.binding_suffix);
+                const cur_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{mc.cursor_temp});
+
+                if (std.mem.eql(u8, expected_tag, "1")) {
+                    // Integer
+                    const val = try self.builder.newTemp();
+                    try self.builder.emitCall(val, "l", "list_iter_value_int", cur_arg);
+                    if (std.mem.eql(u8, resolved.store_type, "w")) {
+                        const trunc = try self.builder.newTemp();
+                        try self.builder.emitTrunc(trunc, "w", val);
+                        try self.builder.emitStore("w", trunc, resolved.addr);
+                    } else {
+                        try self.builder.emitStore("l", val, resolved.addr);
+                    }
+                } else if (std.mem.eql(u8, expected_tag, "2")) {
+                    // Float/Double
+                    const val = try self.builder.newTemp();
+                    try self.builder.emitCall(val, "d", "list_iter_value_float", cur_arg);
+                    try self.builder.emitStore(resolved.store_type, val, resolved.addr);
+                } else if (std.mem.eql(u8, expected_tag, "3")) {
+                    // String
+                    const val = try self.builder.newTemp();
+                    try self.builder.emitCall(val, "l", "list_iter_value_ptr", cur_arg);
+                    try self.builder.emitStore("l", val, resolved.addr);
+                } else {
+                    // Pointer / object
+                    const val = try self.builder.newTemp();
+                    try self.builder.emitCall(val, "l", "list_iter_value_ptr", cur_arg);
+                    try self.builder.emitStore("l", val, resolved.addr);
+                }
+            }
+
+            if (std.mem.eql(u8, expected_tag, "5")) {
+                // OBJECT: any atom with type >= 5 matches (generic object catch-all)
+                const cmp = try self.builder.newTemp();
+                try self.builder.emitCompare(cmp, "w", "sge", mc.type_tag_temp, expected_tag);
+                try self.builder.emitBranch(
+                    cmp,
+                    try blockLabel(self.cfg, match_target, self.allocator),
+                    try blockLabel(self.cfg, next_target, self.allocator),
+                );
+            } else {
+                const cmp = try self.builder.newTemp();
+                try self.builder.emitCompare(cmp, "w", "eq", mc.type_tag_temp, expected_tag);
+                try self.builder.emitBranch(
+                    cmp,
+                    try blockLabel(self.cfg, match_target, self.allocator),
+                    try blockLabel(self.cfg, next_target, self.allocator),
+                );
+            }
         }
     }
 
@@ -9861,6 +10485,11 @@ pub const CFGCodeGenerator = struct {
         try self.emitGlobalVariables();
         try self.emitGlobalArrays();
 
+        // Phase 3a: GOSUB return stack (if program uses GOSUB)
+        if (self.program_cfg.gosub_return_blocks.count() > 0) {
+            try self.emitGosubReturnStack();
+        }
+
         // Phase 3b: CLASS vtables and class name strings
         try self.emitClassDeclarations(program);
 
@@ -11055,6 +11684,32 @@ pub const CFGCodeGenerator = struct {
                 try self.builder.emitComment("TODO: unhandled statement in class body");
             },
         }
+    }
+
+    /// Emit the global data for GOSUB/RETURN: a 16-deep return stack and
+    /// a stack pointer, matching the C++ codegen design.
+    fn emitGosubReturnStack(self: *CFGCodeGenerator) !void {
+        const GOSUB_STACK_DEPTH = 16;
+
+        try self.builder.emitComment("=== GOSUB Return Stack ===");
+
+        // Emit return stack: array of GOSUB_STACK_DEPTH words (block IDs)
+        var stack_data: std.ArrayList(u8) = .empty;
+        defer stack_data.deinit(self.allocator);
+        try stack_data.appendSlice(self.allocator, "{ ");
+        for (0..GOSUB_STACK_DEPTH) |i| {
+            try stack_data.appendSlice(self.allocator, "w 0");
+            if (i < GOSUB_STACK_DEPTH - 1) {
+                try stack_data.appendSlice(self.allocator, ", ");
+            }
+        }
+        try stack_data.appendSlice(self.allocator, " }");
+        try self.builder.emit("export data $gosub_return_stack = {s}\n", .{stack_data.items});
+
+        // Emit stack pointer: current depth (0 = empty)
+        try self.builder.emit("export data $gosub_return_sp = {{ w 0 }}\n", .{});
+
+        try self.builder.emitBlankLine();
     }
 
     fn emitGlobalVariables(self: *CFGCodeGenerator) !void {

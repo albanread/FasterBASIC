@@ -3655,15 +3655,21 @@ pub const Parser = struct {
                     atom_type_tag = @intFromEnum(self.current().tag);
                     _ = self.advance();
                 } else if (self.check(.identifier)) {
-                    // Could be a class name or UDT name
+                    // Could be a class name, UDT name, or OBJECT keyword
                     const type_name = self.current().lexeme;
                     _ = self.advance();
 
-                    // Determine if it's a class or UDT match
-                    is_class_match = true;
-                    match_class_name = type_name;
-                    is_udt_match = false;
-                    udt_type_name = type_name;
+                    if (std.ascii.eqlIgnoreCase(type_name, "OBJECT")) {
+                        // Generic OBJECT catch-all — treat as a basic type
+                        // keyword, not a class match.
+                        type_keyword = type_name;
+                    } else {
+                        // Determine if it's a class or UDT match
+                        is_class_match = true;
+                        match_class_name = type_name;
+                        is_udt_match = false;
+                        udt_type_name = type_name;
+                    }
                 } else {
                     try self.addError("Expected type name after CASE in MATCH TYPE");
                     return error.ParseError;

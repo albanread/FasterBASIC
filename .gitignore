@@ -60,3 +60,27 @@ results/
 # Zig build artifacts
 zig_compiler/zig-out/
 zig_compiler/.zig-cache/
+
+# Test data artifacts
+*.dat
+
+# JIT test binaries and scratch files
+arm64_encoder
+day1jit
+day2jit
+day2jit_v2
+jit_test_gosub
+jit_test_gosub_nested
+jit_encode.zig
+arm64_encoder.zig
+debug_io.txt
+
+# External dependencies (vendored locally)
+capstone/
+
+# Quoted-name test artifacts
+\"test_empty.txt\"
+\"test_large.txt\"
+\"test_poem.txt\"
+\"test_program.bas\"
+\"test_slurp_output.txt\"

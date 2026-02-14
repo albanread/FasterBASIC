@@ -1,4 +1,5 @@
 #include "all.h"
+#include "jit_collect.h"
 
 enum {
 	SecText,
@@ -225,6 +226,83 @@ macho_emitfin(FILE *f)
 	};
 
 	emitfin(f, sec);
+}
+
+/* ── JIT: emit stashed FP constants as JIT data records ─────────
+ *
+ * In the assembly path, emitfin() writes .section/.quad directives
+ * for every floating-point constant that was stashed during isel
+ * (via stashbits()).  In JIT mode we never call emitfin(); instead,
+ * this function walks the same `stash` list and appends
+ * JIT_DATA_START / JIT_DATA_QUAD / JIT_DATA_END records so the
+ * Zig encoder places the constants in the JIT data section and
+ * registers them in the symbol table.
+ *
+ * Must be called after parse() returns (all functions have been
+ * through isel) but before the JitCollector is handed to the
+ * encoder.
+ */
+void
+jit_emit_fp_constants(JitCollector *jc)
+{
+	Asmbits *b;
+	int i;
+	char buf[JIT_SYM_MAX];
+	JitInst *ji;
+
+	for (b = stash, i = 0; b; b = b->link, i++) {
+		/* Build the symbol name: "Lfp0", "Lfp1", … (Apple)
+		 * or ".Lfp0", ".Lfp1", … (ELF).
+		 * isel wraps it in quotes: "\"Lfp0\"", so we do the
+		 * same to match the LOAD_ADDR references.
+		 */
+		snprintf(buf, sizeof buf, "\"%sfp%d\"", T.asloc, i);
+
+		/* ── DATA_START with symbol name ── */
+		ji = jit_emit(jc);
+		if (!ji) return;
+		ji->kind = JIT_DATA_START;
+		ji->sym_type = JIT_SYM_DATA;
+		{
+			size_t len = strlen(buf);
+			if (len >= JIT_SYM_MAX) len = JIT_SYM_MAX - 1;
+			memcpy(ji->sym_name, buf, len);
+			ji->sym_name[len] = 0;
+		}
+
+		/* ── Alignment (8 for doubles, 4 for singles) ── */
+		ji = jit_emit(jc);
+		if (!ji) return;
+		ji->kind = JIT_DATA_ALIGN;
+		ji->imm = (b->size >= 8) ? 8 : 4;
+
+		/* ── Emit the constant value ── */
+		if (b->size >= 8) {
+			/* 64-bit (double) */
+			ji = jit_emit(jc);
+			if (!ji) return;
+			ji->kind = JIT_DATA_QUAD;
+			ji->imm = (int64_t)b->n;
+		} else {
+			/* 32-bit (single float) */
+			ji = jit_emit(jc);
+			if (!ji) return;
+			ji->kind = JIT_DATA_WORD;
+			ji->imm = (int64_t)(int32_t)b->n;
+		}
+
+		/* ── DATA_END ── */
+		ji = jit_emit(jc);
+		if (!ji) return;
+		ji->kind = JIT_DATA_END;
+		jc->ndata++;
+	}
+
+	/* Free the stash list (same as emitfin does) */
+	while ((b = stash)) {
+		stash = b->link;
+		free(b);
+	}
 }
 
 static uint32_t *file;

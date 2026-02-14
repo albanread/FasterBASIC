@@ -1364,9 +1364,62 @@ pub const SemanticAnalyzer = struct {
                 for (tc.finally_block) |s| try self.collectDeclaration(s);
             },
             // Recurse into MATCH TYPE blocks so declarations inside
-            // case arms are collected.
+            // case arms are collected.  Also auto-register the binding
+            // variables (e.g. `CASE INTEGER n%`) so they get global slots.
             .match_type => |mt| {
                 for (mt.case_arms) |arm| {
+                    if (arm.binding_variable.len > 0) {
+                        // Determine the base type from the arm's type keyword
+                        var bt: BaseType = .double;
+                        if (arm.is_class_match) {
+                            bt = .class_instance;
+                        } else if (arm.type_keyword.len > 0) {
+                            const kw = arm.type_keyword;
+                            if (std.ascii.eqlIgnoreCase(kw, "INTEGER")) {
+                                bt = .integer;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "DOUBLE")) {
+                                bt = .double;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "SINGLE")) {
+                                bt = .single;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "STRING")) {
+                                bt = .string;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "LONG")) {
+                                bt = .long;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "OBJECT")) {
+                                bt = .class_instance;
+                            }
+                        } else if (arm.binding_suffix) |suf| {
+                            bt = switch (suf) {
+                                .type_int, .percent => .integer,
+                                .type_double, .hash => .double,
+                                .type_float, .exclamation => .single,
+                                .type_string => .string,
+                                .ampersand => .long,
+                                else => .double,
+                            };
+                        }
+                        // Register if not already known
+                        const name = arm.binding_variable;
+                        var upper_buf: [128]u8 = undefined;
+                        const ulen = @min(name.len, upper_buf.len);
+                        for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(name[i]);
+                        const upper_name = upper_buf[0..ulen];
+                        if (self.symbol_table.lookupVariable(upper_name) == null) {
+                            const key = try self.allocator.dupe(u8, upper_name);
+                            const td = if (arm.is_class_match)
+                                TypeDescriptor.fromClass(arm.match_class_name)
+                            else
+                                TypeDescriptor.fromBase(bt);
+                            try self.symbol_table.insertVariable(key, .{
+                                .name = name,
+                                .type_desc = td,
+                                .is_declared = false,
+                                .first_use = stmt.loc,
+                                .scope = if (self.in_function) Scope.makeFunction(self.current_function_name) else Scope.makeGlobal(),
+                                .is_global = !self.in_function,
+                            });
+                        }
+                    }
                     for (arm.body) |s| try self.collectDeclaration(s);
                 }
                 for (mt.case_else_body) |s| try self.collectDeclaration(s);

@@ -542,9 +542,11 @@ fn toUpperBuf(text: []const u8, buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-fn initKeywordMap(allocator: std.mem.Allocator) !void {
+fn initKeywordMap(_: std.mem.Allocator) !void {
     @setEvalBranchQuota(100000);
-    keyword_map = KeywordMap.init(allocator);
+    // Use page_allocator for this process-lifetime singleton so it doesn't
+    // appear as a leak when callers pass std.testing.allocator (GPA).
+    keyword_map = KeywordMap.init(std.heap.page_allocator);
     const keywords = [_]struct { []const u8, Tag }{
         .{ "PRINT", .kw_print },
         .{ "CONSOLE", .kw_console },
