@@ -71,10 +71,12 @@ const Options = struct {
     cc_path: []const u8 = "cc",
     runtime_dir: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
+    /// Arguments to pass to the JIT-compiled program (collected after
+    /// the input file when --run is used).
+    program_args: []const []const u8 = &.{},
 };
 
 fn parseArgs(allocator: std.mem.Allocator) Options {
-    _ = allocator;
     var opts = Options{};
 
     var args = std.process.args();
@@ -117,6 +119,7 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
             opts.run_after_compile = true;
+            opts.mode = .jit; // --run implies JIT mode
         } else if (std.mem.eql(u8, arg, "--cc")) {
             opts.cc_path = args.next() orelse {
                 opts.error_message = "Missing argument for --cc";
@@ -137,6 +140,19 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
                 return opts;
             }
             opts.input_path = arg;
+
+            // In --run mode, everything after the input file is a
+            // program argument — stop parsing compiler flags.
+            if (opts.run_after_compile) {
+                var prog_args: std.ArrayListUnmanaged([]const u8) = .{};
+                // argv[0] for the program = the .bas source path
+                prog_args.append(allocator, arg) catch {};
+                while (args.next()) |parg| {
+                    prog_args.append(allocator, parg) catch {};
+                }
+                opts.program_args = prog_args.toOwnedSlice(allocator) catch &.{};
+                return opts;
+            }
         }
     }
 
@@ -150,6 +166,7 @@ fn printHelp(writer: anytype) void {
         \\{s}
         \\
         \\Usage: fbc [options] <input.bas>
+        \\       fbc --run <input.bas> [program args...]
         \\
         \\Compiles FasterBASIC source files to native executables via QBE IL.
         \\
@@ -158,10 +175,10 @@ fn printHelp(writer: anytype) void {
         \\  -i, --il                 Emit QBE Intermediate Language only
         \\  -c, --asm                Emit assembly only
         \\  -J, --jit                JIT compile and execute in-process (ARM64)
+        \\  -r, --run                JIT compile and run, passing remaining args to program
         \\
         \\Options:
         \\  -o <path>                Output file path (default: derived from input)
-        \\  -r, --run                Run the compiled program after building
         \\  -v, --verbose            Verbose compiler output
         \\  -h, --help               Show this help message
         \\  -V, --version            Show version information
@@ -190,7 +207,7 @@ fn printHelp(writer: anytype) void {
         \\  fbc hello.bas -i                 # Print QBE IL to stdout
         \\  fbc hello.bas -i -o hello.qbe    # Write QBE IL to hello.qbe
         \\  fbc hello.bas --show-il          # Compile and show IL on stderr
-        \\  fbc hello.bas -r                 # Compile and run
+        \\  fbc --run hello.bas arg1 arg2    # JIT run with program arguments
         \\  fbc hello.bas --jit              # JIT compile and execute in-process
         \\  fbc hello.bas --jit-verbose      # JIT with full diagnostic report
         \\
@@ -1089,7 +1106,12 @@ pub fn main() !void {
             }
 
             // Step 3: Execute
-            const exec_result = session.execute();
+            const exec_result = if (opts.run_after_compile and opts.program_args.len > 0) blk: {
+                // --run mode: pass program arguments to main(argc, argv)
+                break :blk session.executeWithArgs(opts.program_args);
+            } else blk: {
+                break :blk session.execute();
+            };
             t_after_jit_exec_ns = std.time.nanoTimestamp();
 
             if (opts.jit_verbose) {

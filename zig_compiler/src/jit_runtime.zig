@@ -333,14 +333,50 @@ pub const JitSession = struct {
     /// Looks up the "main" symbol in the module's symbol table,
     /// casts the code pointer to a function, and calls it.
     ///
-    /// The expected function signature is: fn() callconv(.C) i32
-    /// (matches the QBE `export function w $main()` convention)
+    /// The expected function signature is: fn(i32, [*][*:0]u8) callconv(.C) i32
+    /// (matches the QBE `export function w $main(w %argc, l %argv)` convention).
+    /// When called without args, argc=0 and argv points to an empty list.
     pub fn execute(self: *JitSession) JitExecResult {
-        return self.executeFunction("main");
+        // Call main with argc=0 and a dummy argv (just a null terminator)
+        var dummy_argv = [_:null]?[*:0]u8{null};
+        return self.executeMain(0, @ptrCast(&dummy_argv));
     }
 
-    /// Execute a named function in the JIT-compiled code.
+    /// Execute the JIT-compiled main with program arguments.
+    ///
+    /// `program_args` should include argv[0] (the program name).
+    /// This builds a C-style argv array and calls main(argc, argv).
+    pub fn executeWithArgs(self: *JitSession, program_args: []const []const u8) JitExecResult {
+        // Build a C argv array: each entry is a pointer to a
+        // null-terminated string.  We point directly into the
+        // slice data — the strings come from std.process.args()
+        // and are already null-terminated on the OS side.
+        const argc: i32 = @intCast(program_args.len);
+        var argv_buf: [128]?[*:0]u8 = undefined;
+        const cap = @min(program_args.len, argv_buf.len - 1);
+        for (0..cap) |i| {
+            // std.process.args() yields [*:0]u8 slices — the
+            // underlying OS strings are null-terminated, so we
+            // can recover the sentinel pointer from the slice.
+            argv_buf[i] = @ptrCast(@constCast(program_args[i].ptr));
+        }
+        argv_buf[cap] = null; // C argv is null-terminated
+        return self.executeMain(argc, @ptrCast(&argv_buf));
+    }
+
+    /// Low-level: execute main(argc, argv) in the JIT region.
+    fn executeMain(self: *JitSession, argc: i32, argv: [*][*:0]u8) JitExecResult {
+        return self.executeFunctionWithArgs("main", argc, argv);
+    }
+
+    /// Execute a named function in the JIT-compiled code (no args).
     pub fn executeFunction(self: *JitSession, func_name: []const u8) JitExecResult {
+        var dummy_argv = [_:null]?[*:0]u8{null};
+        return self.executeFunctionWithArgs(func_name, 0, @ptrCast(&dummy_argv));
+    }
+
+    /// Execute a named function with argc/argv arguments.
+    fn executeFunctionWithArgs(self: *JitSession, func_name: []const u8, argc: i32, argv: [*][*:0]u8) JitExecResult {
         var result = JitExecResult{
             .exit_code = -1,
             .completed = false,
@@ -385,8 +421,8 @@ pub const JitSession = struct {
             }
         };
 
-        // Get a callable function pointer
-        const MainFn = *const fn () callconv(.c) i32;
+        // Get a callable function pointer — main(argc, argv) → int
+        const MainFn = *const fn (i32, [*][*:0]u8) callconv(.c) i32;
         const fn_ptr = self.region.getFunctionPtr(MainFn, entry_offset) catch {
             return result;
         };
@@ -400,7 +436,7 @@ pub const JitSession = struct {
         defer setCurrentSession(null);
 
         // Execute!
-        const exit_code = fn_ptr();
+        const exit_code = fn_ptr(argc, argv);
 
         result.exit_code = exit_code;
         result.completed = true;
