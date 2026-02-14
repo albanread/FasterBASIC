@@ -329,6 +329,25 @@ extern fn str_to_double(...) callconv(.c) f64;
 // ── Additional math ──
 extern fn basic_abs_double(...) callconv(.c) f64;
 extern fn basic_sqrt(...) callconv(.c) f64;
+
+// ── C libm bare-name stubs for JIT alias table ──
+// Zig names avoid clashing with builtins; they link against the
+// C library symbols via @export / callconv(.c).
+fn libm_sinh(x: f64) callconv(.c) f64 {
+    return @call(.auto, std.math.sinh, .{x});
+}
+fn libm_cosh(x: f64) callconv(.c) f64 {
+    return @call(.auto, std.math.cosh, .{x});
+}
+fn libm_tanh(x: f64) callconv(.c) f64 {
+    return @call(.auto, std.math.tanh, .{x});
+}
+fn libm_hypot(x: f64, y: f64) callconv(.c) f64 {
+    return @call(.auto, std.math.hypot, .{ x, y });
+}
+fn libm_cbrt(x: f64) callconv(.c) f64 {
+    return @call(.auto, std.math.cbrt, .{x});
+}
 extern fn basic_pow(...) callconv(.c) f64;
 extern fn basic_sin(...) callconv(.c) f64;
 extern fn basic_cos(...) callconv(.c) f64;
@@ -731,6 +750,31 @@ const entry_names = [_][]const u8{
     "_basic_randomize",
     "_basic_round",
 
+    // ── Bare C math aliases (QBE IL emits $sqrt, $pow, etc.) ──
+    "_sqrt",
+    "_pow",
+    "_fabs",
+    "_sin",
+    "_cos",
+    "_tan",
+    "_asin",
+    "_acos",
+    "_atan",
+    "_atan2",
+    "_log",
+    "_log10",
+    "_exp",
+    "_floor",
+    "_ceil",
+    "_round",
+    "_trunc",
+    "_sinh",
+    "_cosh",
+    "_tanh",
+    "_hypot",
+    "_cbrt",
+    "_math_cint",
+
     // ── Error / exception ──
     "_basic_error_msg",
     "_basic_throw",
@@ -1105,6 +1149,31 @@ fn initEntries() void {
         fnAddr(basic_rnd_int),
         fnAddr(basic_randomize),
         fnAddr(basic_round),
+
+        // ── Bare C math aliases (QBE IL emits $sqrt, $pow, etc.) ──
+        fnAddr(basic_sqrt), // _sqrt   → basic_sqrt
+        fnAddr(basic_pow), // _pow    → basic_pow
+        fnAddr(basic_abs_double), // _fabs   → basic_abs_double
+        fnAddr(basic_sin), // _sin    → basic_sin
+        fnAddr(basic_cos), // _cos    → basic_cos
+        fnAddr(basic_tan), // _tan    → basic_tan
+        fnAddr(basic_asin), // _asin   → basic_asin
+        fnAddr(basic_acos), // _acos   → basic_acos
+        fnAddr(basic_atan), // _atan   → basic_atan
+        fnAddr(basic_atan2), // _atan2  → basic_atan2
+        fnAddr(basic_log), // _log    → basic_log
+        fnAddr(basic_log10), // _log10  → basic_log10
+        fnAddr(basic_exp), // _exp    → basic_exp
+        fnAddr(basic_floor), // _floor  → basic_floor
+        fnAddr(basic_ceil), // _ceil   → basic_ceil
+        fnAddr(basic_round), // _round  → basic_round
+        fnAddr(basic_fix), // _trunc  → basic_fix (trunc)
+        fnAddr(libm_sinh), // _sinh
+        fnAddr(libm_cosh), // _cosh
+        fnAddr(libm_tanh), // _tanh
+        fnAddr(libm_hypot), // _hypot
+        fnAddr(libm_cbrt), // _cbrt
+        fnAddr(math_cint), // _math_cint
 
         // ── Error / exception ──
         fnAddr(basic_error_msg),

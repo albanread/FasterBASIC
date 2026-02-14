@@ -851,7 +851,13 @@ jc_ins(Ins *i, JC *e)
             ji = jit_grow(e->jc);
             if (!ji) return;
             ji->kind = JIT_FCVTZS;
-            ji->cls = jcls;
+            /* cls must reflect the SOURCE fp type (S or D), not the
+               destination int type, so the encoder picks the correct
+               fcvtzs Wd,Dn vs fcvtzs Wd,Sn variant.
+               is_float carries dest-is-64-bit (Kl) so the encoder can
+               emit fcvtzs Xd,Dn when the result is a 64-bit integer. */
+            ji->cls = (i->op == Odtosi) ? JIT_CLS_D : JIT_CLS_S;
+            ji->is_float = (i->cls == Kl) ? 1 : 0;
             ji->rd = mapreg(i->to.val);
             ji->rn = mapreg(i->arg[0].val);
             return;
@@ -860,7 +866,8 @@ jc_ins(Ins *i, JC *e)
             ji = jit_grow(e->jc);
             if (!ji) return;
             ji->kind = JIT_FCVTZU;
-            ji->cls = jcls;
+            ji->cls = (i->op == Odtoui) ? JIT_CLS_D : JIT_CLS_S;
+            ji->is_float = (i->cls == Kl) ? 1 : 0;
             ji->rd = mapreg(i->to.val);
             ji->rn = mapreg(i->arg[0].val);
             return;
@@ -869,7 +876,11 @@ jc_ins(Ins *i, JC *e)
             ji = jit_grow(e->jc);
             if (!ji) return;
             ji->kind = JIT_SCVTF;
+            /* cls = dest FP type (S or D) for scalarSizeFromCls.
+               is_float carries source-is-64-bit so the encoder can
+               emit scvtf Dd,Xn when the source is a 64-bit integer. */
             ji->cls = jcls;
+            ji->is_float = (i->op == Osltof) ? 1 : 0;
             ji->rd = mapreg(i->to.val);
             ji->rn = mapreg(i->arg[0].val);
             return;
@@ -879,6 +890,7 @@ jc_ins(Ins *i, JC *e)
             if (!ji) return;
             ji->kind = JIT_UCVTF;
             ji->cls = jcls;
+            ji->is_float = (i->op == Oultof) ? 1 : 0;
             ji->rd = mapreg(i->to.val);
             ji->rn = mapreg(i->arg[0].val);
             return;

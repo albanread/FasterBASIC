@@ -1024,40 +1024,48 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
 
         .JIT_FCVTZS => {
             // Float → signed int (truncate)
+            // cls = source FP type (S or D), is_float = dest is 64-bit int
             const rd = mapGPRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd", inst.rd, e);
             const rn = mapNeonRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn(neon)", inst.rn, e);
             const size = scalarSizeFromCls(inst.cls);
-            const word = if (inst.is64()) enc.emitNeonFcvtzsGen64(rd, rn, size) else enc.emitNeonFcvtzsGen(rd, rn, size);
+            const dest_is_64 = inst.is_float != 0;
+            const word = if (dest_is_64) enc.emitNeonFcvtzsGen64(rd, rn, size) else enc.emitNeonFcvtzsGen(rd, rn, size);
             mod.emitWord(word) catch |e| {
                 mod.addDiag(.Error, inst_index, "FCVTZS emit failed: {s}", .{@errorName(e)});
             };
         },
 
         .JIT_FCVTZU => {
+            // cls = source FP type (S or D), is_float = dest is 64-bit int
             const rd = mapGPRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd", inst.rd, e);
             const rn = mapNeonRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn(neon)", inst.rn, e);
             const size = scalarSizeFromCls(inst.cls);
-            const word = if (inst.is64()) enc.emitNeonFcvtzuGen64(rd, rn, size) else enc.emitNeonFcvtzuGen(rd, rn, size);
+            const dest_is_64 = inst.is_float != 0;
+            const word = if (dest_is_64) enc.emitNeonFcvtzuGen64(rd, rn, size) else enc.emitNeonFcvtzuGen(rd, rn, size);
             mod.emitWord(word) catch |e| {
                 mod.addDiag(.Error, inst_index, "FCVTZU emit failed: {s}", .{@errorName(e)});
             };
         },
 
         .JIT_SCVTF => {
+            // cls = dest FP type (S or D), is_float = source is 64-bit int
             const rd = mapNeonRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd(neon)", inst.rd, e);
             const rn = mapGPRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn", inst.rn, e);
             const size = scalarSizeFromCls(inst.cls);
-            const word = if (inst.is64()) enc.emitNeonScvtfGen64(rd, rn, size) else enc.emitNeonScvtfGen(rd, rn, size);
+            const src_is_64 = inst.is_float != 0;
+            const word = if (src_is_64) enc.emitNeonScvtfGen64(rd, rn, size) else enc.emitNeonScvtfGen(rd, rn, size);
             mod.emitWord(word) catch |e| {
                 mod.addDiag(.Error, inst_index, "SCVTF emit failed: {s}", .{@errorName(e)});
             };
         },
 
         .JIT_UCVTF => {
+            // cls = dest FP type (S or D), is_float = source is 64-bit int
             const rd = mapNeonRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd(neon)", inst.rd, e);
             const rn = mapGPRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn", inst.rn, e);
             const size = scalarSizeFromCls(inst.cls);
-            const word = if (inst.is64()) enc.emitNeonUcvtfGen64(rd, rn, size) else enc.emitNeonUcvtfGen(rd, rn, size);
+            const src_is_64 = inst.is_float != 0;
+            const word = if (src_is_64) enc.emitNeonUcvtfGen64(rd, rn, size) else enc.emitNeonUcvtfGen(rd, rn, size);
             mod.emitWord(word) catch |e| {
                 mod.addDiag(.Error, inst_index, "UCVTF emit failed: {s}", .{@errorName(e)});
             };
