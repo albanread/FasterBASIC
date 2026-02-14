@@ -30,6 +30,24 @@ const Tag = token.Tag;
 const SourceLocation = token.SourceLocation;
 
 // ═══════════════════════════════════════════════════════════════════════════
+// bufPrintDupe — Fast formatting helper that avoids ArrayList overhead.
+//
+// Formats into a small stack buffer, then dupes the result onto the arena
+// allocator.  Falls back to std.fmt.allocPrint for the rare case where the
+// formatted string exceeds the stack buffer (256 bytes — more than enough
+// for temp names, labels, call-arg lists, and comments).
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn bufPrintDupe(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error![]u8 {
+    var buf: [256]u8 = undefined;
+    const result = std.fmt.bufPrint(&buf, fmt, args) catch {
+        // Formatted string too large for stack buffer — fall back.
+        return std.fmt.allocPrint(allocator, fmt, args);
+    };
+    return allocator.dupe(u8, result);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // FunctionContext — Tracks parameters, locals, and return value for the
 //                   currently-emitting function/sub.
 // ═══════════════════════════════════════════════════════════════════════════
@@ -281,7 +299,7 @@ pub const QBEBuilder = struct {
     pub fn newTemp(self: *QBEBuilder) ![]const u8 {
         const n = self.temp_counter;
         self.temp_counter += 1;
-        return std.fmt.allocPrint(self.allocator, "%t.{d}", .{n});
+        return bufPrintDupe(self.allocator, "%t.{d}", .{n});
     }
 
     /// Get next unique label ID.
@@ -477,7 +495,7 @@ pub const QBEBuilder = struct {
         }
         const n = self.string_counter;
         self.string_counter += 1;
-        const label = try std.fmt.allocPrint(self.allocator, "str_{d}", .{n});
+        const label = try bufPrintDupe(self.allocator, "str_{d}", .{n});
         const owned_value = try self.allocator.dupe(u8, value);
         try self.string_pool.put(owned_value, label);
         return label;
@@ -722,28 +740,28 @@ pub const SymbolMapper = struct {
     pub fn globalVarName(self: *const SymbolMapper, name: []const u8, suffix: ?Tag) ![]const u8 {
         const base = stripSuffix(name);
         const type_tag = suffixString(suffix);
-        return std.fmt.allocPrint(self.allocator, "var_{s}{s}", .{ base, type_tag });
+        return bufPrintDupe(self.allocator, "var_{s}{s}", .{ base, type_tag });
     }
 
     /// Mangle a local variable name: %name or %name_type.
     pub fn localVarName(self: *const SymbolMapper, name: []const u8, suffix: ?Tag) ![]const u8 {
         const base = stripSuffix(name);
         const type_tag = suffixString(suffix);
-        return std.fmt.allocPrint(self.allocator, "%{s}{s}", .{ base, type_tag });
+        return bufPrintDupe(self.allocator, "%{s}{s}", .{ base, type_tag });
     }
 
     /// Mangle a function name: MyFunc → "func_MYFUNC".
     pub fn functionName(self: *const SymbolMapper, name: []const u8) ![]const u8 {
         var buf: [128]u8 = undefined;
         const upper = toUpperBuf(name, &buf);
-        return std.fmt.allocPrint(self.allocator, "func_{s}", .{upper});
+        return bufPrintDupe(self.allocator, "func_{s}", .{upper});
     }
 
     /// Mangle a SUB name: MySub → "sub_MYSUB".
     pub fn subName(self: *const SymbolMapper, name: []const u8) ![]const u8 {
         var buf: [128]u8 = undefined;
         const upper = toUpperBuf(name, &buf);
-        return std.fmt.allocPrint(self.allocator, "sub_{s}", .{upper});
+        return bufPrintDupe(self.allocator, "sub_{s}", .{upper});
     }
 
     /// Mangle an array descriptor name: arr$ → "arr_ARR_str_desc".
@@ -764,32 +782,32 @@ pub const SymbolMapper = struct {
         const base = stripSuffix(name);
         var buf: [128]u8 = undefined;
         const upper = toUpperBuf(base, &buf);
-        return std.fmt.allocPrint(self.allocator, "arr_{s}{s}_desc", .{ upper, type_tag });
+        return bufPrintDupe(self.allocator, "arr_{s}{s}_desc", .{ upper, type_tag });
     }
 
     /// Mangle a class method name: ClassName.MethodName → "ClassName__MethodName".
     pub fn classMethodName(self: *const SymbolMapper, class_name: []const u8, method_name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}__{s}", .{ class_name, method_name });
+        return bufPrintDupe(self.allocator, "{s}__{s}", .{ class_name, method_name });
     }
 
     /// Mangle a class constructor name.
     pub fn classConstructorName(self: *const SymbolMapper, class_name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}__CONSTRUCTOR", .{class_name});
+        return bufPrintDupe(self.allocator, "{s}__CONSTRUCTOR", .{class_name});
     }
 
     /// Mangle a class destructor name.
     pub fn classDestructorName(self: *const SymbolMapper, class_name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "{s}__DESTRUCTOR", .{class_name});
+        return bufPrintDupe(self.allocator, "{s}__DESTRUCTOR", .{class_name});
     }
 
     /// Mangle a vtable data name.
     pub fn vtableName(self: *const SymbolMapper, class_name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "vtable_{s}", .{class_name});
+        return bufPrintDupe(self.allocator, "vtable_{s}", .{class_name});
     }
 
     /// Mangle a class name string constant name.
     pub fn classNameStringLabel(self: *const SymbolMapper, class_name: []const u8) ![]const u8 {
-        return std.fmt.allocPrint(self.allocator, "classname_{s}", .{class_name});
+        return bufPrintDupe(self.allocator, "classname_{s}", .{class_name});
     }
 
     /// Register a variable as SHARED.
@@ -1757,7 +1775,7 @@ pub const ExprEmitter = struct {
         const raw_ptr = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy ${s}\n", .{ raw_ptr, label });
         const dest = try self.builder.newTemp();
-        const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{raw_ptr});
+        const args = try bufPrintDupe(self.allocator, "l {s}", .{raw_ptr});
         try self.builder.emitCall(dest, "l", "string_new_utf8", args);
         return dest;
     }
@@ -1876,7 +1894,7 @@ pub const ExprEmitter = struct {
         // POINTER to the struct (allocated by CREATE on the stack or
         // heap).  Load the pointer from the global slot with loadl.
         if (bt == .user_defined) {
-            try self.builder.emitLoad(dest, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            try self.builder.emitLoad(dest, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             return dest;
         }
 
@@ -1887,10 +1905,10 @@ pub const ExprEmitter = struct {
             try self.builder.emit("    {s} =w load{s} {s}\n", .{
                 dest,
                 if (bt == .byte or bt == .ubyte) @as([]const u8, "ub") else @as([]const u8, "sh"),
-                try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}),
+                try bufPrintDupe(self.allocator, "${s}", .{var_name}),
             });
         } else {
-            try self.builder.emitLoad(dest, qbe_t, try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            try self.builder.emitLoad(dest, qbe_t, try bufPrintDupe(self.allocator, "${s}", .{var_name}));
         }
         // SINGLE globals are loaded as 's' but the expression system
         // expects 'd' (double). Promote to double so that comparisons
@@ -1926,7 +1944,7 @@ pub const ExprEmitter = struct {
                     else
                         rhs_val;
                     const dest = try self.builder.newTemp();
-                    const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ lhs_str, rhs_str });
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ lhs_str, rhs_str });
                     try self.builder.emitCall(dest, "l", "string_concat", args);
                     return dest;
                 },
@@ -1935,7 +1953,7 @@ pub const ExprEmitter = struct {
                     const lhs = try self.emitExpression(left);
                     const rhs_val = try self.emitExpression(right);
                     const cmp_result = try self.builder.newTemp();
-                    const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ lhs, rhs_val });
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ lhs, rhs_val });
                     try self.builder.emitCall(cmp_result, "w", "string_compare", args);
                     const dest = try self.builder.newTemp();
                     switch (op) {
@@ -2022,7 +2040,7 @@ pub const ExprEmitter = struct {
                 // Power always uses doubles.
                 const pow_lhs = if (left_type == .integer) try self.emitIntToDouble(lhs) else lhs;
                 const pow_rhs = if (right_type == .integer) try self.emitIntToDouble(rhs) else rhs;
-                const args = try std.fmt.allocPrint(self.allocator, "d {s}, d {s}", .{ pow_lhs, pow_rhs });
+                const args = try bufPrintDupe(self.allocator, "d {s}, d {s}", .{ pow_lhs, pow_rhs });
                 try self.builder.emitCall(dest, "d", "pow", args);
             },
             .int_divide => {
@@ -2093,11 +2111,11 @@ pub const ExprEmitter = struct {
                     try self.builder.emitExtend(ext, "l", "extsw", temp);
                     break :blk ext;
                 };
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{long_val});
+                const args = try bufPrintDupe(self.allocator, "l {s}", .{long_val});
                 try self.builder.emitCall(dest, "l", "string_from_int", args);
             },
             .double => {
-                const args = try std.fmt.allocPrint(self.allocator, "d {s}", .{temp});
+                const args = try bufPrintDupe(self.allocator, "d {s}", .{temp});
                 try self.builder.emitCall(dest, "l", "string_from_double", args);
             },
             .string => return temp, // already a string
@@ -2327,9 +2345,9 @@ pub const ExprEmitter = struct {
                 }
                 // Branchless select: result = cmp ? a : b
                 const id = self.builder.nextLabelId();
-                const pick_a = try std.fmt.allocPrint(self.allocator, "sel_a_{d}", .{id});
-                const pick_b = try std.fmt.allocPrint(self.allocator, "sel_b_{d}", .{id});
-                const sel_done = try std.fmt.allocPrint(self.allocator, "sel_d_{d}", .{id});
+                const pick_a = try bufPrintDupe(self.allocator, "sel_a_{d}", .{id});
+                const pick_b = try bufPrintDupe(self.allocator, "sel_b_{d}", .{id});
+                const sel_done = try bufPrintDupe(self.allocator, "sel_d_{d}", .{id});
                 try self.builder.emitBranch(cmp, pick_a, pick_b);
                 try self.builder.emitLabel(pick_a);
                 const va = try self.builder.newTemp();
@@ -2354,9 +2372,9 @@ pub const ExprEmitter = struct {
                     try self.builder.emit("    {s} =w cltd {s}, {s}\n", .{ cmp, da, db });
                 }
                 const id = self.builder.nextLabelId();
-                const pick_a = try std.fmt.allocPrint(self.allocator, "sel_a_{d}", .{id});
-                const pick_b = try std.fmt.allocPrint(self.allocator, "sel_b_{d}", .{id});
-                const sel_done = try std.fmt.allocPrint(self.allocator, "sel_d_{d}", .{id});
+                const pick_a = try bufPrintDupe(self.allocator, "sel_a_{d}", .{id});
+                const pick_b = try bufPrintDupe(self.allocator, "sel_b_{d}", .{id});
+                const sel_done = try bufPrintDupe(self.allocator, "sel_d_{d}", .{id});
                 try self.builder.emitBranch(cmp, pick_a, pick_b);
                 try self.builder.emitLabel(pick_a);
                 const va = try self.builder.newTemp();
@@ -2387,9 +2405,9 @@ pub const ExprEmitter = struct {
             if (arguments.len >= 1) {
                 const str_ptr = try self.emitExpression(arguments[0]);
                 const id = self.builder.nextLabelId();
-                const load_lbl = try std.fmt.allocPrint(self.allocator, "len_load_{d}", .{id});
-                const null_lbl = try std.fmt.allocPrint(self.allocator, "len_null_{d}", .{id});
-                const done_lbl = try std.fmt.allocPrint(self.allocator, "len_done_{d}", .{id});
+                const load_lbl = try bufPrintDupe(self.allocator, "len_load_{d}", .{id});
+                const null_lbl = try bufPrintDupe(self.allocator, "len_null_{d}", .{id});
+                const done_lbl = try bufPrintDupe(self.allocator, "len_done_{d}", .{id});
 
                 // NULL check
                 const is_null = try self.builder.newTemp();
@@ -2407,7 +2425,7 @@ pub const ExprEmitter = struct {
                 // NULL path: length is 0
                 try self.builder.emitLabel(null_lbl);
                 const zero = try self.builder.newTemp();
-                try self.builder.emitInstruction(try std.fmt.allocPrint(
+                try self.builder.emitInstruction(try bufPrintDupe(
                     self.allocator,
                     "{s} =l copy 0",
                     .{zero},
@@ -2417,7 +2435,7 @@ pub const ExprEmitter = struct {
                 // Merge
                 try self.builder.emitLabel(done_lbl);
                 const result = try self.builder.newTemp();
-                try self.builder.emitInstruction(try std.fmt.allocPrint(
+                try self.builder.emitInstruction(try bufPrintDupe(
                     self.allocator,
                     "{s} =l phi @{s} {s}, @{s} {s}",
                     .{ result, load_lbl, loaded, null_lbl, zero },
@@ -2480,7 +2498,7 @@ pub const ExprEmitter = struct {
                     // Double ABS: call fabs
                     const dval = if (arg_type == .integer) try self.emitIntToDouble(arg_val) else arg_val;
                     const result = try self.builder.newTemp();
-                    try self.builder.emitCall(result, "d", "fabs", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+                    try self.builder.emitCall(result, "d", "fabs", try bufPrintDupe(self.allocator, "d {s}", .{dval}));
                     return result;
                 }
             }
@@ -2650,9 +2668,9 @@ pub const ExprEmitter = struct {
         const cond = try self.emitExpression(condition);
         const cond_type = self.inferExprType(condition);
         const id = self.builder.nextLabelId();
-        const true_label = try std.fmt.allocPrint(self.allocator, "iif_true_{d}", .{id});
-        const false_label = try std.fmt.allocPrint(self.allocator, "iif_false_{d}", .{id});
-        const done_label = try std.fmt.allocPrint(self.allocator, "iif_done_{d}", .{id});
+        const true_label = try bufPrintDupe(self.allocator, "iif_true_{d}", .{id});
+        const false_label = try bufPrintDupe(self.allocator, "iif_false_{d}", .{id});
+        const done_label = try bufPrintDupe(self.allocator, "iif_done_{d}", .{id});
 
         // Only convert to integer if condition is a double; if already
         // integer (e.g. from a comparison) use it directly.
@@ -2699,10 +2717,10 @@ pub const ExprEmitter = struct {
         if (object.data == .me) {
             if (self.class_ctx) |cls| {
                 if (cls.findField(member_name)) |field_info| {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "CLASS field access: {s}.{s} (offset {d})", .{ cls.name, member_name, field_info.offset }));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "CLASS field access: {s}.{s} (offset {d})", .{ cls.name, member_name, field_info.offset }));
                     const field_addr = try self.builder.newTemp();
                     if (field_info.offset > 0) {
-                        try self.builder.emitBinary(field_addr, "l", "add", "%me", try std.fmt.allocPrint(self.allocator, "{d}", .{field_info.offset}));
+                        try self.builder.emitBinary(field_addr, "l", "add", "%me", try bufPrintDupe(self.allocator, "{d}", .{field_info.offset}));
                     } else {
                         try self.builder.emit("    {s} =l copy %me\n", .{field_addr});
                     }
@@ -2726,10 +2744,10 @@ pub const ExprEmitter = struct {
 
             if (self.symbol_table.lookupClass(cu_name)) |cls| {
                 if (cls.findField(member_name)) |field_info| {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "CLASS field access: {s}.{s} (offset {d})", .{ cls.name, member_name, field_info.offset }));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "CLASS field access: {s}.{s} (offset {d})", .{ cls.name, member_name, field_info.offset }));
                     const field_addr = try self.builder.newTemp();
                     if (field_info.offset > 0) {
-                        try self.builder.emitBinary(field_addr, "l", "add", obj_addr, try std.fmt.allocPrint(self.allocator, "{d}", .{field_info.offset}));
+                        try self.builder.emitBinary(field_addr, "l", "add", obj_addr, try bufPrintDupe(self.allocator, "{d}", .{field_info.offset}));
                     } else {
                         try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, obj_addr });
                     }
@@ -2758,7 +2776,7 @@ pub const ExprEmitter = struct {
                     if (std.mem.eql(u8, field.name, member_name)) {
                         const field_addr = try self.builder.newTemp();
                         if (offset > 0) {
-                            try self.builder.emitBinary(field_addr, "l", "add", obj_addr, try std.fmt.allocPrint(self.allocator, "{d}", .{offset}));
+                            try self.builder.emitBinary(field_addr, "l", "add", obj_addr, try bufPrintDupe(self.allocator, "{d}", .{offset}));
                         } else {
                             try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, obj_addr });
                         }
@@ -2790,7 +2808,7 @@ pub const ExprEmitter = struct {
         }
 
         // Fallback: unknown member, load as double from base address.
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unresolved member .{s}", .{member_name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unresolved member .{s}", .{member_name}));
         const dest = try self.builder.newTemp();
         try self.builder.emitLoad(dest, "d", obj_addr);
         return dest;
@@ -3009,7 +3027,7 @@ pub const ExprEmitter = struct {
         if (object.data == .me) {
             if (self.class_ctx) |cls| {
                 if (cls.findMethod(method_name)) |method_info| {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ME.{s}() - direct call", .{method_name}));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "ME.{s}() - direct call", .{method_name}));
 
                     var call_args: std.ArrayList(u8) = .empty;
                     defer call_args.deinit(self.allocator);
@@ -3073,14 +3091,14 @@ pub const ExprEmitter = struct {
                     if (arguments.len >= 1) {
                         const key_val = try self.emitExpression(arguments[0]);
                         const cstr = try self.builder.newTemp();
-                        try self.builder.emitCall(cstr, "l", "string_to_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_val}));
+                        try self.builder.emitCall(cstr, "l", "string_to_utf8", try bufPrintDupe(self.allocator, "l {s}", .{key_val}));
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "w", "hashmap_has_key", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, cstr }));
+                        try self.builder.emitCall(dest, "w", "hashmap_has_key", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, cstr }));
                         return dest;
                     }
                 } else if (std.mem.eql(u8, mupper, "SIZE")) {
                     const dest = try self.builder.newTemp();
-                    try self.builder.emitCall(dest, "l", "hashmap_size", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(dest, "l", "hashmap_size", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     const dest_w = try self.builder.newTemp();
                     try self.builder.emitTrunc(dest_w, "w", dest);
                     return dest_w;
@@ -3088,22 +3106,22 @@ pub const ExprEmitter = struct {
                     if (arguments.len >= 1) {
                         const key_val = try self.emitExpression(arguments[0]);
                         const cstr = try self.builder.newTemp();
-                        try self.builder.emitCall(cstr, "l", "string_to_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_val}));
+                        try self.builder.emitCall(cstr, "l", "string_to_utf8", try bufPrintDupe(self.allocator, "l {s}", .{key_val}));
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "w", "hashmap_remove", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, cstr }));
+                        try self.builder.emitCall(dest, "w", "hashmap_remove", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, cstr }));
                         return dest;
                     }
                 } else if (std.mem.eql(u8, mupper, "CLEAR")) {
-                    try self.builder.emitCall("", "", "hashmap_clear", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall("", "", "hashmap_clear", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     const dest = try self.builder.newTemp();
                     try self.builder.emit("    {s} =w copy 0\n", .{dest});
                     return dest;
                 } else if (std.mem.eql(u8, mupper, "KEYS")) {
                     const dest = try self.builder.newTemp();
-                    try self.builder.emitCall(dest, "l", "hashmap_keys", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(dest, "l", "hashmap_keys", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     return dest;
                 } else {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unknown HASHMAP method .{s}", .{method_name}));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unknown HASHMAP method .{s}", .{method_name}));
                 }
             }
         }
@@ -3122,7 +3140,7 @@ pub const ExprEmitter = struct {
                     if (arguments.len >= 1) {
                         const arg_val = try self.emitExpression(arguments[0]);
                         if (elt.isString()) {
-                            try self.builder.emitCall("", "", "list_append_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
+                            try self.builder.emitCall("", "", "list_append_string", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
                         } else if (elt.isFloat() or elt == .single) {
                             // Ensure value is double for list_append_float
                             const arg_et = self.inferExprType(arguments[0]);
@@ -3131,7 +3149,7 @@ pub const ExprEmitter = struct {
                                 try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
                                 break :blk cvt;
                             } else arg_val;
-                            try self.builder.emitCall("", "", "list_append_float", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
+                            try self.builder.emitCall("", "", "list_append_float", try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
                         } else {
                             // integer or unknown → list_append_int (int64_t)
                             const arg_et = self.inferExprType(arguments[0]);
@@ -3144,7 +3162,7 @@ pub const ExprEmitter = struct {
                                 try self.builder.emitConvert(cvt, "l", "dtosi", arg_val);
                                 break :blk cvt;
                             } else arg_val;
-                            try self.builder.emitCall("", "", "list_append_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
+                            try self.builder.emitCall("", "", "list_append_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
                         }
                     }
                     const dest = try self.builder.newTemp();
@@ -3154,7 +3172,7 @@ pub const ExprEmitter = struct {
                     if (arguments.len >= 1) {
                         const arg_val = try self.emitExpression(arguments[0]);
                         if (elt.isString()) {
-                            try self.builder.emitCall("", "", "list_prepend_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
+                            try self.builder.emitCall("", "", "list_prepend_string", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
                         } else if (elt.isFloat() or elt == .single) {
                             const arg_et = self.inferExprType(arguments[0]);
                             const fval = if (arg_et == .integer) blk: {
@@ -3162,7 +3180,7 @@ pub const ExprEmitter = struct {
                                 try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
                                 break :blk cvt;
                             } else arg_val;
-                            try self.builder.emitCall("", "", "list_prepend_float", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
+                            try self.builder.emitCall("", "", "list_prepend_float", try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
                         } else {
                             const arg_et = self.inferExprType(arguments[0]);
                             const ival = if (arg_et == .integer) blk: {
@@ -3174,7 +3192,7 @@ pub const ExprEmitter = struct {
                                 try self.builder.emitConvert(cvt, "l", "dtosi", arg_val);
                                 break :blk cvt;
                             } else arg_val;
-                            try self.builder.emitCall("", "", "list_prepend_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
+                            try self.builder.emitCall("", "", "list_prepend_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
                         }
                     }
                     const dest = try self.builder.newTemp();
@@ -3182,27 +3200,27 @@ pub const ExprEmitter = struct {
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "LENGTH")) {
                     const raw = try self.builder.newTemp();
-                    try self.builder.emitCall(raw, "l", "list_length", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(raw, "l", "list_length", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     // Truncate int64_t → w for ExprType.integer
                     const dest = try self.builder.newTemp();
                     try self.builder.emitTrunc(dest, "w", raw);
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "EMPTY")) {
                     const dest = try self.builder.newTemp();
-                    try self.builder.emitCall(dest, "w", "list_empty", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(dest, "w", "list_empty", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "HEAD")) {
                     if (elt.isString()) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "l", "list_head_ptr", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "l", "list_head_ptr", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else if (elt.isFloat() or elt == .single) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "d", "list_head_float", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "d", "list_head_float", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else {
                         const raw = try self.builder.newTemp();
-                        try self.builder.emitCall(raw, "l", "list_head_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(raw, "l", "list_head_int", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         const dest = try self.builder.newTemp();
                         try self.builder.emitTrunc(dest, "w", raw);
                         return dest;
@@ -3223,15 +3241,15 @@ pub const ExprEmitter = struct {
                         } else idx_val;
                         if (elt.isString()) {
                             const dest = try self.builder.newTemp();
-                            try self.builder.emitCall(dest, "l", "list_get_ptr", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
+                            try self.builder.emitCall(dest, "l", "list_get_ptr", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
                             return dest;
                         } else if (elt.isFloat() or elt == .single) {
                             const dest = try self.builder.newTemp();
-                            try self.builder.emitCall(dest, "d", "list_get_float", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
+                            try self.builder.emitCall(dest, "d", "list_get_float", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
                             return dest;
                         } else {
                             const raw = try self.builder.newTemp();
-                            try self.builder.emitCall(raw, "l", "list_get_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
+                            try self.builder.emitCall(raw, "l", "list_get_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
                             const dest = try self.builder.newTemp();
                             try self.builder.emitTrunc(dest, "w", raw);
                             return dest;
@@ -3242,7 +3260,7 @@ pub const ExprEmitter = struct {
                         const arg_val = try self.emitExpression(arguments[0]);
                         if (elt.isString()) {
                             const dest = try self.builder.newTemp();
-                            try self.builder.emitCall(dest, "w", "list_contains_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
+                            try self.builder.emitCall(dest, "w", "list_contains_string", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
                             return dest;
                         } else if (elt.isFloat() or elt == .single) {
                             const arg_et = self.inferExprType(arguments[0]);
@@ -3252,7 +3270,7 @@ pub const ExprEmitter = struct {
                                 break :blk cvt;
                             } else arg_val;
                             const dest = try self.builder.newTemp();
-                            try self.builder.emitCall(dest, "w", "list_contains_float", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
+                            try self.builder.emitCall(dest, "w", "list_contains_float", try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
                             return dest;
                         } else {
                             const arg_et = self.inferExprType(arguments[0]);
@@ -3266,7 +3284,7 @@ pub const ExprEmitter = struct {
                                 break :blk cvt;
                             } else arg_val;
                             const dest = try self.builder.newTemp();
-                            try self.builder.emitCall(dest, "w", "list_contains_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
+                            try self.builder.emitCall(dest, "w", "list_contains_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
                             return dest;
                         }
                     }
@@ -3275,7 +3293,7 @@ pub const ExprEmitter = struct {
                         const arg_val = try self.emitExpression(arguments[0]);
                         if (elt.isString()) {
                             const raw = try self.builder.newTemp();
-                            try self.builder.emitCall(raw, "l", "list_indexof_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
+                            try self.builder.emitCall(raw, "l", "list_indexof_string", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, arg_val }));
                             const dest = try self.builder.newTemp();
                             try self.builder.emitTrunc(dest, "w", raw);
                             return dest;
@@ -3287,7 +3305,7 @@ pub const ExprEmitter = struct {
                                 break :blk cvt;
                             } else arg_val;
                             const raw = try self.builder.newTemp();
-                            try self.builder.emitCall(raw, "l", "list_indexof_float", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
+                            try self.builder.emitCall(raw, "l", "list_indexof_float", try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ obj_val, fval }));
                             const dest = try self.builder.newTemp();
                             try self.builder.emitTrunc(dest, "w", raw);
                             return dest;
@@ -3303,7 +3321,7 @@ pub const ExprEmitter = struct {
                                 break :blk cvt;
                             } else arg_val;
                             const raw = try self.builder.newTemp();
-                            try self.builder.emitCall(raw, "l", "list_indexof_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
+                            try self.builder.emitCall(raw, "l", "list_indexof_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, ival }));
                             const dest = try self.builder.newTemp();
                             try self.builder.emitTrunc(dest, "w", raw);
                             return dest;
@@ -3312,15 +3330,15 @@ pub const ExprEmitter = struct {
                 } else if (std.mem.eql(u8, lmupper, "SHIFT")) {
                     if (elt.isString()) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "l", "list_shift_ptr", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "l", "list_shift_ptr", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else if (elt.isFloat() or elt == .single) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "d", "list_shift_float", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "d", "list_shift_float", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else {
                         const raw = try self.builder.newTemp();
-                        try self.builder.emitCall(raw, "l", "list_shift_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(raw, "l", "list_shift_int", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         const dest = try self.builder.newTemp();
                         try self.builder.emitTrunc(dest, "w", raw);
                         return dest;
@@ -3328,15 +3346,15 @@ pub const ExprEmitter = struct {
                 } else if (std.mem.eql(u8, lmupper, "POP")) {
                     if (elt.isString()) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "l", "list_pop_ptr", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "l", "list_pop_ptr", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else if (elt.isFloat() or elt == .single) {
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "d", "list_pop_float", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(dest, "d", "list_pop_float", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         return dest;
                     } else {
                         const raw = try self.builder.newTemp();
-                        try self.builder.emitCall(raw, "l", "list_pop_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                        try self.builder.emitCall(raw, "l", "list_pop_int", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                         const dest = try self.builder.newTemp();
                         try self.builder.emitTrunc(dest, "w", raw);
                         return dest;
@@ -3345,7 +3363,7 @@ pub const ExprEmitter = struct {
                     if (arguments.len >= 1) {
                         const sep_val = try self.emitExpression(arguments[0]);
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "l", "list_join", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, sep_val }));
+                        try self.builder.emitCall(dest, "l", "list_join", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, sep_val }));
                         return dest;
                     } else {
                         // No separator — use empty string
@@ -3353,9 +3371,9 @@ pub const ExprEmitter = struct {
                         const empty_tmp = try self.builder.newTemp();
                         try self.builder.emit("    {s} =l copy ${s}\n", .{ empty_tmp, empty_label });
                         const empty_sd = try self.builder.newTemp();
-                        try self.builder.emitCall(empty_sd, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{empty_tmp}));
+                        try self.builder.emitCall(empty_sd, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{empty_tmp}));
                         const dest = try self.builder.newTemp();
-                        try self.builder.emitCall(dest, "l", "list_join", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, empty_sd }));
+                        try self.builder.emitCall(dest, "l", "list_join", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, empty_sd }));
                         return dest;
                     }
                 } else if (std.mem.eql(u8, lmupper, "REMOVE")) {
@@ -3371,26 +3389,26 @@ pub const ExprEmitter = struct {
                             try self.builder.emitConvert(cvt, "l", "dtosi", idx_val);
                             break :blk cvt;
                         } else idx_val;
-                        try self.builder.emitCall("", "", "list_remove", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
+                        try self.builder.emitCall("", "", "list_remove", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ obj_val, idx_l }));
                     }
                     const dest = try self.builder.newTemp();
                     try self.builder.emit("    {s} =w copy 0\n", .{dest});
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "CLEAR")) {
-                    try self.builder.emitCall("", "", "list_clear", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall("", "", "list_clear", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     const dest = try self.builder.newTemp();
                     try self.builder.emit("    {s} =w copy 0\n", .{dest});
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "COPY")) {
                     const dest = try self.builder.newTemp();
-                    try self.builder.emitCall(dest, "l", "list_copy", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(dest, "l", "list_copy", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     return dest;
                 } else if (std.mem.eql(u8, lmupper, "REVERSE")) {
                     const dest = try self.builder.newTemp();
-                    try self.builder.emitCall(dest, "l", "list_reverse", try std.fmt.allocPrint(self.allocator, "l {s}", .{obj_val}));
+                    try self.builder.emitCall(dest, "l", "list_reverse", try bufPrintDupe(self.allocator, "l {s}", .{obj_val}));
                     return dest;
                 } else {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unknown LIST method .{s}", .{method_name}));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unknown LIST method .{s}", .{method_name}));
                 }
             }
         }
@@ -3405,7 +3423,7 @@ pub const ExprEmitter = struct {
 
             if (self.symbol_table.lookupClass(cu_name)) |cls| {
                 if (cls.findMethod(method_name)) |method_info| {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "vtable dispatch: {s}.{s}() slot={d}", .{ cls.name, method_name, method_info.vtable_slot }));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "vtable dispatch: {s}.{s}() slot={d}", .{ cls.name, method_name, method_info.vtable_slot }));
 
                     // Load vtable pointer from object[0]
                     const vtable_ptr = try self.builder.newTemp();
@@ -3414,7 +3432,7 @@ pub const ExprEmitter = struct {
                     // Compute method slot address: vtable + 32 + slot * 8
                     const slot_offset = 32 + method_info.vtable_slot * 8;
                     const slot_addr = try self.builder.newTemp();
-                    try self.builder.emitBinary(slot_addr, "l", "add", vtable_ptr, try std.fmt.allocPrint(self.allocator, "{d}", .{slot_offset}));
+                    try self.builder.emitBinary(slot_addr, "l", "add", vtable_ptr, try bufPrintDupe(self.allocator, "{d}", .{slot_offset}));
 
                     // Load method function pointer
                     const method_ptr = try self.builder.newTemp();
@@ -3480,7 +3498,7 @@ pub const ExprEmitter = struct {
         }
 
         const dest = try self.builder.newTemp();
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unresolved method call .{s}", .{method_name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unresolved method call .{s}", .{method_name}));
         try self.builder.emit("    {s} =l copy 0\n", .{dest});
         return dest;
     }
@@ -3494,7 +3512,7 @@ pub const ExprEmitter = struct {
 
         // ── List subscript sugar: myList(n) → list_get_* ────────────
         if (self.isListVariable(name)) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LIST subscript: {s}(...)", .{name}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "LIST subscript: {s}(...)", .{name}));
 
             // Load the list pointer from the global or local variable
             var list_ptr: []const u8 = undefined;
@@ -3509,12 +3527,12 @@ pub const ExprEmitter = struct {
                 } else {
                     const var_name = try self.symbol_mapper.globalVarName(name, null);
                     list_ptr = try self.builder.newTemp();
-                    try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                    try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
                 }
             } else {
                 const var_name = try self.symbol_mapper.globalVarName(name, null);
                 list_ptr = try self.builder.newTemp();
-                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             }
 
             // Evaluate the index expression
@@ -3536,15 +3554,15 @@ pub const ExprEmitter = struct {
             const elt = self.listElementType(name);
             if (elt.isString()) {
                 const dest = try self.builder.newTemp();
-                try self.builder.emitCall(dest, "l", "list_get_ptr", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                try self.builder.emitCall(dest, "l", "list_get_ptr", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
                 return dest;
             } else if (elt.isFloat() or elt == .single) {
                 const dest = try self.builder.newTemp();
-                try self.builder.emitCall(dest, "d", "list_get_float", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                try self.builder.emitCall(dest, "d", "list_get_float", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
                 return dest;
             } else {
                 const raw = try self.builder.newTemp();
-                try self.builder.emitCall(raw, "l", "list_get_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
+                try self.builder.emitCall(raw, "l", "list_get_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ list_ptr, idx_l }));
                 const dest = try self.builder.newTemp();
                 try self.builder.emitTrunc(dest, "w", raw);
                 return dest;
@@ -3559,7 +3577,7 @@ pub const ExprEmitter = struct {
             for (0..mlen) |mi| mup_buf[mi] = std.ascii.toUpper(mbase[mi]);
             if (cls.findMethod(mup_buf[0..mlen])) |_| {
                 // This is a method of the current class — emit as ME.Method(args)
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Self-method call: {s}(...) → ME.{s}(...)", .{ name, name }));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "Self-method call: {s}(...) → ME.{s}(...)", .{ name, name }));
                 // Build a synthetic ME expression for the object
                 const me_result = try self.emitMe();
                 return self.emitMethodCallOnPtr(me_result, mup_buf[0..mlen], name, indices, cls);
@@ -3568,23 +3586,23 @@ pub const ExprEmitter = struct {
 
         // ── Hashmap subscript: dict("key") → hashmap_lookup ─────────
         if (self.isHashmapVariable(name)) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "HASHMAP lookup: {s}(...)", .{name}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "HASHMAP lookup: {s}(...)", .{name}));
 
             // Load the hashmap pointer from the global variable
             const var_name = try self.symbol_mapper.globalVarName(name, null);
             const map_ptr = try self.builder.newTemp();
-            try self.builder.emitLoad(map_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            try self.builder.emitLoad(map_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
 
             // Evaluate the key expression (must be a string descriptor)
             const key_val = try self.emitExpression(indices[0]);
 
             // Convert StringDescriptor* → C string (char*) for hashmap API
             const key_cstr = try self.builder.newTemp();
-            try self.builder.emitCall(key_cstr, "l", "string_to_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_val}));
+            try self.builder.emitCall(key_cstr, "l", "string_to_utf8", try bufPrintDupe(self.allocator, "l {s}", .{key_val}));
 
             // Call hashmap_lookup(map, key_cstr) → returns value pointer (l)
             const result = try self.builder.newTemp();
-            try self.builder.emitCall(result, "l", "hashmap_lookup", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ map_ptr, key_cstr }));
+            try self.builder.emitCall(result, "l", "hashmap_lookup", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ map_ptr, key_cstr }));
 
             // The returned value is a StringDescriptor* (for string hashmaps)
             return result;
@@ -3605,11 +3623,11 @@ pub const ExprEmitter = struct {
         try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
         // Bounds check
-        const bc_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+        const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
         try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
 
         const elem_addr = try self.builder.newTemp();
-        const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+        const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
         try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
 
         // Determine element type: prefer the declared array element type
@@ -3662,7 +3680,7 @@ pub const ExprEmitter = struct {
             var offset: u32 = 0;
             for (type_sym.fields, 0..) |field, i| {
                 const field_addr = try self.builder.newTemp();
-                try self.builder.emitBinary(field_addr, "l", "add", addr, try std.fmt.allocPrint(self.allocator, "{d}", .{offset}));
+                try self.builder.emitBinary(field_addr, "l", "add", addr, try bufPrintDupe(self.allocator, "{d}", .{offset}));
 
                 // Determine which argument supplies this field's value.
                 // For positional CREATE: argument i maps to field i.
@@ -3727,7 +3745,7 @@ pub const ExprEmitter = struct {
                         }
                     } else if (field_bt == .string or field_bt == .unicode) {
                         // String field: retain the new string
-                        const retain_args = try std.fmt.allocPrint(self.allocator, "l {s}", .{val});
+                        const retain_args = try bufPrintDupe(self.allocator, "l {s}", .{val});
                         try self.builder.emitCall("", "", "string_retain", retain_args);
                     }
 
@@ -3770,7 +3788,7 @@ pub const ExprEmitter = struct {
         const class_id: i32 = if (cls) |c| c.class_id else 0;
 
         const obj = try self.builder.newTemp();
-        const alloc_args = try std.fmt.allocPrint(self.allocator, "l {d}, l {s}, l {d}", .{ obj_size, vtable_addr, class_id });
+        const alloc_args = try bufPrintDupe(self.allocator, "l {d}, l {s}, l {d}", .{ obj_size, vtable_addr, class_id });
         try self.builder.emitCall(obj, "l", "class_object_new", alloc_args);
 
         // Call constructor if the class has one
@@ -3879,9 +3897,9 @@ pub const ExprEmitter = struct {
             src2_name = getWholeArrayName(arguments[1]);
         }
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array reduction: {s}({s}(){s})", .{
-            func_name,                                                                                             src_name,
-            if (src2_name) |s2| try std.fmt.allocPrint(self.allocator, ", {s}()", .{s2}) else @as([]const u8, ""),
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Array reduction: {s}({s}(){s})", .{
+            func_name,                                                                                       src_name,
+            if (src2_name) |s2| try bufPrintDupe(self.allocator, ", {s}()", .{s2}) else @as([]const u8, ""),
         }));
 
         // Get source array data pointer
@@ -3901,7 +3919,7 @@ pub const ExprEmitter = struct {
         try self.builder.emitBinary(num_elements, "l", "add", upper_val, "1");
         // total_bytes = num_elements * elem_size
         const total_bytes = try self.builder.newTemp();
-        try self.builder.emitBinary(total_bytes, "l", "mul", num_elements, try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size}));
+        try self.builder.emitBinary(total_bytes, "l", "mul", num_elements, try bufPrintDupe(self.allocator, "{d}", .{elem_size}));
 
         // DOT: get second source data pointer
         var src2_data: []const u8 = "";
@@ -3943,9 +3961,9 @@ pub const ExprEmitter = struct {
         try self.builder.emit("    storel 0, {s}\n", .{cur_off_slot});
 
         const loop_id = self.builder.nextLabelId();
-        const hdr_lbl = try std.fmt.allocPrint(self.allocator, "reduce_hdr_{d}", .{loop_id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "reduce_body_{d}", .{loop_id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "reduce_done_{d}", .{loop_id});
+        const hdr_lbl = try bufPrintDupe(self.allocator, "reduce_hdr_{d}", .{loop_id});
+        const body_lbl = try bufPrintDupe(self.allocator, "reduce_body_{d}", .{loop_id});
+        const done_lbl = try bufPrintDupe(self.allocator, "reduce_done_{d}", .{loop_id});
 
         try self.builder.emitJump(hdr_lbl);
         try self.builder.emitLabel(hdr_lbl);
@@ -3997,8 +4015,8 @@ pub const ExprEmitter = struct {
                 try self.builder.emit("    {s} =w csgew {s}, {s}\n", .{ cmp_res, cur_acc, op_val });
             }
             const max_id = self.builder.nextLabelId();
-            const max_then = try std.fmt.allocPrint(self.allocator, "rmax_t_{d}", .{max_id});
-            const max_end = try std.fmt.allocPrint(self.allocator, "rmax_e_{d}", .{max_id});
+            const max_then = try bufPrintDupe(self.allocator, "rmax_t_{d}", .{max_id});
+            const max_end = try bufPrintDupe(self.allocator, "rmax_e_{d}", .{max_id});
             // Store opVal as default, conditionally overwrite with curAcc
             try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, op_val, acc_slot });
             try self.builder.emitBranch(cmp_res, max_then, max_end);
@@ -4016,8 +4034,8 @@ pub const ExprEmitter = struct {
                 try self.builder.emit("    {s} =w cslew {s}, {s}\n", .{ cmp_res, cur_acc, op_val });
             }
             const min_id = self.builder.nextLabelId();
-            const min_then = try std.fmt.allocPrint(self.allocator, "rmin_t_{d}", .{min_id});
-            const min_end = try std.fmt.allocPrint(self.allocator, "rmin_e_{d}", .{min_id});
+            const min_then = try bufPrintDupe(self.allocator, "rmin_t_{d}", .{min_id});
+            const min_end = try bufPrintDupe(self.allocator, "rmin_e_{d}", .{min_id});
             try self.builder.emit("    store{s} {s}, {s}\n", .{ qbe_type, op_val, acc_slot });
             try self.builder.emitBranch(cmp_res, min_then, min_end);
             try self.builder.emitLabel(min_then);
@@ -4028,7 +4046,7 @@ pub const ExprEmitter = struct {
 
         // Advance offset
         const next_off = try self.builder.newTemp();
-        try self.builder.emitBinary(next_off, "l", "add", off, try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size}));
+        try self.builder.emitBinary(next_off, "l", "add", off, try bufPrintDupe(self.allocator, "{d}", .{elem_size}));
         try self.builder.emit("    storel {s}, {s}\n", .{ next_off, cur_off_slot });
         try self.builder.emitJump(hdr_lbl);
 
@@ -4076,7 +4094,7 @@ pub const ExprEmitter = struct {
     /// calls like `Build(x)` inside a class method → `ME.Build(x)`).
     fn emitMethodCallOnPtr(self: *ExprEmitter, obj_ptr: []const u8, method_upper: []const u8, _: []const u8, arguments: []const ast.ExprPtr, cls: *const semantic.ClassSymbol) EmitError![]const u8 {
         if (cls.findMethod(method_upper)) |method_info| {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Self-method call: {s}.{s}()", .{ cls.name, method_upper }));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "Self-method call: {s}.{s}()", .{ cls.name, method_upper }));
 
             var call_args: std.ArrayList(u8) = .empty;
             defer call_args.deinit(self.allocator);
@@ -4125,7 +4143,7 @@ pub const ExprEmitter = struct {
         }
 
         // Fallback: method not found, return 0
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: self-method {s} not found in class {s}", .{ method_upper, cls.name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: self-method {s} not found in class {s}", .{ method_upper, cls.name }));
         const dest = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy 0\n", .{dest});
         return dest;
@@ -4151,7 +4169,7 @@ pub const ExprEmitter = struct {
             const cu_name = cu_buf[0..cu_len];
 
             const target_id: i32 = if (self.symbol_table.lookupClass(cu_name)) |cls| cls.class_id else 0;
-            const is_args = try std.fmt.allocPrint(self.allocator, "l {s}, l {d}", .{ obj_val, target_id });
+            const is_args = try bufPrintDupe(self.allocator, "l {s}, l {d}", .{ obj_val, target_id });
             try self.builder.emitCall(dest, "w", "class_is_instance", is_args);
         }
         return dest;
@@ -4167,7 +4185,7 @@ pub const ExprEmitter = struct {
     }
 
     fn emitListConstructor(self: *ExprEmitter, elements: []const ast.ExprPtr) EmitError![]const u8 {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LIST({d} elements)", .{elements.len}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "LIST({d} elements)", .{elements.len}));
 
         // Create a new list via list_create()
         const header_ptr = try self.builder.newTemp();
@@ -4206,24 +4224,24 @@ pub const ExprEmitter = struct {
 
             if (is_object) {
                 // Object/class pointer → list_append_object(list, ptr)
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ header_ptr, elem_val });
+                const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ header_ptr, elem_val });
                 try self.builder.emitCall("", "", "list_append_object", args);
             } else switch (elem_type) {
                 .double => {
                     // Float/double value → list_append_float(list, double)
-                    const args = try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ header_ptr, elem_val });
+                    const args = try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ header_ptr, elem_val });
                     try self.builder.emitCall("", "", "list_append_float", args);
                 },
                 .string => {
                     // String descriptor → list_append_string(list, str_desc)
-                    const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ header_ptr, elem_val });
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ header_ptr, elem_val });
                     try self.builder.emitCall("", "", "list_append_string", args);
                 },
                 .integer => {
                     // Integer value → widen to 64-bit, then list_append_int(list, long)
                     const long_val = try self.builder.newTemp();
                     try self.builder.emitExtend(long_val, "l", "extsw", elem_val);
-                    const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ header_ptr, long_val });
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ header_ptr, long_val });
                     try self.builder.emitCall("", "", "list_append_int", args);
                 },
             }
@@ -4271,7 +4289,7 @@ pub const ExprEmitter = struct {
 
         // Allocate the args block: worker_args_alloc(num_args) → pointer.
         const args_block = try self.builder.newTemp();
-        const num_args_str = try std.fmt.allocPrint(self.allocator, "w {d}", .{num_args});
+        const num_args_str = try bufPrintDupe(self.allocator, "w {d}", .{num_args});
         try self.builder.emitCall(args_block, "l", "worker_args_alloc", num_args_str);
 
         // Pack each argument into the args block.
@@ -4306,8 +4324,8 @@ pub const ExprEmitter = struct {
             else
                 "ptr";
 
-            const set_fn = try std.fmt.allocPrint(self.allocator, "worker_args_set_{s}", .{type_suffix_str});
-            const set_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}, {s} {s}", .{ args_block, i, declared_type, arg_val });
+            const set_fn = try bufPrintDupe(self.allocator, "worker_args_set_{s}", .{type_suffix_str});
+            const set_args = try bufPrintDupe(self.allocator, "l {s}, w {d}, {s} {s}", .{ args_block, i, declared_type, arg_val });
             try self.builder.emitCall("", "", set_fn, set_args);
         }
 
@@ -4327,7 +4345,7 @@ pub const ExprEmitter = struct {
 
         // worker_spawn(func_ptr, args_block, num_args, ret_type) → handle (pointer)
         const handle = try self.builder.newTemp();
-        const spawn_args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}, w {d}", .{ func_ptr, args_block, num_args, ret_type_code });
+        const spawn_args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, w {d}", .{ func_ptr, args_block, num_args, ret_type_code });
         try self.builder.emitCall(handle, "l", "worker_spawn", spawn_args);
 
         // Cast pointer to double for storage in DOUBLE variables.
@@ -4351,7 +4369,7 @@ pub const ExprEmitter = struct {
         // Call worker_await which blocks and returns the result as a double.
         // The runtime stores results as 64-bit values regardless of type.
         const dest = try self.builder.newTemp();
-        const await_args = try std.fmt.allocPrint(self.allocator, "l {s}", .{handle});
+        const await_args = try bufPrintDupe(self.allocator, "l {s}", .{handle});
         try self.builder.emitCall(dest, "d", "worker_await", await_args);
 
         return dest;
@@ -4367,7 +4385,7 @@ pub const ExprEmitter = struct {
         try self.builder.emit("    {s} =l cast {s}\n", .{ handle, handle_d });
 
         const dest = try self.builder.newTemp();
-        const ready_args = try std.fmt.allocPrint(self.allocator, "l {s}", .{handle});
+        const ready_args = try bufPrintDupe(self.allocator, "l {s}", .{handle});
         try self.builder.emitCall(dest, "w", "worker_ready", ready_args);
 
         return dest;
@@ -4376,7 +4394,7 @@ pub const ExprEmitter = struct {
     /// Emit MARSHALL(variable) — deep-copy an array or UDT into a portable
     /// blob.  Returns the blob pointer cast to double for storage.
     fn emitMarshall(self: *ExprEmitter, variable_name: []const u8) EmitError![]const u8 {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "MARSHALL({s})", .{variable_name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "MARSHALL({s})", .{variable_name}));
 
         // Determine the variable type: array or UDT.
         var upper_buf: [128]u8 = undefined;
@@ -4393,7 +4411,7 @@ pub const ExprEmitter = struct {
             try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
             const blob = try self.builder.newTemp();
-            const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{desc_addr});
+            const args = try bufPrintDupe(self.allocator, "l {s}", .{desc_addr});
             try self.builder.emitCall(blob, "l", "marshall_array", args);
 
             // Cast blob pointer to double for storage — recovered via cast in UNMARSHALL.
@@ -4439,7 +4457,7 @@ pub const ExprEmitter = struct {
                 try self.builder.emitLoad(udt_ptr, "l", info.addr);
             } else {
                 const var_name = try self.symbol_mapper.globalVarName(variable_name, null);
-                try self.builder.emitLoad(udt_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(udt_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             }
 
             // marshall_udt or marshall_udt_deep depending on string fields
@@ -4471,11 +4489,11 @@ pub const ExprEmitter = struct {
                     }
                     break :blk 0;
                 };
-                const offsets_label = try std.fmt.allocPrint(self.allocator, "$str_offsets_{s}", .{info.udt_name});
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}, l {s}, w {d}", .{ udt_ptr, obj_size, offsets_label, num_offsets });
+                const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{info.udt_name});
+                const args = try bufPrintDupe(self.allocator, "l {s}, w {d}, l {s}, w {d}", .{ udt_ptr, obj_size, offsets_label, num_offsets });
                 try self.builder.emitCall(blob, "l", "marshall_udt_deep", args);
             } else {
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, w {d}", .{ udt_ptr, obj_size });
+                const args = try bufPrintDupe(self.allocator, "l {s}, w {d}", .{ udt_ptr, obj_size });
                 try self.builder.emitCall(blob, "l", "marshall_udt", args);
             }
 
@@ -4810,7 +4828,7 @@ pub const BlockEmitter = struct {
         }
         const var_name = try self.symbol_mapper.globalVarName(name, effective_suffix);
         return .{
-            .addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}),
+            .addr = try bufPrintDupe(self.allocator, "${s}", .{var_name}),
             .store_type = bt.toQBEMemOp(),
             .base_type = bt,
         };
@@ -5276,11 +5294,11 @@ pub const BlockEmitter = struct {
         }
 
         // 4. Emit range check: if selector < 1 or selector > count, fall through
-        const fallthrough_label = try std.fmt.allocPrint(self.allocator, "on_goto_ft_{d}", .{dispatch_id});
+        const fallthrough_label = try bufPrintDupe(self.allocator, "on_goto_ft_{d}", .{dispatch_id});
 
         // 5. Chain of comparisons: selector == 1 → target[0], selector == 2 → target[1], ...
         for (targets.items, 0..) |target_block, i| {
-            const idx_val = try std.fmt.allocPrint(self.allocator, "{d}", .{i + 1});
+            const idx_val = try bufPrintDupe(self.allocator, "{d}", .{i + 1});
             const cmp_tmp = try self.builder.newTemp();
             try self.builder.emitBinary(cmp_tmp, "w", "ceqw", selector, idx_val);
 
@@ -5290,7 +5308,7 @@ pub const BlockEmitter = struct {
                 // Last target — if no match, fall through
                 try self.builder.emitBranch(cmp_tmp, target_label, fallthrough_label);
             } else {
-                const next_check = try std.fmt.allocPrint(self.allocator, "on_goto_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                const next_check = try bufPrintDupe(self.allocator, "on_goto_chk_{d}_{d}", .{ dispatch_id, i + 1 });
                 try self.builder.emitBranch(cmp_tmp, target_label, next_check);
                 try self.builder.emitLabel(next_check);
             }
@@ -5341,11 +5359,11 @@ pub const BlockEmitter = struct {
 
         // 4. Push return block onto GOSUB stack BEFORE dispatching
         //    (only if selector is in range — check range first)
-        const fallthrough_label = try std.fmt.allocPrint(self.allocator, "on_gosub_ft_{d}", .{dispatch_id});
-        const dispatch_label = try std.fmt.allocPrint(self.allocator, "on_gosub_dispatch_{d}", .{dispatch_id});
+        const fallthrough_label = try bufPrintDupe(self.allocator, "on_gosub_ft_{d}", .{dispatch_id});
+        const dispatch_label = try bufPrintDupe(self.allocator, "on_gosub_dispatch_{d}", .{dispatch_id});
 
         // Range check: selector < 1 or selector > count → fall through
-        const count_str = try std.fmt.allocPrint(self.allocator, "{d}", .{targets.items.len});
+        const count_str = try bufPrintDupe(self.allocator, "{d}", .{targets.items.len});
         const lt_one = try self.builder.newTemp();
         try self.builder.emitBinary(lt_one, "w", "csltw", selector, "1");
         const gt_count = try self.builder.newTemp();
@@ -5362,7 +5380,7 @@ pub const BlockEmitter = struct {
 
         // 6. Chain of comparisons: selector == 1 → target[0], ...
         for (targets.items, 0..) |target_block, i| {
-            const idx_val = try std.fmt.allocPrint(self.allocator, "{d}", .{i + 1});
+            const idx_val = try bufPrintDupe(self.allocator, "{d}", .{i + 1});
             const cmp_tmp = try self.builder.newTemp();
             try self.builder.emitBinary(cmp_tmp, "w", "ceqw", selector, idx_val);
 
@@ -5372,7 +5390,7 @@ pub const BlockEmitter = struct {
                 // Last target — unconditional jump (we already range-checked)
                 try self.builder.emitJump(target_label);
             } else {
-                const next_check = try std.fmt.allocPrint(self.allocator, "on_gosub_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                const next_check = try bufPrintDupe(self.allocator, "on_gosub_chk_{d}_{d}", .{ dispatch_id, i + 1 });
                 try self.builder.emitBranch(cmp_tmp, target_label, next_check);
                 try self.builder.emitLabel(next_check);
             }
@@ -5402,7 +5420,7 @@ pub const BlockEmitter = struct {
     /// Mirrors the C++ emitPushReturnBlock().
     fn emitPushReturnBlock(self: *BlockEmitter, return_block_id: u32) EmitError!void {
         try self.builder.emitComment(
-            try std.fmt.allocPrint(self.allocator, "Push return block {d} onto GOSUB return stack", .{return_block_id}),
+            try bufPrintDupe(self.allocator, "Push return block {d} onto GOSUB return stack", .{return_block_id}),
         );
 
         // 1. Load current stack pointer
@@ -5422,7 +5440,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitBinary(stack_addr, "l", "add", "$gosub_return_stack", byte_offset);
 
         // 5. Store return block ID at that address
-        const blk_id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{return_block_id});
+        const blk_id_str = try bufPrintDupe(self.allocator, "{d}", .{return_block_id});
         try self.builder.emitStore("w", blk_id_str, stack_addr);
 
         // 6. Increment stack pointer
@@ -5484,12 +5502,12 @@ pub const BlockEmitter = struct {
         }
 
         try self.builder.emitComment(
-            try std.fmt.allocPrint(self.allocator, "Sparse RETURN dispatch - checking {d} return points", .{return_blocks.items.len}),
+            try bufPrintDupe(self.allocator, "Sparse RETURN dispatch - checking {d} return points", .{return_blocks.items.len}),
         );
 
         for (return_blocks.items, 0..) |blk_id, i| {
             const is_match = try self.builder.newTemp();
-            const blk_id_str = try std.fmt.allocPrint(self.allocator, "{d}", .{blk_id});
+            const blk_id_str = try bufPrintDupe(self.allocator, "{d}", .{blk_id});
             try self.builder.emitCompare(is_match, "w", "eq", ret_id, blk_id_str);
 
             const target_label = try blockLabel(self.cfg, blk_id, self.allocator);
@@ -5497,11 +5515,11 @@ pub const BlockEmitter = struct {
 
             if (is_last) {
                 // Last check — if no match, fall through to error
-                const error_label = try std.fmt.allocPrint(self.allocator, "gosub_ret_err_{d}", .{dispatch_id});
+                const error_label = try bufPrintDupe(self.allocator, "gosub_ret_err_{d}", .{dispatch_id});
                 try self.builder.emitBranch(is_match, target_label, error_label);
                 try self.builder.emitLabel(error_label);
             } else {
-                const next_check = try std.fmt.allocPrint(self.allocator, "gosub_ret_chk_{d}_{d}", .{ dispatch_id, i + 1 });
+                const next_check = try bufPrintDupe(self.allocator, "gosub_ret_chk_{d}_{d}", .{ dispatch_id, i + 1 });
                 try self.builder.emitBranch(is_match, target_label, next_check);
                 try self.builder.emitLabel(next_check);
             }
@@ -5550,10 +5568,10 @@ pub const BlockEmitter = struct {
             return;
         }
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN ...", .{fi.variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH {s} IN ...", .{fi.variable}));
 
         const desc_name = try self.symbol_mapper.arrayDescName(coll_name);
-        const desc_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{desc_name});
+        const desc_addr = try bufPrintDupe(self.allocator, "${s}", .{desc_name});
 
         // Look up element type from symbol table.
         var arr_upper_buf: [128]u8 = undefined;
@@ -5619,7 +5637,7 @@ pub const BlockEmitter = struct {
     /// Emit FOR EACH initialisation for LIST collections.
     /// Uses the cursor-based list iterator API.
     fn emitForEachListInit(self: *BlockEmitter, fi: *const ast.ForInStmt, block: *const cfg_mod.BasicBlock, coll_name: []const u8) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN {s} (LIST)", .{ fi.variable, coll_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH {s} IN {s} (LIST)", .{ fi.variable, coll_name }));
 
         // Determine element type from symbol table.
         const elem_base_type = self.expr_emitter.listElementType(coll_name);
@@ -5638,17 +5656,17 @@ pub const BlockEmitter = struct {
             } else {
                 const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
                 list_ptr = try self.builder.newTemp();
-                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             }
         } else {
             const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
             list_ptr = try self.builder.newTemp();
-            try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
         }
 
         // Call list_iter_begin(list) → returns cursor (ListAtom*)
         const cursor_init = try self.builder.newTemp();
-        try self.builder.emitCall(cursor_init, "l", "list_iter_begin", try std.fmt.allocPrint(self.allocator, "l {s}", .{list_ptr}));
+        try self.builder.emitCall(cursor_init, "l", "list_iter_begin", try bufPrintDupe(self.allocator, "l {s}", .{list_ptr}));
 
         // Allocate stack slot for cursor pointer
         const cursor_addr = try self.builder.newTemp();
@@ -5705,20 +5723,20 @@ pub const BlockEmitter = struct {
     /// Calls hashmap_keys() and hashmap_size(), stores results on the stack,
     /// and registers a ForEachHashmapContext for use by condition/body/increment.
     fn emitForEachHashmapInit(self: *BlockEmitter, fi: *const ast.ForInStmt, block: *const cfg_mod.BasicBlock, coll_name: []const u8) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH {s} IN {s} (HASHMAP)", .{ fi.variable, coll_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH {s} IN {s} (HASHMAP)", .{ fi.variable, coll_name }));
 
         // Load the hashmap pointer from the global variable.
         const var_name = try self.symbol_mapper.globalVarName(coll_name, null);
         const map_ptr = try self.builder.newTemp();
-        try self.builder.emitLoad(map_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+        try self.builder.emitLoad(map_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
 
         // Call hashmap_keys(map) → returns NULL-terminated char** array.
         const keys_arr = try self.builder.newTemp();
-        try self.builder.emitCall(keys_arr, "l", "hashmap_keys", try std.fmt.allocPrint(self.allocator, "l {s}", .{map_ptr}));
+        try self.builder.emitCall(keys_arr, "l", "hashmap_keys", try bufPrintDupe(self.allocator, "l {s}", .{map_ptr}));
 
         // Call hashmap_size(map) → returns int64_t count.
         const size_l = try self.builder.newTemp();
-        try self.builder.emitCall(size_l, "l", "hashmap_size", try std.fmt.allocPrint(self.allocator, "l {s}", .{map_ptr}));
+        try self.builder.emitCall(size_l, "l", "hashmap_size", try bufPrintDupe(self.allocator, "l {s}", .{map_ptr}));
         // Truncate to int32 for comparison with w-typed index.
         const size_w = try self.builder.newTemp();
         try self.builder.emitTrunc(size_w, "w", size_l);
@@ -5882,7 +5900,7 @@ pub const BlockEmitter = struct {
 
         const ctx = self.foreach_contexts.get(block.index) orelse return;
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH: load {s} = arr(index)", .{ctx.iter_variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH: load {s} = arr(index)", .{ctx.iter_variable}));
 
         // Load current index
         const cur_idx = try self.builder.newTemp();
@@ -5890,7 +5908,7 @@ pub const BlockEmitter = struct {
 
         // Get element address: fbc_array_element_addr(desc, index)
         const elem_addr = try self.builder.newTemp();
-        const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ ctx.array_desc_addr, cur_idx });
+        const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ ctx.array_desc_addr, cur_idx });
         try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
 
         // Load element value
@@ -5954,7 +5972,7 @@ pub const BlockEmitter = struct {
             const cur_cursor = try self.builder.newTemp();
             try self.builder.emitLoad(cur_cursor, "l", lctx.cursor_addr);
             const next_cursor = try self.builder.newTemp();
-            try self.builder.emitCall(next_cursor, "l", "list_iter_next", try std.fmt.allocPrint(self.allocator, "l {s}", .{cur_cursor}));
+            try self.builder.emitCall(next_cursor, "l", "list_iter_next", try bufPrintDupe(self.allocator, "l {s}", .{cur_cursor}));
             try self.builder.emitStore("l", next_cursor, lctx.cursor_addr);
 
             // Increment hidden index
@@ -5992,7 +6010,7 @@ pub const BlockEmitter = struct {
     /// Loads the element value from the current cursor using the
     /// appropriate list_iter_value_* function.
     fn emitForEachListBodyLoad(self: *BlockEmitter, lctx: *const ForEachListContext) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH LIST: load {s} from cursor", .{lctx.iter_variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH LIST: load {s} from cursor", .{lctx.iter_variable}));
 
         // Load current cursor
         const cursor = try self.builder.newTemp();
@@ -6000,7 +6018,7 @@ pub const BlockEmitter = struct {
 
         // Call the appropriate list_iter_value_* based on element type
         const elem_val = try self.builder.newTemp();
-        const cursor_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{cursor});
+        const cursor_arg = try bufPrintDupe(self.allocator, "l {s}", .{cursor});
         if (lctx.elem_base_type.isString()) {
             // String: list_iter_value_ptr returns a StringDescriptor*
             try self.builder.emitCall(elem_val, "l", "list_iter_value_ptr", cursor_arg);
@@ -6068,7 +6086,7 @@ pub const BlockEmitter = struct {
     /// stores to key variable.  If a value variable is present, calls
     /// hashmap_lookup to get the value.
     fn emitForEachHashmapBodyLoad(self: *BlockEmitter, hctx: *const ForEachHashmapContext) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH HASHMAP: load key={s}", .{hctx.key_variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH HASHMAP: load key={s}", .{hctx.key_variable}));
 
         // Load current index
         const cur_idx = try self.builder.newTemp();
@@ -6092,7 +6110,7 @@ pub const BlockEmitter = struct {
 
         // Convert char* → StringDescriptor* via string_new_utf8
         const key_str_desc = try self.builder.newTemp();
-        try self.builder.emitCall(key_str_desc, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_cstr}));
+        try self.builder.emitCall(key_str_desc, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{key_cstr}));
 
         // Store the StringDescriptor* into the key variable
         const key_resolved = try self.resolveVarAddr(hctx.key_variable, null);
@@ -6100,7 +6118,7 @@ pub const BlockEmitter = struct {
 
         // If there's a value variable, look up the value from the hashmap.
         if (hctx.value_variable.len > 0) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "FOR EACH HASHMAP: load value={s}", .{hctx.value_variable}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "FOR EACH HASHMAP: load value={s}", .{hctx.value_variable}));
 
             // Load the hashmap pointer
             const map_ptr = try self.builder.newTemp();
@@ -6108,7 +6126,7 @@ pub const BlockEmitter = struct {
 
             // Call hashmap_lookup(map, key_cstr) → returns value (StringDescriptor*)
             const val_ptr = try self.builder.newTemp();
-            try self.builder.emitCall(val_ptr, "l", "hashmap_lookup", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ map_ptr, key_cstr }));
+            try self.builder.emitCall(val_ptr, "l", "hashmap_lookup", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ map_ptr, key_cstr }));
 
             // Store the value into the value variable
             const val_resolved = try self.resolveVarAddr(hctx.value_variable, null);
@@ -6427,7 +6445,7 @@ pub const BlockEmitter = struct {
             if (sel_type == .string) {
                 // String SELECT CASE: call string_compare, then check == 0
                 const cmp_result = try self.builder.newTemp();
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ sel_temp.?, test_val });
+                const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ sel_temp.?, test_val });
                 try self.builder.emitCall(cmp_result, "w", "string_compare", args);
                 try self.builder.emitCompare(cmp, "w", "eq", cmp_result, "0");
             } else {
@@ -6527,7 +6545,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitLoad(cursor, "l", cursor_addr.?);
 
         const type_tag = try self.builder.newTemp();
-        const cursor_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{cursor});
+        const cursor_arg = try bufPrintDupe(self.allocator, "l {s}", .{cursor});
         try self.builder.emitCall(type_tag, "w", "list_iter_type", cursor_arg);
 
         try self.match_type_contexts.put(block.index, .{
@@ -6611,7 +6629,7 @@ pub const BlockEmitter = struct {
             try self.builder.emitCompare(is_obj, "w", "eq", mc.type_tag_temp, "5");
 
             // We need to branch: if not an object, skip to next arm.
-            const check_class_label = try std.fmt.allocPrint(self.allocator, "mt_chkcls_{d}", .{block.index});
+            const check_class_label = try bufPrintDupe(self.allocator, "mt_chkcls_{d}", .{block.index});
             try self.builder.emitBranch(
                 is_obj,
                 check_class_label,
@@ -6621,7 +6639,7 @@ pub const BlockEmitter = struct {
 
             // Load the object pointer from the cursor
             const obj_ptr = try self.builder.newTemp();
-            const cur_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{mc.cursor_temp});
+            const cur_arg = try bufPrintDupe(self.allocator, "l {s}", .{mc.cursor_temp});
             try self.builder.emitCall(obj_ptr, "l", "list_iter_value_ptr", cur_arg);
 
             // Look up class_id from symbol table
@@ -6633,7 +6651,7 @@ pub const BlockEmitter = struct {
 
             // Call class_is_instance(obj_ptr, class_id)
             const is_inst = try self.builder.newTemp();
-            const ci_args = try std.fmt.allocPrint(self.allocator, "l {s}, l {d}", .{ obj_ptr, class_id });
+            const ci_args = try bufPrintDupe(self.allocator, "l {s}, l {d}", .{ obj_ptr, class_id });
             try self.builder.emitCall(is_inst, "w", "class_is_instance", ci_args);
 
             // Store the object pointer into the binding variable
@@ -6669,7 +6687,7 @@ pub const BlockEmitter = struct {
             // (so it's available if the arm matches).
             if (arm.binding_variable.len > 0) {
                 const resolved = try self.resolveVarAddr(arm.binding_variable, arm.binding_suffix);
-                const cur_arg = try std.fmt.allocPrint(self.allocator, "l {s}", .{mc.cursor_temp});
+                const cur_arg = try bufPrintDupe(self.allocator, "l {s}", .{mc.cursor_temp});
 
                 if (std.mem.eql(u8, expected_tag, "1")) {
                     // Integer
@@ -6780,7 +6798,7 @@ pub const BlockEmitter = struct {
                 // Global variable: load pointer from the global slot
                 const var_name = try self.symbol_mapper.globalVarName(v.name, null);
                 const dest = try self.builder.newTemp();
-                try self.builder.emitLoad(dest, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(dest, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
                 return dest;
             },
             .array_access => |aa| {
@@ -6795,10 +6813,10 @@ pub const BlockEmitter = struct {
                 const desc_name = try self.symbol_mapper.arrayDescName(aa.name);
                 const desc_addr = try self.builder.newTemp();
                 try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
-                const bc_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
                 try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
                 const elem_addr = try self.builder.newTemp();
-                const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
                 try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
                 return elem_addr;
             },
@@ -6857,18 +6875,18 @@ pub const BlockEmitter = struct {
                 // Fall through to scalar
             } else {
                 const arr_code = simdArrangementCode(simd_info);
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "NEON arithmetic ({s}): {s} → 4 instructions", .{ udt_type_name, neon_op }));
-                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonldr {s}", .{left_addr}));
-                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonldr2 {s}", .{right_addr}));
-                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ neon_op, arr_code }));
-                try self.builder.emitInstruction(try std.fmt.allocPrint(self.allocator, "neonstr {s}", .{target_addr}));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "NEON arithmetic ({s}): {s} → 4 instructions", .{ udt_type_name, neon_op }));
+                try self.builder.emitInstruction(try bufPrintDupe(self.allocator, "neonldr {s}", .{left_addr}));
+                try self.builder.emitInstruction(try bufPrintDupe(self.allocator, "neonldr2 {s}", .{right_addr}));
+                try self.builder.emitInstruction(try bufPrintDupe(self.allocator, "{s} {d}", .{ neon_op, arr_code }));
+                try self.builder.emitInstruction(try bufPrintDupe(self.allocator, "neonstr {s}", .{target_addr}));
                 try self.builder.emitComment("End NEON UDT arithmetic assignment");
                 return true;
             }
         }
 
         // ── Scalar fallback (field-by-field) ────────────────────────────
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Scalar UDT arithmetic ({s}): field-by-field {s}", .{ udt_type_name, scalar_op }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Scalar UDT arithmetic ({s}): field-by-field {s}", .{ udt_type_name, scalar_op }));
 
         var offset: u32 = 0;
         for (type_sym.fields) |field| {
@@ -6894,7 +6912,7 @@ pub const BlockEmitter = struct {
             const dst_field_addr = try self.builder.newTemp();
 
             if (offset > 0) {
-                const off_str = try std.fmt.allocPrint(self.allocator, "{d}", .{offset});
+                const off_str = try bufPrintDupe(self.allocator, "{d}", .{offset});
                 try self.builder.emitBinary(left_field_addr, "l", "add", left_addr, off_str);
                 try self.builder.emitBinary(right_field_addr, "l", "add", right_addr, off_str);
                 try self.builder.emitBinary(dst_field_addr, "l", "add", target_addr, off_str);
@@ -7016,7 +7034,7 @@ pub const BlockEmitter = struct {
 
         // Total byte count = num_elements * elem_size
         const total_bytes = try self.builder.newTemp();
-        const elem_size_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const elem_size_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(total_bytes, "l", "mul", num_elements, elem_size_str);
 
         switch (pattern) {
@@ -7219,7 +7237,7 @@ pub const BlockEmitter = struct {
             .variable => |v| v.name,
             else => return,
         };
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array copy: {s}() = {s}()", .{ lt.variable, src_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array copy: {s}() = {s}()", .{ lt.variable, src_name }));
 
         const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
         const src_desc = try self.builder.newTemp();
@@ -7232,9 +7250,9 @@ pub const BlockEmitter = struct {
         // Actually use a call to memcpy via the C library which is available.
         // QBE doesn't have a dynamic blit, so we emit a scalar loop.
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_loop_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_done_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_copy_body_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_copy_loop_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_copy_done_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_copy_body_{d}", .{id});
 
         // Loop index (byte offset)
         const idx_slot = try self.builder.newTemp();
@@ -7270,7 +7288,7 @@ pub const BlockEmitter = struct {
 
     /// Emit: fill all elements with a scalar value
     fn emitArrayFill(self: *BlockEmitter, lt: *const ast.LetStmt, target_data: []const u8, num_elements: []const u8, elem_bt: semantic.BaseType, _: []const u8, elem_store_op: []const u8, elem_size: u32, is_float: bool) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array fill: {s}() = scalar", .{lt.variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array fill: {s}() = scalar", .{lt.variable}));
 
         // Evaluate the scalar value
         const scalar_val = try self.expr_emitter.emitExpression(lt.value);
@@ -7301,7 +7319,7 @@ pub const BlockEmitter = struct {
             },
             else => return,
         };
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array negate: {s}() = -{s}()", .{ lt.variable, src_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array negate: {s}() = -{s}()", .{ lt.variable, src_name }));
 
         const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
         const src_desc = try self.builder.newTemp();
@@ -7369,7 +7387,7 @@ pub const BlockEmitter = struct {
             .divide => "/",
             else => "?",
         };
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array binop: {s}() = {s}() {s} {s}()", .{ lt.variable, left_name, op_str, right_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array binop: {s}() = {s}() {s} {s}()", .{ lt.variable, left_name, op_str, right_name }));
 
         // Get source array data pointers
         const left_desc_name = try self.symbol_mapper.arrayDescName(left_name);
@@ -7423,9 +7441,9 @@ pub const BlockEmitter = struct {
             else => "?",
         };
         if (is_left_scalar) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array broadcast: {s}() = scalar {s} {s}()", .{ lt.variable, op_str, arr_name }));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array broadcast: {s}() = scalar {s} {s}()", .{ lt.variable, op_str, arr_name }));
         } else {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Whole-array broadcast: {s}() = {s}() {s} scalar", .{ lt.variable, arr_name, op_str }));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "Whole-array broadcast: {s}() = {s}() {s} scalar", .{ lt.variable, arr_name, op_str }));
         }
 
         // Get source array data pointer
@@ -7475,7 +7493,7 @@ pub const BlockEmitter = struct {
             else => return,
         };
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array expression: {s}() = {s}({s}())", .{ lt.variable, func_upper, src_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Array expression: {s}() = {s}({s}())", .{ lt.variable, func_upper, src_name }));
 
         // Get source array data pointer
         const src_desc_name = try self.symbol_mapper.arrayDescName(src_name);
@@ -7486,9 +7504,9 @@ pub const BlockEmitter = struct {
 
         // Emit scalar loop
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_loop_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_body_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_ufn_done_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_ufn_loop_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_ufn_body_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_ufn_done_{d}", .{id});
 
         const idx_slot = try self.builder.newTemp();
         try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
@@ -7506,7 +7524,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitLabel(body_lbl);
 
         const byte_off = try self.builder.newTemp();
-        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const esz_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
 
         const needs_promote = (elem_bt == .single);
@@ -7533,7 +7551,7 @@ pub const BlockEmitter = struct {
                 // Float ABS: call fabs
                 const arith_t = if (needs_promote) "d" else elem_arith_type;
                 result_val = try self.builder.newTemp();
-                try self.builder.emitCall(result_val, arith_t, "fabs", try std.fmt.allocPrint(self.allocator, "d {s}", .{src_val}));
+                try self.builder.emitCall(result_val, arith_t, "fabs", try bufPrintDupe(self.allocator, "d {s}", .{src_val}));
             } else {
                 // Integer ABS: (x ^ (x >> 31)) - (x >> 31)
                 const mask = try self.builder.newTemp();
@@ -7548,13 +7566,13 @@ pub const BlockEmitter = struct {
             if (is_float) {
                 const dval = if (needs_promote) src_val else src_val;
                 result_val = try self.builder.newTemp();
-                try self.builder.emitCall(result_val, "d", "sqrt", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+                try self.builder.emitCall(result_val, "d", "sqrt", try bufPrintDupe(self.allocator, "d {s}", .{dval}));
             } else {
                 // Integer SQR: convert to double, sqrt, convert back
                 const dval = try self.builder.newTemp();
                 try self.builder.emitConvert(dval, "d", "swtof", src_val);
                 result_val = try self.builder.newTemp();
-                try self.builder.emitCall(result_val, "d", "sqrt", try std.fmt.allocPrint(self.allocator, "d {s}", .{dval}));
+                try self.builder.emitCall(result_val, "d", "sqrt", try bufPrintDupe(self.allocator, "d {s}", .{dval}));
                 const ival = try self.builder.newTemp();
                 try self.builder.emitConvert(ival, "w", "dtosi", result_val);
                 result_val = ival;
@@ -7632,7 +7650,7 @@ pub const BlockEmitter = struct {
             else => return,
         };
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Array expression (FMA): {s}() = {s}() + {s}() * {s}()", .{ lt.variable, addend_name, mul_l_name, mul_r_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "Array expression (FMA): {s}() = {s}() + {s}() * {s}()", .{ lt.variable, addend_name, mul_l_name, mul_r_name }));
 
         // Get source array data pointers
         const add_desc_name = try self.symbol_mapper.arrayDescName(addend_name);
@@ -7655,9 +7673,9 @@ pub const BlockEmitter = struct {
 
         // Emit scalar FMA loop
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_loop_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_body_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_fma_done_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_fma_loop_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_fma_body_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_fma_done_{d}", .{id});
 
         const idx_slot = try self.builder.newTemp();
         try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
@@ -7675,7 +7693,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitLabel(body_lbl);
 
         const byte_off = try self.builder.newTemp();
-        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const esz_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
 
         // Determine if we need SINGLE→DOUBLE promotion for arithmetic
@@ -7820,9 +7838,9 @@ pub const BlockEmitter = struct {
         needs_trunc: bool,
     ) EmitError!void {
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_loop_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_body_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_done_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_loop_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_body_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_done_{d}", .{id});
 
         // Loop counter (element index)
         const idx_slot = try self.builder.newTemp();
@@ -7842,7 +7860,7 @@ pub const BlockEmitter = struct {
 
         // Compute byte offset = cur_idx * elem_size
         const byte_off = try self.builder.newTemp();
-        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const esz_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
 
         // Target element pointer
@@ -7902,9 +7920,9 @@ pub const BlockEmitter = struct {
         arith_instr: []const u8,
     ) EmitError!void {
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_loop_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_body_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_binop_done_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_binop_loop_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_binop_body_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_binop_done_{d}", .{id});
 
         const idx_slot = try self.builder.newTemp();
         try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
@@ -7922,7 +7940,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitLabel(body_lbl);
 
         const byte_off = try self.builder.newTemp();
-        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const esz_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
 
         // Determine if we need SINGLE→DOUBLE promotion
@@ -7991,9 +8009,9 @@ pub const BlockEmitter = struct {
         is_left_scalar: bool,
     ) EmitError!void {
         const id = self.builder.nextLabelId();
-        const loop_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_loop_{d}", .{id});
-        const body_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_body_{d}", .{id});
-        const done_lbl = try std.fmt.allocPrint(self.allocator, "wa_bcast_done_{d}", .{id});
+        const loop_lbl = try bufPrintDupe(self.allocator, "wa_bcast_loop_{d}", .{id});
+        const body_lbl = try bufPrintDupe(self.allocator, "wa_bcast_body_{d}", .{id});
+        const done_lbl = try bufPrintDupe(self.allocator, "wa_bcast_done_{d}", .{id});
 
         const idx_slot = try self.builder.newTemp();
         try self.builder.emit("    {s} =l alloc8 8\n", .{idx_slot});
@@ -8011,7 +8029,7 @@ pub const BlockEmitter = struct {
         try self.builder.emitLabel(body_lbl);
 
         const byte_off = try self.builder.newTemp();
-        const esz_str = try std.fmt.allocPrint(self.allocator, "{d}", .{elem_size});
+        const esz_str = try bufPrintDupe(self.allocator, "{d}", .{elem_size});
         try self.builder.emitBinary(byte_off, "l", "mul", cur_idx, esz_str);
 
         // Determine if we need SINGLE→DOUBLE promotion
@@ -8067,7 +8085,7 @@ pub const BlockEmitter = struct {
         const char_code = try self.expr_emitter.emitExpression(wr.expr);
 
         // Call basic_wrch with the character code (void call - no return value)
-        const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{char_code});
+        const args = try bufPrintDupe(self.allocator, "w {s}", .{char_code});
         try self.builder.emitCall("", "", "basic_wrch", args);
     }
 
@@ -8078,7 +8096,7 @@ pub const BlockEmitter = struct {
         const str_val = try self.expr_emitter.emitExpression(ws.expr);
 
         // Call basic_wrstr with the string descriptor (void call)
-        const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{str_val});
+        const args = try bufPrintDupe(self.allocator, "l {s}", .{str_val});
         try self.builder.emitCall("", "", "basic_wrstr", args);
     }
 
@@ -8093,7 +8111,7 @@ pub const BlockEmitter = struct {
 
             // Get file handle
             const fh = try self.builder.newTemp();
-            try self.builder.emitCall(fh, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+            try self.builder.emitCall(fh, "l", "file_get_handle", try bufPrintDupe(self.allocator, "w {s}", .{file_num_val}));
             file_handle = fh;
         }
 
@@ -8104,13 +8122,13 @@ pub const BlockEmitter = struct {
                 const et = self.expr_emitter.inferExprType(item.expr);
 
                 if (et == .string) {
-                    try self.runtime.callVoid("file_print_string", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ fh, val }));
+                    try self.runtime.callVoid("file_print_string", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ fh, val }));
                 } else if (et == .integer) {
                     const long_val = try self.builder.newTemp();
                     try self.builder.emitExtend(long_val, "l", "extsw", val);
-                    try self.runtime.callVoid("file_print_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ fh, long_val }));
+                    try self.runtime.callVoid("file_print_int", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ fh, long_val }));
                 } else if (et == .double) {
-                    try self.runtime.callVoid("file_print_double", try std.fmt.allocPrint(self.allocator, "l {s}, d {s}", .{ fh, val }));
+                    try self.runtime.callVoid("file_print_double", try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ fh, val }));
                 }
             } else {
                 // Print to console
@@ -8134,7 +8152,7 @@ pub const BlockEmitter = struct {
                         try self.builder.emitExtend(long_val, "l", "extsw", val);
                         break :blk long_val;
                     } else val;
-                    const args = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ et.printArgLetter(), print_val });
+                    const args = try bufPrintDupe(self.allocator, "{s} {s}", .{ et.printArgLetter(), print_val });
                     try self.runtime.callVoid(et.printFn(), args);
                 }
 
@@ -8150,7 +8168,7 @@ pub const BlockEmitter = struct {
 
         if (pr.trailing_newline) {
             if (file_handle) |fh| {
-                try self.runtime.callVoid("file_print_newline", try std.fmt.allocPrint(self.allocator, "l {s}", .{fh}));
+                try self.runtime.callVoid("file_print_newline", try bufPrintDupe(self.allocator, "l {s}", .{fh}));
             } else {
                 try self.runtime.callVoid("basic_print_newline", "");
             }
@@ -8165,7 +8183,7 @@ pub const BlockEmitter = struct {
             // Unknown UDT — fall back to printing the pointer as an integer
             const long_val = try self.builder.newTemp();
             try self.builder.emit("    {s} =l copy {s}\n", .{ long_val, base_ptr });
-            const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{long_val});
+            const args = try bufPrintDupe(self.allocator, "l {s}", .{long_val});
             try self.runtime.callVoid("basic_print_int", args);
             return;
         };
@@ -8175,27 +8193,27 @@ pub const BlockEmitter = struct {
         const open_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy ${s}\n", .{ open_tmp, open_label });
         const open_sd = try self.builder.newTemp();
-        try self.builder.emitCall(open_sd, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{open_tmp}));
-        try self.runtime.callVoid("basic_print_string_desc", try std.fmt.allocPrint(self.allocator, "l {s}", .{open_sd}));
+        try self.builder.emitCall(open_sd, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{open_tmp}));
+        try self.runtime.callVoid("basic_print_string_desc", try bufPrintDupe(self.allocator, "l {s}", .{open_sd}));
 
         var offset: u32 = 0;
         for (tsym.fields, 0..) |field, fi| {
             // Print "FieldName: " prefix
             const prefix = if (fi > 0)
-                try std.fmt.allocPrint(self.allocator, ", {s}: ", .{field.name})
+                try bufPrintDupe(self.allocator, ", {s}: ", .{field.name})
             else
-                try std.fmt.allocPrint(self.allocator, "{s}: ", .{field.name});
+                try bufPrintDupe(self.allocator, "{s}: ", .{field.name});
             const prefix_label = try self.builder.registerString(prefix);
             const prefix_tmp = try self.builder.newTemp();
             try self.builder.emit("    {s} =l copy ${s}\n", .{ prefix_tmp, prefix_label });
             const prefix_sd = try self.builder.newTemp();
-            try self.builder.emitCall(prefix_sd, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{prefix_tmp}));
-            try self.runtime.callVoid("basic_print_string_desc", try std.fmt.allocPrint(self.allocator, "l {s}", .{prefix_sd}));
+            try self.builder.emitCall(prefix_sd, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{prefix_tmp}));
+            try self.runtime.callVoid("basic_print_string_desc", try bufPrintDupe(self.allocator, "l {s}", .{prefix_sd}));
 
             // Compute field address
             const field_addr = try self.builder.newTemp();
             if (offset > 0) {
-                try self.builder.emitBinary(field_addr, "l", "add", base_ptr, try std.fmt.allocPrint(self.allocator, "{d}", .{offset}));
+                try self.builder.emitBinary(field_addr, "l", "add", base_ptr, try bufPrintDupe(self.allocator, "{d}", .{offset}));
             } else {
                 try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, base_ptr });
             }
@@ -8207,29 +8225,29 @@ pub const BlockEmitter = struct {
                 try self.builder.emitLoad(fv, "w", field_addr);
                 const fv_long = try self.builder.newTemp();
                 try self.builder.emitExtend(fv_long, "l", "extsw", fv);
-                try self.runtime.callVoid("basic_print_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv_long}));
+                try self.runtime.callVoid("basic_print_int", try bufPrintDupe(self.allocator, "l {s}", .{fv_long}));
             } else if (bt == .double) {
                 // Double field: loadd, print as double
                 const fv = try self.builder.newTemp();
                 try self.builder.emitLoad(fv, "d", field_addr);
-                try self.runtime.callVoid("basic_print_double", try std.fmt.allocPrint(self.allocator, "d {s}", .{fv}));
+                try self.runtime.callVoid("basic_print_double", try bufPrintDupe(self.allocator, "d {s}", .{fv}));
             } else if (bt == .single) {
                 // Single field: loads, extend to double, print as double
                 const fv = try self.builder.newTemp();
                 try self.builder.emitLoad(fv, "s", field_addr);
                 const fv_d = try self.builder.newTemp();
                 try self.builder.emitExtend(fv_d, "d", "exts", fv);
-                try self.runtime.callVoid("basic_print_double", try std.fmt.allocPrint(self.allocator, "d {s}", .{fv_d}));
+                try self.runtime.callVoid("basic_print_double", try bufPrintDupe(self.allocator, "d {s}", .{fv_d}));
             } else if (bt == .long or bt == .ulong) {
                 // Long field: loadl, print as int
                 const fv = try self.builder.newTemp();
                 try self.builder.emitLoad(fv, "l", field_addr);
-                try self.runtime.callVoid("basic_print_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv}));
+                try self.runtime.callVoid("basic_print_int", try bufPrintDupe(self.allocator, "l {s}", .{fv}));
             } else if (bt.isString()) {
                 // String field: loadl (pointer to string descriptor), print
                 const fv = try self.builder.newTemp();
                 try self.builder.emitLoad(fv, "l", field_addr);
-                try self.runtime.callVoid("basic_print_string_desc", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv}));
+                try self.runtime.callVoid("basic_print_string_desc", try bufPrintDupe(self.allocator, "l {s}", .{fv}));
             } else if (bt == .user_defined) {
                 // Nested UDT: get the nested type name and recurse
                 const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
@@ -8238,17 +8256,17 @@ pub const BlockEmitter = struct {
                     // For simplicity, just print the nested UDT pointer as int
                     const fv = try self.builder.newTemp();
                     try self.builder.emitLoad(fv, "l", field_addr);
-                    try self.runtime.callVoid("basic_print_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv}));
+                    try self.runtime.callVoid("basic_print_int", try bufPrintDupe(self.allocator, "l {s}", .{fv}));
                 } else {
                     const fv = try self.builder.newTemp();
                     try self.builder.emitLoad(fv, "l", field_addr);
-                    try self.runtime.callVoid("basic_print_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv}));
+                    try self.runtime.callVoid("basic_print_int", try bufPrintDupe(self.allocator, "l {s}", .{fv}));
                 }
             } else {
                 // Fallback: load as long, print as int
                 const fv = try self.builder.newTemp();
                 try self.builder.emitLoad(fv, "l", field_addr);
-                try self.runtime.callVoid("basic_print_int", try std.fmt.allocPrint(self.allocator, "l {s}", .{fv}));
+                try self.runtime.callVoid("basic_print_int", try bufPrintDupe(self.allocator, "l {s}", .{fv}));
             }
 
             // Advance offset
@@ -8264,8 +8282,8 @@ pub const BlockEmitter = struct {
         const close_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy ${s}\n", .{ close_tmp, close_label });
         const close_sd = try self.builder.newTemp();
-        try self.builder.emitCall(close_sd, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{close_tmp}));
-        try self.runtime.callVoid("basic_print_string_desc", try std.fmt.allocPrint(self.allocator, "l {s}", .{close_sd}));
+        try self.builder.emitCall(close_sd, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{close_tmp}));
+        try self.runtime.callVoid("basic_print_string_desc", try bufPrintDupe(self.allocator, "l {s}", .{close_sd}));
     }
 
     fn emitConsoleStatement(self: *BlockEmitter, con: *const ast.ConsoleStmt) EmitError!void {
@@ -8277,7 +8295,7 @@ pub const BlockEmitter = struct {
             } else {
                 const val = try self.expr_emitter.emitExpression(item.expr);
                 const et = self.expr_emitter.inferExprType(item.expr);
-                const args = try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ et.printArgLetter(), val });
+                const args = try bufPrintDupe(self.allocator, "{s} {s}", .{ et.printArgLetter(), val });
                 try self.runtime.callVoid(et.printFn(), args);
             }
         }
@@ -8318,7 +8336,7 @@ pub const BlockEmitter = struct {
         // Call field_init_buffer(file_num, total_size)
         const size_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =w copy {d}\n", .{ size_tmp, total_size });
-        try self.runtime.callVoid("field_init_buffer", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, size_tmp }));
+        try self.runtime.callVoid("field_init_buffer", try bufPrintDupe(self.allocator, "w {s}, w {s}", .{ file_num_val, size_tmp }));
 
         // Store field mappings for LSET/RSET/GET to use
         var offset: i32 = 0;
@@ -8342,7 +8360,7 @@ pub const BlockEmitter = struct {
             const empty_tmp = try self.builder.newTemp();
             try self.builder.emit("    {s} =l copy ${s}\n", .{ empty_tmp, empty_label });
             const empty_str = try self.builder.newTemp();
-            try self.builder.emitCall(empty_str, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{empty_tmp}));
+            try self.builder.emitCall(empty_str, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{empty_tmp}));
             try self.builder.emitStore("l", empty_str, resolved.addr);
 
             try self.field_mappings.put(try self.allocator.dupe(u8, field.var_name), mapping);
@@ -8352,7 +8370,7 @@ pub const BlockEmitter = struct {
     }
 
     fn emitLsetStatement(self: *BlockEmitter, ls: *const ast.LsetStmt) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LSET {s}", .{ls.var_name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "LSET {s}", .{ls.var_name}));
 
         // Look up field mapping
         const mapping = self.field_mappings.get(ls.var_name) orelse {
@@ -8372,17 +8390,17 @@ pub const BlockEmitter = struct {
         try self.builder.emit("    {s} =w copy {d}\n", .{ offset_tmp, mapping.offset });
         const length_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
-        try self.runtime.callVoid("field_lset", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
+        try self.runtime.callVoid("field_lset", try bufPrintDupe(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
 
         // Also update the variable so reading it reflects the LSET value
         const extracted = try self.builder.newTemp();
-        try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+        try self.builder.emitCall(extracted, "l", "field_extract", try bufPrintDupe(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
         const resolved = try self.resolveVarAddr(ls.var_name, .type_string);
         try self.builder.emitStore("l", extracted, resolved.addr);
     }
 
     fn emitRsetStatement(self: *BlockEmitter, rs: *const ast.RsetStmt) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "RSET {s}", .{rs.var_name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "RSET {s}", .{rs.var_name}));
 
         // Look up field mapping
         const mapping = self.field_mappings.get(rs.var_name) orelse {
@@ -8401,11 +8419,11 @@ pub const BlockEmitter = struct {
         try self.builder.emit("    {s} =w copy {d}\n", .{ offset_tmp, mapping.offset });
         const length_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
-        try self.runtime.callVoid("field_rset", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
+        try self.runtime.callVoid("field_rset", try bufPrintDupe(self.allocator, "w {s}, w {s}, w {s}, l {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp, value }));
 
         // Also update the variable
         const extracted = try self.builder.newTemp();
-        try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+        try self.builder.emitCall(extracted, "l", "field_extract", try bufPrintDupe(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
         const resolved = try self.resolveVarAddr(rs.var_name, .type_string);
         try self.builder.emitStore("l", extracted, resolved.addr);
     }
@@ -8426,7 +8444,7 @@ pub const BlockEmitter = struct {
         };
 
         // Call file_put_record(file_num, record_num)
-        try self.runtime.callVoid("file_put_record", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
+        try self.runtime.callVoid("file_put_record", try bufPrintDupe(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
     }
 
     fn emitGetStatement(self: *BlockEmitter, gt: *const ast.GetStmt) EmitError!void {
@@ -8445,7 +8463,7 @@ pub const BlockEmitter = struct {
         };
 
         // Call file_get_record(file_num, record_num)
-        try self.runtime.callVoid("file_get_record", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
+        try self.runtime.callVoid("file_get_record", try bufPrintDupe(self.allocator, "w {s}, w {s}", .{ file_num_val, record_val }));
 
         // After GET, extract all FIELD variables mapped to this file
         // so that reading them returns the data just read from disk.
@@ -8461,7 +8479,7 @@ pub const BlockEmitter = struct {
             try self.builder.emit("    {s} =w copy {d}\n", .{ length_tmp, mapping.length });
 
             const extracted = try self.builder.newTemp();
-            try self.builder.emitCall(extracted, "l", "field_extract", try std.fmt.allocPrint(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
+            try self.builder.emitCall(extracted, "l", "field_extract", try bufPrintDupe(self.allocator, "w {s}, w {s}, w {s}", .{ mapping.file_num_tmp, offset_tmp, length_tmp }));
 
             const resolved = try self.resolveVarAddr(entry.key_ptr.*, .type_string);
             try self.builder.emitStore("l", extracted, resolved.addr);
@@ -8478,11 +8496,11 @@ pub const BlockEmitter = struct {
         const pos_val = try self.expr_emitter.emitExpression(sk.position);
 
         // Call file_seek(file_num, position)
-        try self.runtime.callVoid("file_seek", try std.fmt.allocPrint(self.allocator, "w {s}, l {s}", .{ file_num_val, pos_val }));
+        try self.runtime.callVoid("file_seek", try bufPrintDupe(self.allocator, "w {s}, l {s}", .{ file_num_val, pos_val }));
     }
 
     fn emitOpenStatement(self: *BlockEmitter, op: *const ast.OpenStmt) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "OPEN file", .{}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "OPEN file", .{}));
 
         // Evaluate filename expression (should be a string)
         const filename_val = try self.expr_emitter.emitExpression(op.filename);
@@ -8492,17 +8510,17 @@ pub const BlockEmitter = struct {
         const mode_tmp = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy ${s}\n", .{ mode_tmp, mode_label });
         const mode_str = try self.builder.newTemp();
-        try self.builder.emitCall(mode_str, "l", "string_new_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{mode_tmp}));
+        try self.builder.emitCall(mode_str, "l", "string_new_utf8", try bufPrintDupe(self.allocator, "l {s}", .{mode_tmp}));
 
         // Call file_open(filename, mode)
         const file_handle = try self.builder.newTemp();
-        try self.builder.emitCall(file_handle, "l", "file_open", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ filename_val, mode_str }));
+        try self.builder.emitCall(file_handle, "l", "file_open", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ filename_val, mode_str }));
 
         // Evaluate file number expression
         const file_num_val = try self.expr_emitter.emitExpression(op.file_number);
 
         // Store handle in file table: file_set_handle(file_number, handle)
-        try self.runtime.callVoid("file_set_handle", try std.fmt.allocPrint(self.allocator, "w {s}, l {s}", .{ file_num_val, file_handle }));
+        try self.runtime.callVoid("file_set_handle", try bufPrintDupe(self.allocator, "w {s}, l {s}", .{ file_num_val, file_handle }));
     }
 
     fn emitCloseStatement(self: *BlockEmitter, cl: *const ast.CloseStmt) EmitError!void {
@@ -8520,13 +8538,13 @@ pub const BlockEmitter = struct {
 
             // Get file handle
             const file_handle = try self.builder.newTemp();
-            try self.builder.emitCall(file_handle, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+            try self.builder.emitCall(file_handle, "l", "file_get_handle", try bufPrintDupe(self.allocator, "w {s}", .{file_num_val}));
 
             // Close file
-            try self.runtime.callVoid("file_close", try std.fmt.allocPrint(self.allocator, "l {s}", .{file_handle}));
+            try self.runtime.callVoid("file_close", try bufPrintDupe(self.allocator, "l {s}", .{file_handle}));
 
             // Clear handle in table
-            try self.runtime.callVoid("file_set_handle", try std.fmt.allocPrint(self.allocator, "w {s}, l 0", .{file_num_val}));
+            try self.runtime.callVoid("file_set_handle", try bufPrintDupe(self.allocator, "w {s}, l 0", .{file_num_val}));
         }
     }
 
@@ -8537,7 +8555,7 @@ pub const BlockEmitter = struct {
         const cmd_val = try self.expr_emitter.emitExpression(sh.command);
 
         // Call basic_shell(command)
-        try self.runtime.callVoid("basic_shell", try std.fmt.allocPrint(self.allocator, "l {s}", .{cmd_val}));
+        try self.runtime.callVoid("basic_shell", try bufPrintDupe(self.allocator, "l {s}", .{cmd_val}));
     }
 
     fn emitSpitStatement(self: *BlockEmitter, sp: *const ast.SpitStmt) EmitError!void {
@@ -8550,7 +8568,7 @@ pub const BlockEmitter = struct {
         const content_val = try self.expr_emitter.emitExpression(sp.content);
 
         // Call basic_spit(filename, content)
-        try self.runtime.callVoid("basic_spit", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ filename_val, content_val }));
+        try self.runtime.callVoid("basic_spit", try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ filename_val, content_val }));
     }
 
     fn emitInputStatement(self: *BlockEmitter, inp: *const ast.InputStmt) EmitError!void {
@@ -8563,13 +8581,13 @@ pub const BlockEmitter = struct {
 
             // Get file handle
             const file_handle = try self.builder.newTemp();
-            try self.builder.emitCall(file_handle, "l", "file_get_handle", try std.fmt.allocPrint(self.allocator, "w {s}", .{file_num_val}));
+            try self.builder.emitCall(file_handle, "l", "file_get_handle", try bufPrintDupe(self.allocator, "w {s}", .{file_num_val}));
 
             // For now, only handle string variables (LINE INPUT style)
             for (inp.variables) |var_name| {
                 // Read line from file
                 const line_val = try self.builder.newTemp();
-                try self.builder.emitCall(line_val, "l", "file_read_line", try std.fmt.allocPrint(self.allocator, "l {s}", .{file_handle}));
+                try self.builder.emitCall(line_val, "l", "file_read_line", try bufPrintDupe(self.allocator, "l {s}", .{file_handle}));
 
                 // Store in variable
                 const resolved = try self.resolveVarAddr(var_name, .type_string);
@@ -8591,7 +8609,7 @@ pub const BlockEmitter = struct {
                 // Call basic_line_input(prompt) for first variable
                 if (inp.variables.len > 0) {
                     const line_val = try self.builder.newTemp();
-                    try self.builder.emitCall(line_val, "l", "basic_line_input", try std.fmt.allocPrint(self.allocator, "l {s}", .{prompt_tmp}));
+                    try self.builder.emitCall(line_val, "l", "basic_line_input", try bufPrintDupe(self.allocator, "l {s}", .{prompt_tmp}));
                     const resolved = try self.resolveVarAddr(inp.variables[0], .type_string);
                     try self.builder.emitStore("l", line_val, resolved.addr);
                 }
@@ -8613,7 +8631,7 @@ pub const BlockEmitter = struct {
                         const qmark_label = try self.builder.registerString("? ");
                         const qmark_tmp = try self.builder.newTemp();
                         try self.builder.emit("    {s} =l copy ${s}\n", .{ qmark_tmp, qmark_label });
-                        try self.builder.emitCall(line_val, "l", "basic_line_input", try std.fmt.allocPrint(self.allocator, "l {s}", .{qmark_tmp}));
+                        try self.builder.emitCall(line_val, "l", "basic_line_input", try bufPrintDupe(self.allocator, "l {s}", .{qmark_tmp}));
                     } else {
                         // LINE INPUT uses no prompt
                         try self.builder.emitCall(line_val, "l", "basic_input_line", "");
@@ -8628,7 +8646,7 @@ pub const BlockEmitter = struct {
     /// Emit UNMARSHALL target, source — reconstruct array or UDT from
     /// a marshalled blob pointer.
     fn emitUnmarshallStatement(self: *BlockEmitter, um: *const ast.UnmarshallStmt) EmitError!void {
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "UNMARSHALL {s}", .{um.target_variable}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "UNMARSHALL {s}", .{um.target_variable}));
 
         // Evaluate the source expression (MARSHALLED blob pointer).
         const src_val = try self.expr_emitter.emitExpression(um.source_expr);
@@ -8651,7 +8669,7 @@ pub const BlockEmitter = struct {
             const desc_addr = try self.builder.newTemp();
             try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
-            const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}", .{ blob_ptr, desc_addr });
+            const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ blob_ptr, desc_addr });
             try self.builder.emitCall("", "", "unmarshall_array", args);
             return;
         }
@@ -8693,7 +8711,7 @@ pub const BlockEmitter = struct {
                 try self.builder.emitLoad(udt_ptr, "l", info.addr);
             } else {
                 const var_name = try self.expr_emitter.symbol_mapper.globalVarName(um.target_variable, null);
-                try self.builder.emitLoad(udt_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(udt_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             }
 
             // unmarshall_udt or unmarshall_udt_deep depending on string fields
@@ -8721,11 +8739,11 @@ pub const BlockEmitter = struct {
                     }
                     break :blk 0;
                 };
-                const offsets_label = try std.fmt.allocPrint(self.allocator, "$str_offsets_{s}", .{info.udt_name});
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size, offsets_label, num_offsets });
+                const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{info.udt_name});
+                const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size, offsets_label, num_offsets });
                 try self.builder.emitCall("", "", "unmarshall_udt_deep", args);
             } else {
-                const args = try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size });
+                const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}", .{ blob_ptr, udt_ptr, obj_size });
                 try self.builder.emitCall("", "", "unmarshall_udt", args);
             }
             return;
@@ -8775,11 +8793,11 @@ pub const BlockEmitter = struct {
 
             // BASIC syntax is LOCATE col, row but runtime is basic_locate(row, col)
             // So we swap the parameters here
-            const args = try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ col_int, row_int });
+            const args = try bufPrintDupe(self.allocator, "w {s}, w {s}", .{ col_int, row_int });
             try self.runtime.callVoid("basic_locate", args);
         } else {
             // Column defaults to 1
-            const args = try std.fmt.allocPrint(self.allocator, "w 1, w {s}", .{row_int});
+            const args = try bufPrintDupe(self.allocator, "w 1, w {s}", .{row_int});
             try self.runtime.callVoid("basic_locate", args);
         }
     }
@@ -8808,11 +8826,11 @@ pub const BlockEmitter = struct {
                 break :blk t;
             };
 
-            const args = try std.fmt.allocPrint(self.allocator, "w {s}, w {s}", .{ fg_int, bg_int });
+            const args = try bufPrintDupe(self.allocator, "w {s}, w {s}", .{ fg_int, bg_int });
             try self.runtime.callVoid("basic_color_bg", args);
         } else {
             // Foreground only
-            const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{fg_int});
+            const args = try bufPrintDupe(self.allocator, "w {s}", .{fg_int});
             try self.runtime.callVoid("basic_color", args);
         }
     }
@@ -8915,7 +8933,7 @@ pub const BlockEmitter = struct {
             break :blk t;
         };
 
-        const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{enable_int});
+        const args = try bufPrintDupe(self.allocator, "w {s}", .{enable_int});
         try self.runtime.callVoid("basic_kbraw", args);
     }
 
@@ -8931,7 +8949,7 @@ pub const BlockEmitter = struct {
             break :blk t;
         };
 
-        const args = try std.fmt.allocPrint(self.allocator, "w {s}", .{enable_int});
+        const args = try bufPrintDupe(self.allocator, "w {s}", .{enable_int});
         try self.runtime.callVoid("basic_kbecho", args);
     }
 
@@ -8958,12 +8976,12 @@ pub const BlockEmitter = struct {
     fn emitLetStatement(self: *BlockEmitter, lt: *const ast.LetStmt) EmitError!void {
         // ── List subscript assignment: myList(n) = value → list_set_* ──
         if (lt.indices.len > 0 and lt.member_chain.len == 0 and self.expr_emitter.isListVariable(lt.variable)) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LIST subscript assign: {s}(...) = ...", .{lt.variable}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "LIST subscript assign: {s}(...) = ...", .{lt.variable}));
 
             // Load the list pointer
             const var_name = try self.symbol_mapper.globalVarName(lt.variable, null);
             const list_ptr = try self.builder.newTemp();
-            try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+            try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
 
             // Evaluate the index expression
             const idx_val = try self.expr_emitter.emitExpression(lt.indices[0]);
@@ -8985,9 +9003,9 @@ pub const BlockEmitter = struct {
             const elt = self.expr_emitter.listElementType(lt.variable);
 
             if (elt.isString()) {
-                try self.builder.emitCall("", "", "list_set_ptr", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val }));
+                try self.builder.emitCall("", "", "list_set_ptr", try bufPrintDupe(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val }));
             } else if (elt.isFloat() or elt == .single) {
-                try self.builder.emitCall("", "", "list_set_float", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, d {s}", .{ list_ptr, idx_l, val }));
+                try self.builder.emitCall("", "", "list_set_float", try bufPrintDupe(self.allocator, "l {s}, l {s}, d {s}", .{ list_ptr, idx_l, val }));
             } else {
                 // Integer: extend to long for list_set_int
                 const val_l = if (self.expr_emitter.inferExprType(lt.value) == .integer) blk: {
@@ -8995,7 +9013,7 @@ pub const BlockEmitter = struct {
                     try self.builder.emit("    {s} =l extsw {s}\n", .{ ext, val });
                     break :blk ext;
                 } else val;
-                try self.builder.emitCall("", "", "list_set_int", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val_l }));
+                try self.builder.emitCall("", "", "list_set_int", try bufPrintDupe(self.allocator, "l {s}, l {s}, l {s}", .{ list_ptr, idx_l, val_l }));
             }
             return;
         }
@@ -9068,10 +9086,10 @@ pub const BlockEmitter = struct {
                             const desc_name_early = try self.symbol_mapper.arrayDescName(lt.variable);
                             const desc_addr_early = try self.builder.newTemp();
                             try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr_early, desc_name_early });
-                            const bc_args_early = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
+                            const bc_args_early = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
                             try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args_early);
                             const elem_addr_early = try self.builder.newTemp();
-                            const ea_args_early = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
+                            const ea_args_early = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr_early, index_int_early });
                             try self.builder.emitCall(elem_addr_early, "l", "fbc_array_element_addr", ea_args_early);
 
                             if (try self.tryEmitUDTArithmetic(lt, elem_addr_early, arr_udt_name)) {
@@ -9095,7 +9113,7 @@ pub const BlockEmitter = struct {
                 if (std.ascii.eqlIgnoreCase(lt.variable, self.method_name)) {
                     const expr_type = self.expr_emitter.inferExprType(lt.value);
                     const ret_store = self.method_ret_type.base_type.toQBEMemOp();
-                    const effective_val = try self.emitTypeConversion(val, expr_type, self.method_ret_type.base_type);
+                    const effective_val = try self.emitTypeConversion(val, expr_type, self.method_ret_type.base_type, lt.value);
                     try self.builder.emitStore(ret_store, effective_val, self.method_ret_slot);
                     return;
                 }
@@ -9113,7 +9131,7 @@ pub const BlockEmitter = struct {
                     if (fctx.return_addr) |ret_addr| {
                         const expr_type = self.expr_emitter.inferExprType(lt.value);
                         const ret_store = fctx.return_base_type.toQBEMemOp();
-                        const effective_val = try self.emitTypeConversion(val, expr_type, fctx.return_base_type);
+                        const effective_val = try self.emitTypeConversion(val, expr_type, fctx.return_base_type, lt.value);
                         try self.builder.emitStore(ret_store, effective_val, ret_addr);
                         return;
                     }
@@ -9192,36 +9210,31 @@ pub const BlockEmitter = struct {
             // generic emitTypeConversion which would insert a spurious
             // `extsw` (sign-extend-word) that truncates the upper 32 bits.
             const expr_type = self.expr_emitter.inferExprType(lt.value);
-            const target_is_long = (resolved.base_type == .long or resolved.base_type == .ulong);
-            const source_is_long = (expr_type == .integer and self.expr_emitter.isLongExpr(lt.value));
-            const effective_val = if (source_is_long and target_is_long)
-                val
-            else
-                try self.emitTypeConversion(val, expr_type, resolved.base_type);
+            const effective_val = try self.emitTypeConversion(val, expr_type, resolved.base_type, lt.value);
             try self.builder.emitStore(resolved.store_type, effective_val, var_addr);
             return;
         }
 
         // ── Hashmap subscript store: dict("key") = value ────────────────
         if (lt.indices.len > 0 and self.expr_emitter.isHashmapVariable(lt.variable)) {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "HASHMAP insert: {s}(...) = ...", .{lt.variable}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "HASHMAP insert: {s}(...) = ...", .{lt.variable}));
 
             // Load the hashmap pointer from the global variable
             const hm_var_name = try self.symbol_mapper.globalVarName(lt.variable, null);
             const map_ptr = try self.builder.newTemp();
-            try self.builder.emitLoad(map_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{hm_var_name}));
+            try self.builder.emitLoad(map_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{hm_var_name}));
 
             // Evaluate the key expression (string descriptor)
             const key_val = try self.expr_emitter.emitExpression(lt.indices[0]);
 
             // Convert StringDescriptor* → C string (char*) for hashmap API
             const key_cstr = try self.builder.newTemp();
-            try self.builder.emitCall(key_cstr, "l", "string_to_utf8", try std.fmt.allocPrint(self.allocator, "l {s}", .{key_val}));
+            try self.builder.emitCall(key_cstr, "l", "string_to_utf8", try bufPrintDupe(self.allocator, "l {s}", .{key_val}));
 
             // The value is already emitted (val). It's a StringDescriptor* for string values.
             // Call hashmap_insert(map, key_cstr, value)
             const insert_result = try self.builder.newTemp();
-            try self.builder.emitCall(insert_result, "w", "hashmap_insert", try std.fmt.allocPrint(self.allocator, "l {s}, l {s}, l {s}", .{ map_ptr, key_cstr, val }));
+            try self.builder.emitCall(insert_result, "w", "hashmap_insert", try bufPrintDupe(self.allocator, "l {s}, l {s}, l {s}", .{ map_ptr, key_cstr, val }));
             return;
         }
 
@@ -9241,12 +9254,12 @@ pub const BlockEmitter = struct {
             try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
             // Bounds check
-            const bc_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+            const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
             try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
 
             // Get element address
             const elem_addr = try self.builder.newTemp();
-            const ea_args = try std.fmt.allocPrint(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+            const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
             try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
 
             // Look up the array element type from the symbol table so we
@@ -9308,7 +9321,7 @@ pub const BlockEmitter = struct {
                             if (current_cls.findField(member_name)) |field_info| {
                                 const field_addr = try self.builder.newTemp();
                                 if (field_info.offset > 0) {
-                                    try self.builder.emitBinary(field_addr, "l", "add", current_addr3, try std.fmt.allocPrint(self.allocator, "{d}", .{field_info.offset}));
+                                    try self.builder.emitBinary(field_addr, "l", "add", current_addr3, try bufPrintDupe(self.allocator, "{d}", .{field_info.offset}));
                                 } else {
                                     try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, current_addr3 });
                                 }
@@ -9316,7 +9329,7 @@ pub const BlockEmitter = struct {
                                 if (is_last) {
                                     const field_store_type = field_info.type_desc.base_type.toQBEMemOp();
                                     const expr_type = self.expr_emitter.inferExprType(lt.value);
-                                    const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type);
+                                    const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type, lt.value);
                                     try self.builder.emitStore(field_store_type, effective_val, field_addr);
                                 } else {
                                     const next_addr = try self.builder.newTemp();
@@ -9332,7 +9345,7 @@ pub const BlockEmitter = struct {
                                     }
                                 }
                             } else {
-                                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, current_cls.name }));
+                                try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, current_cls.name }));
                             }
                         }
                         return;
@@ -9354,14 +9367,14 @@ pub const BlockEmitter = struct {
                                         if (std.mem.eql(u8, field.name, member_name)) {
                                             const field_addr = try self.builder.newTemp();
                                             if (offset2 > 0) {
-                                                try self.builder.emitBinary(field_addr, "l", "add", current_addr4, try std.fmt.allocPrint(self.allocator, "{d}", .{offset2}));
+                                                try self.builder.emitBinary(field_addr, "l", "add", current_addr4, try bufPrintDupe(self.allocator, "{d}", .{offset2}));
                                             } else {
                                                 try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, current_addr4 });
                                             }
                                             if (is_last) {
                                                 const field_store_type = field.type_desc.base_type.toQBEMemOp();
                                                 const expr_type = self.expr_emitter.inferExprType(lt.value);
-                                                const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type);
+                                                const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type, lt.value);
                                                 try self.builder.emitStore(field_store_type, effective_val, field_addr);
                                             } else {
                                                 // For inline UDT fields, the field address
@@ -9394,7 +9407,7 @@ pub const BlockEmitter = struct {
                 }
 
                 // Fallback: store directly (flat field offset unknown)
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unresolved array element member store {s}(...).{s}", .{ lt.variable, lt.member_chain[0] }));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unresolved array element member store {s}(...).{s}", .{ lt.variable, lt.member_chain[0] }));
                 try self.builder.emitStore(arr_store_type, val, elem_addr);
                 return;
             }
@@ -9426,7 +9439,7 @@ pub const BlockEmitter = struct {
                 }
             } else {
                 const expr_type = self.expr_emitter.inferExprType(lt.value);
-                const effective_val = try self.emitTypeConversion(val, expr_type, arr_bt);
+                const effective_val = try self.emitTypeConversion(val, expr_type, arr_bt, lt.value);
                 try self.builder.emitStore(arr_store_type, effective_val, elem_addr);
             }
             return;
@@ -9441,16 +9454,16 @@ pub const BlockEmitter = struct {
                     if (lt.member_chain.len == 1) {
                         const member_name = lt.member_chain[0];
                         if (cls.findField(member_name)) |field_info| {
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ME.{s} = ... (offset {d})", .{ member_name, field_info.offset }));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "ME.{s} = ... (offset {d})", .{ member_name, field_info.offset }));
                             const field_addr = try self.builder.newTemp();
                             if (field_info.offset > 0) {
-                                try self.builder.emitBinary(field_addr, "l", "add", "%me", try std.fmt.allocPrint(self.allocator, "{d}", .{field_info.offset}));
+                                try self.builder.emitBinary(field_addr, "l", "add", "%me", try bufPrintDupe(self.allocator, "{d}", .{field_info.offset}));
                             } else {
                                 try self.builder.emit("    {s} =l copy %me\n", .{field_addr});
                             }
                             const field_store_type = field_info.type_desc.base_type.toQBEMemOp();
                             const expr_type = self.expr_emitter.inferExprType(lt.value);
-                            const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type);
+                            const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type, lt.value);
                             try self.builder.emitStore(field_store_type, effective_val, field_addr);
                             return;
                         }
@@ -9486,7 +9499,7 @@ pub const BlockEmitter = struct {
                         if (current_cls.findField(member_name)) |field_info| {
                             const field_addr = try self.builder.newTemp();
                             if (field_info.offset > 0) {
-                                try self.builder.emitBinary(field_addr, "l", "add", current_addr2, try std.fmt.allocPrint(self.allocator, "{d}", .{field_info.offset}));
+                                try self.builder.emitBinary(field_addr, "l", "add", current_addr2, try bufPrintDupe(self.allocator, "{d}", .{field_info.offset}));
                             } else {
                                 try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, current_addr2 });
                             }
@@ -9494,7 +9507,7 @@ pub const BlockEmitter = struct {
                             if (is_last) {
                                 const field_store_type = field_info.type_desc.base_type.toQBEMemOp();
                                 const expr_type = self.expr_emitter.inferExprType(lt.value);
-                                const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type);
+                                const effective_val = try self.emitTypeConversion(val, expr_type, field_info.type_desc.base_type, lt.value);
                                 try self.builder.emitStore(field_store_type, effective_val, field_addr);
                             } else {
                                 // Intermediate: load pointer for nested access
@@ -9512,7 +9525,7 @@ pub const BlockEmitter = struct {
                                 }
                             }
                         } else {
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, current_cls.name }));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, current_cls.name }));
                         }
                     }
                     return;
@@ -9547,7 +9560,7 @@ pub const BlockEmitter = struct {
                 // global slot (allocated by CREATE).  Load the pointer
                 // with loadl so we get the actual struct address for
                 // field offset calculations.
-                try self.builder.emitLoad(base_addr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(base_addr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
             }
 
             // Walk the member chain to compute the final field address.
@@ -9616,7 +9629,7 @@ pub const BlockEmitter = struct {
                                 found = true;
                                 const field_addr = try self.builder.newTemp();
                                 if (offset > 0) {
-                                    try self.builder.emitBinary(field_addr, "l", "add", current_addr, try std.fmt.allocPrint(self.allocator, "{d}", .{offset}));
+                                    try self.builder.emitBinary(field_addr, "l", "add", current_addr, try bufPrintDupe(self.allocator, "{d}", .{offset}));
                                 } else {
                                     try self.builder.emit("    {s} =l copy {s}\n", .{ field_addr, current_addr });
                                 }
@@ -9637,7 +9650,7 @@ pub const BlockEmitter = struct {
                                         // Store the value at this field.
                                         const field_store_type = field.type_desc.base_type.toQBEMemOp();
                                         const expr_type = self.expr_emitter.inferExprType(lt.value);
-                                        const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type);
+                                        const effective_val = try self.emitTypeConversion(val, expr_type, field.type_desc.base_type, lt.value);
                                         try self.builder.emitStore(field_store_type, effective_val, field_addr);
                                     }
                                 } else {
@@ -9665,18 +9678,20 @@ pub const BlockEmitter = struct {
                             offset += if (field_size == 0) 8 else field_size;
                         }
                         if (!found) {
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, tn }));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: field .{s} not found in {s}", .{ member_name, tn }));
                         }
                     }
                 } else {
-                    try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "WARN: unresolved type for .{s}", .{member_name}));
+                    try self.builder.emitComment(try bufPrintDupe(self.allocator, "WARN: unresolved type for .{s}", .{member_name}));
                 }
             }
         }
     }
 
     /// Convert a value from one expression type to a target BaseType.
-    fn emitTypeConversion(self: *BlockEmitter, val: []const u8, from: ExprEmitter.ExprType, to_bt: semantic.BaseType) EmitError![]const u8 {
+    /// When `source_expr` is provided the function can detect LONG (64-bit)
+    /// integer sources and skip the `extsw` that would truncate them.
+    fn emitTypeConversion(self: *BlockEmitter, val: []const u8, from: ExprEmitter.ExprType, to_bt: semantic.BaseType, source_expr: ?*const ast.Expression) EmitError![]const u8 {
         const target_qbe = to_bt.toQBEType();
         const is_long_target = std.mem.eql(u8, target_qbe, "l") and to_bt.isInteger();
 
@@ -9719,11 +9734,17 @@ pub const BlockEmitter = struct {
             try self.builder.emit("    {s} =s truncd {s}\n", .{ dest, tmp });
             return dest;
         }
-        // Integer (w) → Long (l): sign-extend
+        // Integer (w) → Long (l): sign-extend.
+        // However, if the source expression is already a LONG (64-bit),
+        // the value is already `l`-typed — inserting `extsw` would
+        // truncate the upper 32 bits.  Skip in that case.
         if (from == .integer and is_long_target) {
-            const dest = try self.builder.newTemp();
-            try self.builder.emitExtend(dest, "l", "extsw", val);
-            return dest;
+            const already_long = if (source_expr) |expr| self.expr_emitter.isLongExpr(expr) else false;
+            if (!already_long) {
+                const dest = try self.builder.newTemp();
+                try self.builder.emitExtend(dest, "l", "extsw", val);
+                return dest;
+            }
         }
         // Otherwise: no conversion needed.
         return val;
@@ -9733,7 +9754,7 @@ pub const BlockEmitter = struct {
         for (dim.arrays) |arr| {
             if (arr.dimensions.len > 0) {
                 // ── Array DIM: allocate via runtime ─────────────────────
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s}(...)", .{arr.name}));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "DIM {s}(...)", .{arr.name}));
 
                 // Evaluate the upper bound expression for dimension 1.
                 const upper_val = try self.expr_emitter.emitExpression(arr.dimensions[0]);
@@ -9767,7 +9788,7 @@ pub const BlockEmitter = struct {
                 try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
                 // Call array_create(ndims=1, desc, upper_bound, elem_size)
-                const create_args = try std.fmt.allocPrint(
+                const create_args = try bufPrintDupe(
                     self.allocator,
                     "w 1, l {s}, w {s}, w {d}",
                     .{ desc_addr, upper_int, actual_elem_size },
@@ -9810,7 +9831,7 @@ pub const BlockEmitter = struct {
                 } else semantic.baseTypeFromSuffix(arr.type_suffix);
                 const var_name = try self.symbol_mapper.globalVarName(arr.name, effective_dim_suffix);
                 const store_type = bt.toQBEMemOp();
-                const var_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name});
+                const var_addr = try bufPrintDupe(self.allocator, "${s}", .{var_name});
 
                 // For class instances, objects (LIST/HASHMAP), and UDT
                 // pointers, no conversion needed — source and target are
@@ -9820,7 +9841,7 @@ pub const BlockEmitter = struct {
                 } else {
                     // Convert value to target type if needed.
                     const expr_type = self.expr_emitter.inferExprType(init_expr);
-                    const effective_val = try self.emitTypeConversion(val, expr_type, bt);
+                    const effective_val = try self.emitTypeConversion(val, expr_type, bt, init_expr);
                     try self.builder.emitStore(store_type, effective_val, var_addr);
                 }
             } else {
@@ -9831,17 +9852,17 @@ pub const BlockEmitter = struct {
                     if (arr.as_type_keyword) |kw| {
                         if (kw == .kw_hashmap) {
                             // DIM x AS HASHMAP → hashmap_new(128)
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS HASHMAP", .{arr.name}));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "DIM {s} AS HASHMAP", .{arr.name}));
                             const var_name = try self.symbol_mapper.globalVarName(arr.name, null);
-                            const var_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name});
+                            const var_addr = try bufPrintDupe(self.allocator, "${s}", .{var_name});
                             const map_ptr = try self.builder.newTemp();
                             try self.builder.emitCall(map_ptr, "l", "hashmap_new", "w 128");
                             try self.builder.emitStore("l", map_ptr, var_addr);
                         } else if (kw == .kw_list) {
                             // DIM x AS LIST → list_create()
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS LIST", .{arr.name}));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "DIM {s} AS LIST", .{arr.name}));
                             const var_name = try self.symbol_mapper.globalVarName(arr.name, null);
-                            const var_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name});
+                            const var_addr = try bufPrintDupe(self.allocator, "${s}", .{var_name});
                             const list_ptr = try self.builder.newTemp();
                             try self.builder.emitCall(list_ptr, "l", "list_create", "");
                             try self.builder.emitStore("l", list_ptr, var_addr);
@@ -9862,11 +9883,11 @@ pub const BlockEmitter = struct {
                             const udt_size = self.type_manager.sizeOfUDT(arr.as_type_name);
                             const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
 
-                            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
+                            try self.builder.emitComment(try bufPrintDupe(self.allocator, "DIM {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
                             const var_name = try self.symbol_mapper.globalVarName(arr.name, null);
-                            const var_addr = try std.fmt.allocPrint(self.allocator, "${s}", .{var_name});
+                            const var_addr = try bufPrintDupe(self.allocator, "${s}", .{var_name});
                             const udt_ptr = try self.builder.newTemp();
-                            try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                            try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try bufPrintDupe(self.allocator, "l {d}", .{alloc_size}));
                             try self.builder.emitStore("l", udt_ptr, var_addr);
                         }
                     }
@@ -9938,9 +9959,9 @@ pub const BlockEmitter = struct {
             if (arr.as_type_name.len > 0) {
                 const udt_size = self.type_manager.sizeOfUDT(arr.as_type_name);
                 const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DIM {s} AS {s} (local auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "DIM {s} AS {s} (local auto-alloc UDT, {d} bytes)", .{ arr.name, arr.as_type_name, alloc_size }));
                 const udt_ptr = try self.builder.newTemp();
-                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try bufPrintDupe(self.allocator, "l {d}", .{alloc_size}));
                 try self.builder.emitStore("l", udt_ptr, addr);
             } else {
                 try self.builder.emitStore("l", "0", addr);
@@ -9956,7 +9977,7 @@ pub const BlockEmitter = struct {
                 try self.builder.emitStore("l", init_val, addr);
             } else {
                 const expr_type = self.expr_emitter.inferExprType(init_expr);
-                const effective = try self.emitTypeConversion(init_val, expr_type, bt);
+                const effective = try self.emitTypeConversion(init_val, expr_type, bt, init_expr);
                 try self.builder.emitStore(bt.toQBEMemOp(), effective, addr);
             }
         }
@@ -9975,7 +9996,7 @@ pub const BlockEmitter = struct {
         if (bt == .class_instance and arr.as_type_name.len > 0) {
             if (self.func_ctx != null) {
                 // Register a VariableSymbol so inferClassName can resolve the class name.
-                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                     fctx.upper_name, upper_key,
                 });
                 const mut_st: *semantic.SymbolTable = @constCast(self.symbol_table);
@@ -9996,7 +10017,7 @@ pub const BlockEmitter = struct {
         // (e.g. v.X where v is DIM v AS Vec3 inside a WORKER/FUNCTION).
         if (bt == .user_defined and arr.as_type_name.len > 0) {
             if (self.func_ctx != null) {
-                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                     fctx.upper_name, upper_key,
                 });
                 const type_id = self.symbol_table.getTypeId(arr.as_type_name) orelse -1;
@@ -10026,19 +10047,19 @@ pub const BlockEmitter = struct {
         for (er.array_names) |arr_name| {
             // Check if this is a LIST variable
             if (self.expr_emitter.isListVariable(arr_name)) {
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ERASE LIST: {s}", .{arr_name}));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "ERASE LIST: {s}", .{arr_name}));
                 // Load the list pointer
                 const var_name = try self.symbol_mapper.globalVarName(arr_name, null);
                 const list_ptr = try self.builder.newTemp();
-                try self.builder.emitLoad(list_ptr, "l", try std.fmt.allocPrint(self.allocator, "${s}", .{var_name}));
+                try self.builder.emitLoad(list_ptr, "l", try bufPrintDupe(self.allocator, "${s}", .{var_name}));
                 // Call list_clear to empty the list
-                try self.builder.emitCall("", "", "list_clear", try std.fmt.allocPrint(self.allocator, "l {s}", .{list_ptr}));
+                try self.builder.emitCall("", "", "list_clear", try bufPrintDupe(self.allocator, "l {s}", .{list_ptr}));
             } else {
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ERASE array: {s}", .{arr_name}));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "ERASE array: {s}", .{arr_name}));
                 const desc_name = try self.symbol_mapper.arrayDescName(arr_name);
                 const desc_addr = try self.builder.newTemp();
                 try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
-                try self.builder.emitCall("", "", "array_descriptor_erase", try std.fmt.allocPrint(self.allocator, "l {s}", .{desc_addr}));
+                try self.builder.emitCall("", "", "array_descriptor_erase", try bufPrintDupe(self.allocator, "l {s}", .{desc_addr}));
             }
         }
     }
@@ -10048,7 +10069,7 @@ pub const BlockEmitter = struct {
         // function by name.  We register them so that resolveVarAddr
         // skips the function context and falls through to the global.
         for (sh_stmt.variables) |sv| {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "SHARED {s}", .{sv.name}));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "SHARED {s}", .{sv.name}));
             try self.symbol_mapper.registerShared(sv.name);
         }
     }
@@ -10155,7 +10176,7 @@ pub const BlockEmitter = struct {
                 } else if (std.mem.eql(u8, ret_t, "w") and expr_et == .integer and self.expr_emitter.isLongExpr(rv)) {
                     // long → word: truncate (shouldn't normally happen, but be safe)
                     const cvt = try self.builder.newTemp();
-                    try self.builder.emitInstruction(try std.fmt.allocPrint(
+                    try self.builder.emitInstruction(try bufPrintDupe(
                         self.allocator,
                         "{s} =w copy {s}",
                         .{ cvt, val },
@@ -10253,12 +10274,12 @@ pub const BlockEmitter = struct {
                     try emitter.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
                     // Bounds check
-                    const bc_args = try std.fmt.allocPrint(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                    const bc_args = try bufPrintDupe(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
                     try emitter.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
 
                     // Get element address
                     const elem_addr = try emitter.builder.newTemp();
-                    const ea_args = try std.fmt.allocPrint(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                    const ea_args = try bufPrintDupe(emitter.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
                     try emitter.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
 
                     // Look up array element type
@@ -10345,9 +10366,9 @@ pub const BlockEmitter = struct {
                 // store the pointer in the stack slot.
                 const udt_size = self.type_manager.sizeOfUDT(local_as_type_name);
                 const alloc_size: u32 = if (udt_size == 0) 8 else udt_size;
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "LOCAL {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ lv.name, local_as_type_name, alloc_size }));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "LOCAL {s} AS {s} (auto-alloc UDT, {d} bytes)", .{ lv.name, local_as_type_name, alloc_size }));
                 const udt_ptr = try self.builder.newTemp();
-                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try std.fmt.allocPrint(self.allocator, "l {d}", .{alloc_size}));
+                try self.builder.emitCall(udt_ptr, "l", "basic_malloc", try bufPrintDupe(self.allocator, "l {d}", .{alloc_size}));
                 try self.builder.emitStore("l", udt_ptr, addr);
             } else if (bt.isNumeric()) {
                 if (bt.isInteger()) {
@@ -10363,7 +10384,7 @@ pub const BlockEmitter = struct {
             if (lv.initial_value) |init_expr| {
                 const init_val = try self.expr_emitter.emitExpression(init_expr);
                 const expr_type = self.expr_emitter.inferExprType(init_expr);
-                const effective = try self.emitTypeConversion(init_val, expr_type, bt);
+                const effective = try self.emitTypeConversion(init_val, expr_type, bt, init_expr);
                 try self.builder.emitStore(bt.toQBEMemOp(), effective, addr);
             }
 
@@ -10386,7 +10407,7 @@ pub const BlockEmitter = struct {
             // inferUDTName can resolve the type name for member
             // access (e.g. P.X where P is LOCAL P AS Point).
             if ((bt == .user_defined or bt == .class_instance) and local_as_type_name.len > 0) {
-                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                     fctx.upper_name, upper_key,
                 });
                 const mut_st: *semantic.SymbolTable = @constCast(self.symbol_table);
@@ -10639,7 +10660,7 @@ pub const CFGCodeGenerator = struct {
                     // table with a scoped key so inferClassName can resolve
                     // the class name for method calls on them.
                     if (p_bt == .class_instance and pt_desc.class_name.len > 0) {
-                        const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                        const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                             upper_name_stripped, param_key,
                         });
                         const mut_st: *semantic.SymbolTable = @constCast(st);
@@ -10719,7 +10740,7 @@ pub const CFGCodeGenerator = struct {
                         // Register class-instance SUB parameters in the
                         // symbol table so inferClassName can resolve them.
                         if (p_bt == .class_instance and pt_desc.class_name.len > 0) {
-                            const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                            const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                                 duped_upper, param_key,
                             });
                             const mut_st2: *semantic.SymbolTable = @constCast(st);
@@ -10862,7 +10883,7 @@ pub const CFGCodeGenerator = struct {
 
                             // Copy parameter value to stack slot.
                             const p_stripped = SymbolMapper.stripSuffix(param);
-                            const param_temp = try std.fmt.allocPrint(self.allocator, "%{s}", .{p_stripped});
+                            const param_temp = try bufPrintDupe(self.allocator, "%{s}", .{p_stripped});
                             try self.builder.emitStore(p_bt.toQBEMemOp(), param_temp, pi.addr);
                         }
 
@@ -11086,7 +11107,7 @@ pub const CFGCodeGenerator = struct {
         const vtable_label = try self.symbol_mapper.vtableName(cls.name);
         const classname_label = try self.symbol_mapper.classNameStringLabel(cls.name);
 
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "VTable for {s} (class_id={d}, {d} methods)", .{ cls.name, cls.class_id, cls.methods.len }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "VTable for {s} (class_id={d}, {d} methods)", .{ cls.name, cls.class_id, cls.methods.len }));
 
         try self.builder.emit("data ${s} = {{\n", .{vtable_label});
 
@@ -11185,8 +11206,8 @@ pub const CFGCodeGenerator = struct {
 
     /// Emit a data section: data $str_offsets_NAME = { w val1, w val2, ... }
     fn emitOffsetDataSection(self: *CFGCodeGenerator, type_name: []const u8, offsets: []const u32) !void {
-        const label = try std.fmt.allocPrint(self.allocator, "str_offsets_{s}", .{type_name});
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "String field offsets for {s} ({d} fields)", .{ type_name, offsets.len }));
+        const label = try bufPrintDupe(self.allocator, "str_offsets_{s}", .{type_name});
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "String field offsets for {s} ({d} fields)", .{ type_name, offsets.len }));
         try self.builder.emit("data ${s} = {{\n", .{label});
         for (offsets, 0..) |off, i| {
             if (i > 0) try self.builder.raw(",\n");
@@ -11197,7 +11218,7 @@ pub const CFGCodeGenerator = struct {
 
     fn emitClassConstructor(self: *CFGCodeGenerator, _: *const ast.ClassStmt, ctor: *const ast.ConstructorStmt, cls: *const semantic.ClassSymbol) !void {
         try self.builder.emitBlankLine();
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "CONSTRUCTOR {s}", .{cls.name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "CONSTRUCTOR {s}", .{cls.name}));
 
         // Build parameter list: first param is always l %me
         var params_buf: std.ArrayList(u8) = .empty;
@@ -11225,7 +11246,7 @@ pub const CFGCodeGenerator = struct {
 
         // Create a FunctionContext so that parameter variables resolve
         // to their stack slots (matching C++ registerMethodParam pattern).
-        const ctor_upper = try std.fmt.allocPrint(self.allocator, "{s}__CONSTRUCTOR", .{cls.name});
+        const ctor_upper = try bufPrintDupe(self.allocator, "{s}__CONSTRUCTOR", .{cls.name});
         var func_ctx = FunctionContext.init(
             self.allocator,
             ctor_upper,
@@ -11257,7 +11278,7 @@ pub const CFGCodeGenerator = struct {
                 else => @as(?Tag, null),
             };
             const param_stripped = SymbolMapper.stripSuffix(param);
-            const var_name = try std.fmt.allocPrint(self.allocator, "%var_{s}", .{param_stripped});
+            const var_name = try bufPrintDupe(self.allocator, "%var_{s}", .{param_stripped});
             const size_str: []const u8 = if (std.mem.eql(u8, pt, "w") or std.mem.eql(u8, pt, "s")) "4" else "8";
             try self.builder.emit("    {s} =l alloc8 {s}\n", .{ var_name, size_str });
             const store_op: []const u8 = if (std.mem.eql(u8, pt, "w")) "storew" else if (std.mem.eql(u8, pt, "s")) "stores" else if (std.mem.eql(u8, pt, "d")) "stored" else "storel";
@@ -11336,7 +11357,7 @@ pub const CFGCodeGenerator = struct {
     fn emitClassDestructor(self: *CFGCodeGenerator, class_stmt: *const ast.ClassStmt, dtor: *const ast.DestructorStmt, cls: *const semantic.ClassSymbol) !void {
         _ = class_stmt;
         try self.builder.emitBlankLine();
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "DESTRUCTOR {s}", .{cls.name}));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "DESTRUCTOR {s}", .{cls.name}));
 
         try self.builder.emitFunctionStart(cls.destructor_mangled_name, "", "l %me");
         try self.builder.emitLabel("start");
@@ -11347,7 +11368,7 @@ pub const CFGCodeGenerator = struct {
         }
 
         // Create a minimal FunctionContext for destructor body
-        const dtor_upper = try std.fmt.allocPrint(self.allocator, "{s}__DESTRUCTOR", .{cls.name});
+        const dtor_upper = try bufPrintDupe(self.allocator, "{s}__DESTRUCTOR", .{cls.name});
         var func_ctx = FunctionContext.init(self.allocator, dtor_upper, dtor_upper, false, "", .void);
         defer func_ctx.deinit();
         self.block_emitter.?.setFunctionContext(&func_ctx);
@@ -11368,7 +11389,7 @@ pub const CFGCodeGenerator = struct {
         // Chain to parent destructor
         if (cls.parent_class) |parent| {
             if (parent.has_destructor) {
-                try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "Chain to parent destructor: {s}", .{parent.name}));
+                try self.builder.emitComment(try bufPrintDupe(self.allocator, "Chain to parent destructor: {s}", .{parent.name}));
                 try self.builder.emitCall("", "", parent.destructor_mangled_name, "l %me");
             }
         }
@@ -11387,12 +11408,12 @@ pub const CFGCodeGenerator = struct {
 
         // Find the method info from the ClassSymbol
         const method_info = cls.findMethod(method.method_name) orelse {
-            try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "ERROR: method '{s}' not found in ClassSymbol '{s}'", .{ method.method_name, cls.name }));
+            try self.builder.emitComment(try bufPrintDupe(self.allocator, "ERROR: method '{s}' not found in ClassSymbol '{s}'", .{ method.method_name, cls.name }));
             return;
         };
 
         try self.builder.emitBlankLine();
-        try self.builder.emitComment(try std.fmt.allocPrint(self.allocator, "METHOD {s}.{s}", .{ cls.name, method.method_name }));
+        try self.builder.emitComment(try bufPrintDupe(self.allocator, "METHOD {s}.{s}", .{ cls.name, method.method_name }));
 
         // Determine return type
         const ret_type = if (method_info.return_type.base_type != .void)
@@ -11463,7 +11484,7 @@ pub const CFGCodeGenerator = struct {
                 else => @as(?Tag, null),
             };
             const param_stripped = SymbolMapper.stripSuffix(param);
-            const var_name = try std.fmt.allocPrint(self.allocator, "%var_{s}", .{param_stripped});
+            const var_name = try bufPrintDupe(self.allocator, "%var_{s}", .{param_stripped});
             const size_str: []const u8 = if (std.mem.eql(u8, pt, "w") or std.mem.eql(u8, pt, "s")) "4" else "8";
             try self.builder.emit("    {s} =l alloc8 {s}\n", .{ var_name, size_str });
             const store_op: []const u8 = if (std.mem.eql(u8, pt, "w")) "storew" else if (std.mem.eql(u8, pt, "s")) "stores" else if (std.mem.eql(u8, pt, "d")) "stored" else "storel";
@@ -11488,7 +11509,7 @@ pub const CFGCodeGenerator = struct {
             if (p_bt == .class_instance and i < method_info.parameter_types.len and
                 method_info.parameter_types[i].class_name.len > 0)
             {
-                const var_key = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{
+                const var_key = try bufPrintDupe(self.allocator, "{s}.{s}", .{
                     method_upper, param_key,
                 });
                 const mut_st: *semantic.SymbolTable = @constCast(self.semantic.getSymbolTable());
@@ -11560,7 +11581,7 @@ pub const CFGCodeGenerator = struct {
 
         // Emit fallback return
         const fallback_id = self.builder.nextLabelId();
-        try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "method_fallback_{d}", .{fallback_id}));
+        try self.builder.emitLabel(try bufPrintDupe(self.allocator, "method_fallback_{d}", .{fallback_id}));
 
         if (self.samm_enabled) {
             // Retain the returned object so it survives scope cleanup
@@ -11568,7 +11589,7 @@ pub const CFGCodeGenerator = struct {
                 const ret_ptr = try self.builder.newTemp();
                 try self.builder.emit("    {s} =l loadl {s}\n", .{ ret_ptr, method_ret_slot });
                 try self.builder.emitComment("SAMM: Retain returned object before scope exit");
-                try self.builder.emitCall("", "", "samm_retain", try std.fmt.allocPrint(self.allocator, "l {s}, w 1", .{ret_ptr}));
+                try self.builder.emitCall("", "", "samm_retain", try bufPrintDupe(self.allocator, "l {s}, w 1", .{ret_ptr}));
             }
             try self.builder.emitComment("SAMM: Exit METHOD scope (fallback path)");
             try self.builder.emitCall("", "", "samm_exit_scope", "");
@@ -11639,7 +11660,7 @@ pub const CFGCodeGenerator = struct {
                             const ret_ptr2 = try self.builder.newTemp();
                             try self.builder.emit("    {s} =l loadl {s}\n", .{ ret_ptr2, self.block_emitter.?.method_ret_slot });
                             try self.builder.emitComment("SAMM: Retain returned object before scope exit");
-                            try self.builder.emitCall("", "", "samm_retain", try std.fmt.allocPrint(self.allocator, "l {s}, w 1", .{ret_ptr2}));
+                            try self.builder.emitCall("", "", "samm_retain", try bufPrintDupe(self.allocator, "l {s}, w 1", .{ret_ptr2}));
                         }
                         try self.builder.emitCall("", "", "samm_exit_scope", "");
                     }
@@ -11668,7 +11689,7 @@ pub const CFGCodeGenerator = struct {
                 }
                 // Emit a fresh label so QBE doesn't complain about unreachable code
                 const lbl_id = self.builder.nextLabelId();
-                try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "after_ret_{d}", .{lbl_id}));
+                try self.builder.emitLabel(try bufPrintDupe(self.allocator, "after_ret_{d}", .{lbl_id}));
             },
             .if_stmt => |ifs| {
                 // Simple if/then/else inside class body
@@ -11685,18 +11706,18 @@ pub const CFGCodeGenerator = struct {
                     break :blk t;
                 } else cond_val;
 
-                try self.builder.emitBranch(cond_int, try std.fmt.allocPrint(self.allocator, "then_{d}", .{then_lbl}), try std.fmt.allocPrint(self.allocator, "else_{d}", .{else_lbl}));
-                try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "then_{d}", .{then_lbl}));
+                try self.builder.emitBranch(cond_int, try bufPrintDupe(self.allocator, "then_{d}", .{then_lbl}), try bufPrintDupe(self.allocator, "else_{d}", .{else_lbl}));
+                try self.builder.emitLabel(try bufPrintDupe(self.allocator, "then_{d}", .{then_lbl}));
                 for (ifs.then_statements) |s| {
                     try self.emitClassBodyStatement(s, self.expr_emitter.?.class_ctx.?);
                 }
-                try self.builder.emitJump(try std.fmt.allocPrint(self.allocator, "endif_{d}", .{end_lbl}));
-                try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "else_{d}", .{else_lbl}));
+                try self.builder.emitJump(try bufPrintDupe(self.allocator, "endif_{d}", .{end_lbl}));
+                try self.builder.emitLabel(try bufPrintDupe(self.allocator, "else_{d}", .{else_lbl}));
                 for (ifs.else_statements) |s| {
                     try self.emitClassBodyStatement(s, self.expr_emitter.?.class_ctx.?);
                 }
-                try self.builder.emitJump(try std.fmt.allocPrint(self.allocator, "endif_{d}", .{end_lbl}));
-                try self.builder.emitLabel(try std.fmt.allocPrint(self.allocator, "endif_{d}", .{end_lbl}));
+                try self.builder.emitJump(try bufPrintDupe(self.allocator, "endif_{d}", .{end_lbl}));
+                try self.builder.emitLabel(try bufPrintDupe(self.allocator, "endif_{d}", .{end_lbl}));
             },
             .rem => {},
             .console => |con| try self.block_emitter.?.emitConsoleStatement(&con),
@@ -11776,7 +11797,7 @@ pub const CFGCodeGenerator = struct {
                 const size = self.type_manager.sizeOf(sym.type_desc.base_type);
                 const actual_size: u32 = if (size == 0) 8 else size;
 
-                try self.builder.emitGlobalData(var_name, "z", try std.fmt.allocPrint(self.allocator, "{d}", .{actual_size}));
+                try self.builder.emitGlobalData(var_name, "z", try bufPrintDupe(self.allocator, "{d}", .{actual_size}));
             }
         }
 
@@ -11966,7 +11987,7 @@ fn blockLabel(the_cfg: *const cfg_mod.CFG, block_idx: u32, allocator: std.mem.Al
     if (block.name.len > 0) {
         return block.name;
     }
-    return std.fmt.allocPrint(allocator, "block_{d}", .{block_idx});
+    return bufPrintDupe(allocator, "block_{d}", .{block_idx});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
