@@ -485,6 +485,11 @@ pub const LoadAddrReloc = struct {
     sym_name_len: u8,
     /// Index of the originating JitInst (for diagnostics)
     inst_index: u32,
+    /// Addend: byte offset added to the symbol address (e.g. +16 for
+    /// accessing a field inside a struct/descriptor).  Set from
+    /// JitInst.imm when the QBE CAddr constant carries a non-zero
+    /// bits.i offset.
+    addend: i64,
 
     pub fn getName(self: *const LoadAddrReloc) []const u8 {
         return self.sym_name[0..self.sym_name_len];
@@ -552,6 +557,16 @@ pub const JitModule = struct {
     /// Whether we're currently in a data section (between DATA_START/DATA_END)
     in_data_section: bool,
 
+    /// Pending data symbol: a slice into the *stable* JitInst sym_name
+    /// array saved at DATA_START.  The offset is not committed to the
+    /// symbol table until after DATA_ALIGN (or the first data-emission
+    /// instruction), so that the recorded offset is the true
+    /// post-alignment start of the constant — not the pre-alignment
+    /// position.  We store a slice (not a copy) so the StringHashMap
+    /// key keeps pointing at the same stable memory the old code used.
+    pending_data_sym_name: []const u8,
+    has_pending_data_sym: bool,
+
     /// Current function name (set by JIT_FUNC_BEGIN)
     current_func: [JIT_SYM_MAX]u8,
     current_func_len: u8,
@@ -575,6 +590,8 @@ pub const JitModule = struct {
             .stats = EncodeStats{},
             .allocator = allocator,
             .in_data_section = false,
+            .pending_data_sym_name = &.{},
+            .has_pending_data_sym = false,
             .current_func = [_]u8{0} ** JIT_SYM_MAX,
             .current_func_len = 0,
         };
@@ -676,6 +693,25 @@ pub const JitModule = struct {
         if (padding > 0) {
             try self.emitDataZero(padding);
         }
+        // After aligning, commit any pending data symbol so its offset
+        // points to the true aligned start of the constant.
+        self.commitPendingDataSym();
+    }
+
+    /// If a DATA_START recorded a pending symbol name, commit it to the
+    /// symbol table now — using the *current* data_len as the offset.
+    /// This must be called after alignment and/or before the first byte
+    /// of the constant is emitted, so the symbol points at the right place.
+    pub fn commitPendingDataSym(self: *JitModule) void {
+        if (!self.has_pending_data_sym) return;
+        if (self.pending_data_sym_name.len > 0) {
+            self.symbols.put(self.pending_data_sym_name, SymbolEntry{
+                .offset = self.data_len,
+                .is_code = false,
+                .sym_type = .DATA,
+            }) catch {};
+        }
+        self.has_pending_data_sym = false;
     }
 
     /// Patch a previously emitted instruction at the given byte offset.
@@ -1246,7 +1282,9 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
         .JIT_LOAD_ADDR => {
             // Load address of symbol (ADRP + ADD sequence)
             // Emit placeholders with imm=0; the linker will patch these
-            // once real addresses are known.
+            // once real addresses are known.  The inst.imm field carries
+            // a CAddr addend (e.g. +16 for struct field access) which
+            // the linker must add to the resolved symbol address.
             const rd = mapGPRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd", inst.rd, e);
             const adrp_offset = mod.code_len;
             mod.emitWord(enc.emitAdrp(rd, 0)) catch |e| {
@@ -1264,6 +1302,7 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
                 .sym_name = [_]u8{0} ** JIT_SYM_MAX,
                 .sym_name_len = 0,
                 .inst_index = inst_index,
+                .addend = inst.imm,
             };
             const sym = inst.getSymName();
             if (sym.len > 0 and sym.len <= JIT_SYM_MAX) {
@@ -1271,7 +1310,11 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
                 reloc.sym_name_len = @intCast(sym.len);
             }
             mod.load_addr_relocs.append(mod.allocator, reloc) catch {};
-            mod.addDiag(.Info, inst_index, "LOAD_ADDR reloc recorded: {s}", .{sym});
+            if (inst.imm != 0) {
+                mod.addDiag(.Info, inst_index, "LOAD_ADDR reloc recorded: {s}+{d}", .{ sym, inst.imm });
+            } else {
+                mod.addDiag(.Info, inst_index, "LOAD_ADDR reloc recorded: {s}", .{sym});
+            }
         },
 
         // ── Stack manipulation ──
@@ -1368,44 +1411,54 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
         // ── Data directives ──
         .JIT_DATA_START => {
             mod.in_data_section = true;
-            // Record symbol for data label
+            // Save a slice pointing into the stable JitInst sym_name
+            // but do NOT record the offset yet.  The offset must be
+            // recorded *after* any subsequent DATA_ALIGN so it reflects
+            // the true post-alignment start.
             const name = inst.getSymName();
             if (name.len > 0) {
-                mod.symbols.put(name, SymbolEntry{
-                    .offset = mod.data_len,
-                    .is_code = false,
-                    .sym_type = .DATA,
-                }) catch {};
+                mod.pending_data_sym_name = name;
+                mod.has_pending_data_sym = true;
+            } else {
+                mod.has_pending_data_sym = false;
             }
         },
         .JIT_DATA_END => {
+            // Safety: commit any pending symbol that was never consumed
+            // (e.g. an empty data block with no ALIGN or data emission).
+            mod.commitPendingDataSym();
             mod.in_data_section = false;
         },
         .JIT_DATA_BYTE => {
+            mod.commitPendingDataSym();
             mod.emitDataByte(@truncate(@as(u64, @bitCast(inst.imm)))) catch |e| {
                 mod.addDiag(.Error, inst_index, "DATA_BYTE emit failed: {s}", .{@errorName(e)});
             };
             mod.stats.data_bytes_emitted += 1;
         },
         .JIT_DATA_HALF => {
+            mod.commitPendingDataSym();
             mod.emitDataHalf(@truncate(@as(u64, @bitCast(inst.imm)))) catch |e| {
                 mod.addDiag(.Error, inst_index, "DATA_HALF emit failed: {s}", .{@errorName(e)});
             };
             mod.stats.data_bytes_emitted += 2;
         },
         .JIT_DATA_WORD => {
+            mod.commitPendingDataSym();
             mod.emitDataWord(@truncate(@as(u64, @bitCast(inst.imm)))) catch |e| {
                 mod.addDiag(.Error, inst_index, "DATA_WORD emit failed: {s}", .{@errorName(e)});
             };
             mod.stats.data_bytes_emitted += 4;
         },
         .JIT_DATA_QUAD => {
+            mod.commitPendingDataSym();
             mod.emitDataQuad(@bitCast(inst.imm)) catch |e| {
                 mod.addDiag(.Error, inst_index, "DATA_QUAD emit failed: {s}", .{@errorName(e)});
             };
             mod.stats.data_bytes_emitted += 8;
         },
         .JIT_DATA_ZERO => {
+            mod.commitPendingDataSym();
             const count: u32 = @truncate(@as(u64, @bitCast(inst.imm)));
             mod.emitDataZero(count) catch |e| {
                 mod.addDiag(.Error, inst_index, "DATA_ZERO emit failed: {s}", .{@errorName(e)});
@@ -1413,6 +1466,7 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
             mod.stats.data_bytes_emitted += count;
         },
         .JIT_DATA_ASCII => {
+            mod.commitPendingDataSym();
             // Use imm field for the decoded byte count (set by jit_collect)
             // so that embedded NUL characters are emitted correctly.
             const decoded_len: u32 = if (inst.imm > 0) @intCast(@as(u64, @bitCast(inst.imm))) else @intCast(inst.getSymName().len);
@@ -1429,6 +1483,7 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
             };
         },
         .JIT_DATA_SYMREF => {
+            mod.commitPendingDataSym();
             // Symbol reference in data — emit 8-byte placeholder, record relocation
             const data_off = mod.data_len;
             mod.emitDataQuad(0) catch |e| {
@@ -1468,7 +1523,17 @@ fn encodeAluRRR(mod: *JitModule, inst: *const JitInst, inst_index: u32, op: AluO
     const rn = mapGPRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn", inst.rn, e);
     const rm = mapGPRegister(inst.rm) catch |e| return regError(mod, inst_index, "rm", inst.rm, e);
     const w64 = inst.is64();
-    const rmp = RegisterParam.reg_only(rm);
+
+    // ARM64 quirk: in shifted-register ADD/SUB, register 31 means XZR
+    // (the zero register), NOT SP.  When any operand is SP we must use
+    // the extended-register form (UXTX #0) where register 31 *does*
+    // mean SP.  This matters for dynamic stack allocation (alloc8)
+    // which emits SUB SP, SP, Xn.
+    const uses_sp = (rd == Register.SP or rn == Register.SP);
+    const rmp = if (uses_sp and (op == .Add or op == .Sub))
+        RegisterParam.extended(rm, .UXTX, 0)
+    else
+        RegisterParam.reg_only(rm);
 
     const word: u32 = switch (op) {
         .Add => if (w64) enc.emitAddRegister64(rd, rn, rmp) else enc.emitAddRegister(rd, rn, rmp),
@@ -1972,13 +2037,20 @@ fn encodeNeonAddv(mod: *JitModule, inst: *const JitInst, inst_index: u32) void {
 }
 
 fn encodeNeonLdrStr(mod: *JitModule, inst: *const JitInst, inst_index: u32, is_load: bool) void {
-    // NEON LDR/STR Q28, [Xn] — 128-bit load/store
+    // NEON LDR/STR Qn, [Xn] — 128-bit load/store
+    // imm2 selects the vector register: 0 or 28 → V28, 29 → V29, 30 → V30
     const rn = mapGPRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn", inst.rn, e);
 
+    const vreg: NeonRegister = switch (@as(i32, @truncate(inst.imm2))) {
+        29 => NeonRegister.V29,
+        30 => NeonRegister.V30,
+        else => NeonRegister.V28,
+    };
+
     const word_opt: ?u32 = if (is_load)
-        enc.emitNeonLdrOffset(NeonRegister.V28, NeonSize.Size1Q, rn, 0)
+        enc.emitNeonLdrOffset(vreg, NeonSize.Size1Q, rn, 0)
     else
-        enc.emitNeonStrOffset(NeonRegister.V28, NeonSize.Size1Q, rn, 0);
+        enc.emitNeonStrOffset(vreg, NeonSize.Size1Q, rn, 0);
 
     if (word_opt) |w| {
         mod.emitWord(w) catch |e| {
@@ -2194,7 +2266,13 @@ pub fn dumpSingleInstruction(inst: *const JitInst, index: u32, writer: anytype) 
 
         .JIT_ADRP => try writer.print("ADRP        {s}, {s}\n", .{ regName(inst.rd), inst.getSymName() }),
         .JIT_ADR => try writer.print("ADR         {s}, {s}\n", .{ regName(inst.rd), inst.getSymName() }),
-        .JIT_LOAD_ADDR => try writer.print("LOAD_ADDR   {s}, {s}\n", .{ regName(inst.rd), inst.getSymName() }),
+        .JIT_LOAD_ADDR => {
+            if (inst.imm != 0) {
+                try writer.print("LOAD_ADDR   {s}, {s}+{d}\n", .{ regName(inst.rd), inst.getSymName(), inst.imm });
+            } else {
+                try writer.print("LOAD_ADDR   {s}, {s}\n", .{ regName(inst.rd), inst.getSymName() });
+            }
+        },
 
         .JIT_HINT => try writer.print("HINT        #{d}\n", .{inst.imm}),
         .JIT_BRK => try writer.print("BRK         #{d}\n", .{inst.imm}),
@@ -2552,6 +2630,109 @@ pub fn dumpPipelineReport(
                 }
             }
             if (any_data) try writer.print("\n", .{});
+        }
+
+        // Typed data dump — decode FP constants and other known data at each symbol
+        {
+            var sym_iter2 = mod.symbols.iterator();
+            var any_typed = false;
+            while (sym_iter2.next()) |entry| {
+                if (entry.value_ptr.is_code) continue;
+                const name = entry.key_ptr.*;
+                const off = entry.value_ptr.offset;
+
+                if (!any_typed) {
+                    try writer.print("   Typed data dump:\n", .{});
+                    any_typed = true;
+                }
+
+                // Detect Lfp (FP literal pool) symbols — names contain "Lfp"
+                const is_fp = std.mem.indexOf(u8, name, "Lfp") != null;
+
+                if (is_fp) {
+                    // Try to decode as double (8 bytes) first, then single (4 bytes)
+                    if (off + 8 <= mod.data_len) {
+                        // Read 8 bytes LE as u64
+                        var qval: u64 = 0;
+                        var qi: u32 = 0;
+                        while (qi < 8) : (qi += 1) {
+                            qval |= @as(u64, mod.data[off + qi]) << @intCast(qi * 8);
+                        }
+                        const dbl: f64 = @bitCast(qval);
+
+                        // Also read first 4 bytes as single
+                        var wval: u32 = 0;
+                        var wi: u32 = 0;
+                        while (wi < 4) : (wi += 1) {
+                            wval |= @as(u32, mod.data[off + wi]) << @intCast(wi * 8);
+                        }
+                        const sng: f32 = @bitCast(wval);
+
+                        // Check if upper 4 bytes are zero → likely a 4-byte single
+                        const upper4_zero = (qval >> 32) == 0;
+
+                        try writer.print("     0x{x:0>4}  {s}\n", .{ off, name });
+                        try writer.print("             raw bytes:", .{});
+                        var bi: u32 = 0;
+                        const blen: u32 = if (upper4_zero) 4 else 8;
+                        while (bi < blen) : (bi += 1) {
+                            try writer.print(" {x:0>2}", .{mod.data[off + bi]});
+                        }
+                        try writer.print("\n", .{});
+
+                        if (upper4_zero) {
+                            try writer.print("             as u32:   0x{x:0>8}\n", .{wval});
+                            try writer.print("             as f32:   {d}\n", .{sng});
+                            // Also show what this would be as f64 if someone mistakenly loaded 8 bytes
+                            try writer.print("             as f64 (if 8B read): {d}  [0x{x:0>16}]\n", .{ dbl, qval });
+                        } else {
+                            try writer.print("             as u64:   0x{x:0>16}\n", .{qval});
+                            try writer.print("             as f64:   {d}\n", .{dbl});
+                            // Also show the lower 4 bytes as f32 in case of size mismatch
+                            try writer.print("             as f32 (lower 4B): {d}  [0x{x:0>8}]\n", .{ sng, wval });
+                        }
+                    } else if (off + 4 <= mod.data_len) {
+                        // Only 4 bytes available — must be single
+                        var wval: u32 = 0;
+                        var wi: u32 = 0;
+                        while (wi < 4) : (wi += 1) {
+                            wval |= @as(u32, mod.data[off + wi]) << @intCast(wi * 8);
+                        }
+                        const sng: f32 = @bitCast(wval);
+                        try writer.print("     0x{x:0>4}  {s}\n", .{ off, name });
+                        try writer.print("             raw bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2}\n", .{
+                            mod.data[off], mod.data[off + 1], mod.data[off + 2], mod.data[off + 3],
+                        });
+                        try writer.print("             as u32:   0x{x:0>8}\n", .{wval});
+                        try writer.print("             as f32:   {d}\n", .{sng});
+                    } else {
+                        try writer.print("     0x{x:0>4}  {s}  (truncated, only {d} bytes remain)\n", .{ off, name, mod.data_len - off });
+                    }
+                } else {
+                    // Non-FP symbol: show first few bytes as hex + ASCII
+                    try writer.print("     0x{x:0>4}  {s}", .{ off, name });
+                    const remain = mod.data_len - off;
+                    if (remain > 0) {
+                        const show = @min(remain, 32);
+                        try writer.print("  [", .{});
+                        var si: u32 = 0;
+                        while (si < show) : (si += 1) {
+                            const b = mod.data[off + si];
+                            if (b >= 0x20 and b < 0x7f) {
+                                try writer.print("{c}", .{b});
+                            } else if (b == 0) {
+                                break; // stop at NUL
+                            } else {
+                                try writer.print("\\x{x:0>2}", .{b});
+                            }
+                        }
+                        try writer.print("]\n", .{});
+                    } else {
+                        try writer.print("\n", .{});
+                    }
+                }
+            }
+            if (any_typed) try writer.print("\n", .{});
         }
     }
 

@@ -95,6 +95,11 @@ pub const DataRelocation = struct {
     /// Instruction index in the JitInst[] stream (for diagnostics)
     inst_index: u32,
 
+    /// Addend: byte offset added to the resolved symbol address.
+    /// Carries the CAddr bits.i value (e.g. +16 for a struct field
+    /// like arr_desc + 16 to reach the element-count field).
+    addend: i64,
+
     /// Get the symbol name as a slice.
     pub fn getName(self: *const DataRelocation) []const u8 {
         return self.sym_name[0..self.sym_name_len];
@@ -434,6 +439,7 @@ pub const JitLinker = struct {
                     .sym_name = lar.sym_name,
                     .sym_name_len = lar.sym_name_len,
                     .inst_index = lar.inst_index,
+                    .addend = lar.addend,
                 };
                 _ = &reloc;
                 relocs.append(allocator, reloc) catch {};
@@ -462,6 +468,7 @@ pub const JitLinker = struct {
                         .sym_name = [_]u8{0} ** jit.JIT_SYM_MAX,
                         .sym_name_len = 0,
                         .inst_index = i,
+                        .addend = inst.imm,
                     };
 
                     // Copy symbol name from the instruction
@@ -766,7 +773,7 @@ pub const JitLinker = struct {
             // Look up the data symbol's offset in the module's symbol table
             if (module.symbols.get(name)) |sym_entry| {
                 // Compute absolute target address
-                const target_addr = if (sym_entry.is_code)
+                const base_addr = if (sym_entry.is_code)
                     region.codeAddress(sym_entry.offset) orelse {
                         diagnostics.append(allocator, LinkDiagnostic.create(
                             .Error,
@@ -786,6 +793,14 @@ pub const JitLinker = struct {
                         stats.errors += 1;
                         continue;
                     };
+
+                // Apply the addend (e.g. +16 for struct field access).
+                // The addend comes from the QBE CAddr constant's bits.i
+                // field — it represents a byte offset within the symbol.
+                const target_addr = if (reloc.addend != 0)
+                    base_addr +% @as(usize, @bitCast(@as(isize, @intCast(reloc.addend))))
+                else
+                    base_addr;
 
                 // Patch ADRP + ADD
                 region.patchAdrpAdd(reloc.adrp_offset, target_addr) catch |err| {
@@ -1080,6 +1095,7 @@ test "DataRelocation getName" {
         .sym_name = [_]u8{0} ** jit.JIT_SYM_MAX,
         .sym_name_len = 0,
         .inst_index = 0,
+        .addend = 0,
     };
     const name = "hello_str";
     @memcpy(reloc.sym_name[0..name.len], name);

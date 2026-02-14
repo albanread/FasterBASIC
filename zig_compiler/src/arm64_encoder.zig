@@ -4787,6 +4787,232 @@ test "NEON FCMP S0, #0.0" {
     try std.testing.expectEqual(expected, emitNeonFcmp0(.V0, .Size1S));
 }
 
+// --- Comprehensive FCMP / FCMPE tests ---
+// These cover varied register combinations and both single/double precision,
+// including higher registers (V28-V30) used by the JIT pipeline.
+
+test "NEON FCMP S0, S1 (bit pattern)" {
+    // FCMP S0, S1: base=0x1e202000, type=0 (single), Rm=1, Rn=0
+    const expected: u32 = 0x1e202000 | (0 << 22) | (1 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp(.V0, .V1, .Size1S));
+}
+
+test "NEON FCMP S3, S5" {
+    const expected: u32 = 0x1e202000 | (0 << 22) | (5 << 16) | (3 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp(.V3, .V5, .Size1S));
+}
+
+test "NEON FCMP D2, D3" {
+    const expected: u32 = 0x1e202000 | (1 << 22) | (3 << 16) | (2 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp(.V2, .V3, .Size1D));
+}
+
+test "NEON FCMP D0, #0.0" {
+    const expected: u32 = 0x1e202008 | (1 << 22) | (0 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp0(.V0, .Size1D));
+}
+
+test "NEON FCMP S5, #0.0" {
+    const expected: u32 = 0x1e202008 | (0 << 22) | (0 << 16) | (5 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp0(.V5, .Size1S));
+}
+
+test "NEON FCMP D10, #0.0" {
+    const expected: u32 = 0x1e202008 | (1 << 22) | (0 << 16) | (10 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp0(.V10, .Size1D));
+}
+
+test "NEON FCMPE S0, S1" {
+    // FCMPE S0, S1: base=0x1e202010, type=0 (single), Rm=1, Rn=0
+    const expected: u32 = 0x1e202010 | (0 << 22) | (1 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V0, .V1, .Size1S));
+}
+
+test "NEON FCMPE D0, D1" {
+    const expected: u32 = 0x1e202010 | (1 << 22) | (1 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V0, .V1, .Size1D));
+}
+
+test "NEON FCMPE S0, #0.0" {
+    const expected: u32 = 0x1e202018 | (0 << 22) | (0 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe0(.V0, .Size1S));
+}
+
+test "NEON FCMPE D0, #0.0" {
+    const expected: u32 = 0x1e202018 | (1 << 22) | (0 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe0(.V0, .Size1D));
+}
+
+test "NEON FCMPE S3, S7" {
+    const expected: u32 = 0x1e202010 | (0 << 22) | (7 << 16) | (3 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V3, .V7, .Size1S));
+}
+
+test "NEON FCMPE D15, D20" {
+    const expected: u32 = 0x1e202010 | (1 << 22) | (20 << 16) | (15 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V15, .V20, .Size1D));
+}
+
+test "NEON FCMPE D28, D29 (JIT high registers)" {
+    // These are the registers commonly used by the JIT pipeline
+    const expected: u32 = 0x1e202010 | (1 << 22) | (29 << 16) | (28 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V28, .V29, .Size1D));
+}
+
+test "NEON FCMPE D29, D30 (JIT high registers)" {
+    const expected: u32 = 0x1e202010 | (1 << 22) | (30 << 16) | (29 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V29, .V30, .Size1D));
+}
+
+test "NEON FCMPE S28, S29 (JIT high registers, single)" {
+    const expected: u32 = 0x1e202010 | (0 << 22) | (29 << 16) | (28 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V28, .V29, .Size1S));
+}
+
+test "NEON FCMP D30, D0" {
+    // High src1, low src2 — checks no masking issues
+    const expected: u32 = 0x1e202000 | (1 << 22) | (0 << 16) | (30 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp(.V30, .V0, .Size1D));
+}
+
+test "NEON FCMPE D0, D30" {
+    // Low src1, high src2
+    const expected: u32 = 0x1e202010 | (1 << 22) | (30 << 16) | (0 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe(.V0, .V30, .Size1D));
+}
+
+test "NEON FCMP D31, D31 (max register)" {
+    // V31 is the highest register — ensure all 5 bits encode properly
+    const expected: u32 = 0x1e202000 | (1 << 22) | (31 << 16) | (31 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmp(.V31, .V31, .Size1D));
+}
+
+test "NEON FCMPE D31, #0.0" {
+    const expected: u32 = 0x1e202018 | (1 << 22) | (0 << 16) | (31 << 5);
+    try std.testing.expectEqual(expected, emitNeonFcmpe0(.V31, .Size1D));
+}
+
+// --- FCMP/FCMPE: verify dest bits are not polluted ---
+// The FCMP/FCMPE instructions have no destination register; bits [4:0]
+// are fixed opcode bits (00000 for FCMP, 10000 for FCMPE, etc.)
+// Ensure the encoder's use of V0 as dummy dest doesn't corrupt these.
+
+test "NEON FCMP low 5 bits are 00000" {
+    const word = emitNeonFcmp(.V5, .V10, .Size1D);
+    try std.testing.expectEqual(@as(u32, 0b00000), word & 0x1F);
+}
+
+test "NEON FCMPE low 5 bits are 10000" {
+    const word = emitNeonFcmpe(.V5, .V10, .Size1D);
+    try std.testing.expectEqual(@as(u32, 0b10000), word & 0x1F);
+}
+
+test "NEON FCMP0 low 5 bits are 01000" {
+    const word = emitNeonFcmp0(.V5, .Size1D);
+    try std.testing.expectEqual(@as(u32, 0b01000), word & 0x1F);
+}
+
+test "NEON FCMPE0 low 5 bits are 11000" {
+    const word = emitNeonFcmpe0(.V5, .Size1D);
+    try std.testing.expectEqual(@as(u32, 0b11000), word & 0x1F);
+}
+
+// --- FP scalar LDR/STR offset tests ---
+// These verify the FP load/store encoding used by the JIT to load
+// FP constants and variables before FCMP.
+
+test "FP LDR S0, [X1, #0]" {
+    const result = emitFpLdrSOffset(.V0, .R1, 0);
+    try std.testing.expect(result != null);
+    // LDR S0, [X1] = 0xBD400000 | (0 << 10) | (1 << 5) | 0
+    const expected: u32 = 0xBD400000 | (0 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR S0, [X1, #4]" {
+    const result = emitFpLdrSOffset(.V0, .R1, 4);
+    try std.testing.expect(result != null);
+    // offset 4 >> 2 = 1
+    const expected: u32 = 0xBD400000 | (1 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D0, [X1, #0]" {
+    const result = emitFpLdrDOffset(.V0, .R1, 0);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xFD400000 | (0 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D0, [X1, #8]" {
+    const result = emitFpLdrDOffset(.V0, .R1, 8);
+    try std.testing.expect(result != null);
+    // offset 8 >> 3 = 1
+    const expected: u32 = 0xFD400000 | (1 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D0, [X1, #16]" {
+    const result = emitFpLdrDOffset(.V0, .R1, 16);
+    try std.testing.expect(result != null);
+    // offset 16 >> 3 = 2
+    const expected: u32 = 0xFD400000 | (2 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D5, [X10, #0]" {
+    const result = emitFpLdrDOffset(.V5, .R10, 0);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xFD400000 | (0 << 10) | (10 << 5) | 5;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP STR S0, [X1, #0]" {
+    const result = emitFpStrSOffset(.V0, .R1, 0);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xBD000000 | (0 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP STR D0, [X1, #0]" {
+    const result = emitFpStrDOffset(.V0, .R1, 0);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xFD000000 | (0 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP STR D0, [X1, #8]" {
+    const result = emitFpStrDOffset(.V0, .R1, 8);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xFD000000 | (1 << 10) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D unaligned offset uses unscaled" {
+    // offset 5 is not 8-byte aligned, should fall back to LDUR
+    const result = emitFpLdrDOffset(.V0, .R1, 5);
+    try std.testing.expect(result != null);
+    // LDUR D0, [X1, #5]: 0xFC400000 | ((5 & 0x1ff) << 12) | (1 << 5) | 0
+    const expected: u32 = 0xFC400000 | ((5 & 0x1ff) << 12) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP LDR D negative offset uses unscaled" {
+    // offset -8: should use LDUR encoding
+    const result = emitFpLdrDOffset(.V0, .R1, -8);
+    try std.testing.expect(result != null);
+    const neg8_u9: u32 = @as(u32, @bitCast(@as(i32, -8))) & 0x1ff;
+    const expected: u32 = 0xFC400000 | (neg8_u9 << 12) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
+test "FP STR S unaligned offset uses unscaled" {
+    const result = emitFpStrSOffset(.V0, .R1, 3);
+    try std.testing.expect(result != null);
+    const expected: u32 = 0xBC000000 | ((3 & 0x1ff) << 12) | (1 << 5) | 0;
+    try std.testing.expectEqual(expected, result.?);
+}
+
 // --- NEON shift immediate ---
 
 test "NEON SHL V0.8H, V1.8H, #2" {
@@ -5762,6 +5988,35 @@ const verify_cases = blk: {
         .{ .name = "FCMPE S0, S1", .expected = emitNeonFcmpe(.V0, .V1, .Size1S), .asm_text = "fcmpe s0, s1" },
         .{ .name = "FCMPE D0, D1", .expected = emitNeonFcmpe(.V0, .V1, .Size1D), .asm_text = "fcmpe d0, d1" },
         .{ .name = "FCMPE S0, #0.0", .expected = emitNeonFcmpe0(.V0, .Size1S), .asm_text = "fcmpe s0, #0.0" },
+        .{ .name = "FCMPE D0, #0.0", .expected = emitNeonFcmpe0(.V0, .Size1D), .asm_text = "fcmpe d0, #0.0" },
+
+        // FCMP/FCMPE with varied registers (cross-check encoding for higher regs)
+        .{ .name = "FCMP S3, S5", .expected = emitNeonFcmp(.V3, .V5, .Size1S), .asm_text = "fcmp s3, s5" },
+        .{ .name = "FCMP D2, D3", .expected = emitNeonFcmp(.V2, .V3, .Size1D), .asm_text = "fcmp d2, d3" },
+        .{ .name = "FCMP D10, D20", .expected = emitNeonFcmp(.V10, .V20, .Size1D), .asm_text = "fcmp d10, d20" },
+        .{ .name = "FCMP D30, D0", .expected = emitNeonFcmp(.V30, .V0, .Size1D), .asm_text = "fcmp d30, d0" },
+        .{ .name = "FCMP S5, #0.0", .expected = emitNeonFcmp0(.V5, .Size1S), .asm_text = "fcmp s5, #0.0" },
+        .{ .name = "FCMP D10, #0.0", .expected = emitNeonFcmp0(.V10, .Size1D), .asm_text = "fcmp d10, #0.0" },
+        .{ .name = "FCMPE S3, S7", .expected = emitNeonFcmpe(.V3, .V7, .Size1S), .asm_text = "fcmpe s3, s7" },
+        .{ .name = "FCMPE D2, D5", .expected = emitNeonFcmpe(.V2, .V5, .Size1D), .asm_text = "fcmpe d2, d5" },
+        .{ .name = "FCMPE D15, D20", .expected = emitNeonFcmpe(.V15, .V20, .Size1D), .asm_text = "fcmpe d15, d20" },
+        .{ .name = "FCMPE D0, D30", .expected = emitNeonFcmpe(.V0, .V30, .Size1D), .asm_text = "fcmpe d0, d30" },
+        .{ .name = "FCMPE S10, #0.0", .expected = emitNeonFcmpe0(.V10, .Size1S), .asm_text = "fcmpe s10, #0.0" },
+        .{ .name = "FCMPE D31, #0.0", .expected = emitNeonFcmpe0(.V31, .Size1D), .asm_text = "fcmpe d31, #0.0" },
+
+        // FP scalar LDR/STR (used by JIT to load FP constants before FCMP)
+        .{ .name = "LDR S0, [X1]", .expected = emitFpLdrSOffset(.V0, .R1, 0).?, .asm_text = "ldr s0, [x1]" },
+        .{ .name = "LDR S0, [X1, #4]", .expected = emitFpLdrSOffset(.V0, .R1, 4).?, .asm_text = "ldr s0, [x1, #4]" },
+        .{ .name = "LDR D0, [X1]", .expected = emitFpLdrDOffset(.V0, .R1, 0).?, .asm_text = "ldr d0, [x1]" },
+        .{ .name = "LDR D0, [X1, #8]", .expected = emitFpLdrDOffset(.V0, .R1, 8).?, .asm_text = "ldr d0, [x1, #8]" },
+        .{ .name = "LDR D0, [X1, #16]", .expected = emitFpLdrDOffset(.V0, .R1, 16).?, .asm_text = "ldr d0, [x1, #16]" },
+        .{ .name = "LDR D5, [X10]", .expected = emitFpLdrDOffset(.V5, .R10, 0).?, .asm_text = "ldr d5, [x10]" },
+        .{ .name = "STR S0, [X1]", .expected = emitFpStrSOffset(.V0, .R1, 0).?, .asm_text = "str s0, [x1]" },
+        .{ .name = "STR S0, [X1, #4]", .expected = emitFpStrSOffset(.V0, .R1, 4).?, .asm_text = "str s0, [x1, #4]" },
+        .{ .name = "STR D0, [X1]", .expected = emitFpStrDOffset(.V0, .R1, 0).?, .asm_text = "str d0, [x1]" },
+        .{ .name = "STR D0, [X1, #8]", .expected = emitFpStrDOffset(.V0, .R1, 8).?, .asm_text = "str d0, [x1, #8]" },
+        .{ .name = "STR D5, [X10, #16]", .expected = emitFpStrDOffset(.V5, .R10, 16).?, .asm_text = "str d5, [x10, #16]" },
+
         .{ .name = "FCSEL S0, S1, S2, EQ", .expected = emitNeonFcsel(.V0, .V1, .V2, .EQ, .Size1S), .asm_text = "fcsel s0, s1, s2, eq" },
         .{ .name = "FCSEL D0, D1, D2, NE", .expected = emitNeonFcsel(.V0, .V1, .V2, .NE, .Size1D), .asm_text = "fcsel d0, d1, d2, ne" },
         .{ .name = "FCSEL D3, D4, D5, GT", .expected = emitNeonFcsel(.V3, .V4, .V5, .GT, .Size1D), .asm_text = "fcsel d3, d4, d5, gt" },

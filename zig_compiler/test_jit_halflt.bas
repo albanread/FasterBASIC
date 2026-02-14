@@ -1,0 +1,9 @@
+DIM h AS DOUBLE
+h = 0.5
+h = h + 0.0
+IF h < 1.0 THEN
+  PRINT "PASS: 0.5 < 1.0"
+ELSE
+  PRINT "FAIL: 0.5 < 1.0"
+ENDIF
+END

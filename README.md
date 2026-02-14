@@ -1,5 +1,29 @@
 # FasterBASIC
 
+## Overview
+
+FasterBASIC is a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, and SIMD acceleration. The compiler is written in **Zig** and compiles to native machine code through the **QBE** (Quick Backend) intermediate representation.
+
+### Key Features
+
+- **Native Compilation** - Compiles to machine code, not interpreted
+- **Zig Compiler** - Written in Zig for memory safety and performance
+- **Classic File I/O** - Supports the I/O Grandad used (INPUT, OUTPUT, APPEND, BINARY, RANDOM)
+- **Object-Oriented** - Classes, inheritance, polymorphism, virtual dispatch
+- **Workers** - Lightweight concurrent threads with structured data passing
+- **MARSHALL/UNMARSHALL** - Type-safe binary serialisation with deep string copy
+- **Modern Collections** - Lists, HashMaps, pattern matching
+- **Exception Handling** - TRY/CATCH/FINALLY blocks
+- **Structured** - SUB, FUNCTION, DO LOOP, SELECT CASE etc.
+- **SIMD Acceleration** - Automatic NEON vectorization on ARM64
+- **Plugin System** - Extensible with plugins
+- **Native ARM64** - Optimized for Apple Silicon
+- **Traditional** - Goto, Gosub, On Goto, whenever you want to.
+
+> **Note on Graphics & Multimedia:** FasterBASIC will integrate with the [Superterminal](https://github.com/albanread/Superterminal) project to provide advanced graphics, sprites, and audio capabilities in the future.
+
+_Its not the compilers we built, its the bugs we squished along the way_
+
 A modern, compiled BASIC dialect that generates native machine code for macOS ARM64 (Apple Silicon).
 
 True to historical BASIC with some modern extensions.
@@ -13,6 +37,21 @@ Aims to be a modern BASIC compiler that combines the ease of traditional BASIC w
  The compiler is written in **Zig** with a hybrid **Zig + C** runtime, and targets the **QBE** SSA backend.
 
 ## 🎉 Latest Features (February 2026)
+
+### JIT for ARM64
+
+FasterBASIC for ARM64 includes a just in time compiler mode.
+This means FasterBASIC can load, compile and run BASIC faster, which will allow for a more QB like experience in future, and is useful in general.
+
+### AOT - exe files
+
+FasterBASIC creates Assembly language output and assuming you have a c compiler (including an assembler) your BASIC will be converted into a small executable file.
+
+### One compiler to Exe and Jit them all
+
+The compiler is the same for both modes, it just the last stage that is different.
+The code created is only slightly different, we use our CLANG verifier to cross check our own ARM64 encoders to Clangs assembler in hundreds of tests.
+
 
 ### Workers & Concurrency
 
@@ -159,6 +198,12 @@ DIM v1 AS Vec4, v2 AS Vec4, result AS Vec4
 result = v1 + v2  ' ← Compiles to NEON SIMD instructions!
 ```
 
+### Scope Aware Memory Manager
+
+SAMM takes care of your memory leaks and security.
+SAMM is not a garbage collector, SAMM clears up Dynamic memory the way you expect it should work.
+
+
 ---
 
 > **⚠️ Build Instructions (Zig Compiler):**
@@ -170,25 +215,7 @@ result = v1 + v2  ' ← Compiles to NEON SIMD instructions!
 >
 > **📁 Project Structure:** See [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) for an overview of the repository organization.
 
-## Overview
 
-FasterBASIC is a modern BASIC compiler that combines the ease of traditional BASIC with advanced features like object-oriented programming, exception handling, and SIMD acceleration. The compiler is written in **Zig** and compiles to native machine code through the **QBE** (Quick Backend) intermediate representation.
-
-### Key Features
-
-- **Native Compilation** - Compiles to machine code, not interpreted
-- **Zig Compiler** - Written in Zig for memory safety and performance
-- **Classic File I/O** - Supports the I/O Grandad used (INPUT, OUTPUT, APPEND, BINARY, RANDOM)
-- **Object-Oriented** - Classes, inheritance, polymorphism, virtual dispatch
-- **Workers** - Lightweight concurrent threads with structured data passing
-- **MARSHALL/UNMARSHALL** - Type-safe binary serialisation with deep string copy
-- **Modern Collections** - Lists, HashMaps, pattern matching
-- **Exception Handling** - TRY/CATCH/FINALLY blocks
-- **SIMD Acceleration** - Automatic NEON vectorization on ARM64
-- **Plugin System** - Extensible with C/C++ plugins
-- **Native ARM64** - Optimized for Apple Silicon
-
-> **Note on Graphics & Multimedia:** FasterBASIC will integrate with the [Superterminal](https://github.com/albanread/Superterminal) project to provide advanced graphics, sprites, and audio capabilities in the future.
 
 ### Documentation
 
@@ -460,12 +487,12 @@ The Zig-based `fbc` compiler provides single-command compilation:
 CLASS Rectangle
   Width AS DOUBLE
   Height AS DOUBLE
-  
+
   CONSTRUCTOR(w AS DOUBLE, h AS DOUBLE)
     ME.Width = w
     ME.Height = h
   END CONSTRUCTOR
-  
+
   METHOD Area() AS DOUBLE
     RETURN ME.Width * ME.Height
   END METHOD
@@ -1151,7 +1178,8 @@ SOFTWARE.
 ## Acknowledgments
 
 - **QBE** by Quentin Carbonneaux for the excellent SSA backend
-- Classic BASIC implementations (GW-BASIC, QuickBASIC, BBC BASIC) for inspiration
+- **CAPSTONE** - really helps to see the code you are compiling.
+- BASIC - All the classic and modern BASIC implementations (GW-BASIC, QuickBASIC, BBC BASIC, Future Basic, FastBASIC, GFA Basic, VAX BASIC, PureBASIC, PowerBASIC, Locomotive Basic, Sinclair Basic, SuperBASIC, TurboBASIC, VisualBASIC (not .NET), RealBASIC etc, and all the other basics I have enjoyed and forgotten) for inspiration
 - The BASIC programming community for continued enthusiasm
 
 ## References
