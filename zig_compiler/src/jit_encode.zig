@@ -1073,9 +1073,13 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
 
         .JIT_FMOV_GF => {
             // FPR → GPR (bitcast)
+            // The cls field is the *destination* (integer) class, not the
+            // source FP class.  cls=L means 64-bit dest → fmov Xd, Dn;
+            // cls=W means 32-bit dest → fmov Wd, Sn.  We must use is64()
+            // (not isDouble()) to select the correct encoding.
             const rd = mapGPRegister(inst.rd) catch |e| return regError(mod, inst_index, "rd", inst.rd, e);
             const rn = mapNeonRegister(inst.rn) catch |e| return regError(mod, inst_index, "rn(neon)", inst.rn, e);
-            const word = if (inst.isDouble()) enc.emitNeonFmovToGeneral64(rd, rn) else enc.emitNeonFmovToGeneral(rd, rn);
+            const word = if (inst.is64()) enc.emitNeonFmovToGeneral64(rd, rn) else enc.emitNeonFmovToGeneral(rd, rn);
             mod.emitWord(word) catch |e| {
                 mod.addDiag(.Error, inst_index, "FMOV GF emit failed: {s}", .{@errorName(e)});
             };
