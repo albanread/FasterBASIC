@@ -401,6 +401,18 @@ extern fn file_seek(...) callconv(.c) i32;
 extern fn basic_loc(...) callconv(.c) c_long;
 extern fn basic_lof(...) callconv(.c) c_long;
 
+// ── MK$/CV$ binary conversion ──
+extern fn basic_mki(...) callconv(.c) ?*anyopaque;
+extern fn basic_mks(...) callconv(.c) ?*anyopaque;
+extern fn basic_mkd(...) callconv(.c) ?*anyopaque;
+extern fn basic_cvi(...) callconv(.c) i32;
+extern fn basic_cvs(...) callconv(.c) f64;
+extern fn basic_cvd(...) callconv(.c) f64;
+
+// ── Command-line arguments ──
+extern fn basic_command_count() callconv(.c) i32;
+extern fn basic_command(...) callconv(.c) ?*anyopaque;
+
 // ── String ops (legacy BasicString) ──
 extern fn str_new(...) callconv(.c) ?*anyopaque;
 extern fn str_retain(...) callconv(.c) ?*anyopaque;
@@ -827,6 +839,18 @@ const entry_names = [_][]const u8{
     "_file_seek",
     "_basic_loc",
     "_basic_lof",
+
+    // ── MK$/CV$ binary conversion ──
+    "_basic_mki",
+    "_basic_mks",
+    "_basic_mkd",
+    "_basic_cvi",
+    "_basic_cvs",
+    "_basic_cvd",
+
+    // ── Command-line arguments ──
+    "_basic_command_count",
+    "_basic_command",
 };
 
 /// Total number of entries in the jump table.
@@ -1232,6 +1256,18 @@ fn initEntries() void {
         fnAddr(file_seek),
         fnAddr(basic_loc),
         fnAddr(basic_lof),
+
+        // ── MK$/CV$ binary conversion ──
+        fnAddr(basic_mki),
+        fnAddr(basic_mks),
+        fnAddr(basic_mkd),
+        fnAddr(basic_cvi),
+        fnAddr(basic_cvs),
+        fnAddr(basic_cvd),
+
+        // ── Command-line arguments ──
+        fnAddr(basic_command_count),
+        fnAddr(basic_command),
     };
 
     for (0..entry_names.len) |i| {
