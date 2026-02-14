@@ -958,6 +958,11 @@ pub const RuntimeLibrary = struct {
         try self.declare("fbc_array_element_addr", "l %desc, w %index");
         try self.declare("array_descriptor_erase", "l %desc");
 
+        // 2D array operations  (runtime: fbc_bridge.c)
+        try self.declare("fbc_array_create_2d", "w %ndims, l %desc, w %upper1, w %upper2, w %elemsize");
+        try self.declare("fbc_array_bounds_check_2d", "l %desc, w %index1, w %index2");
+        try self.declare("fbc_array_element_addr_2d", "l %desc, w %index1, w %index2");
+
         // SAMM (Scope-Aware Memory Management)  (runtime: samm_core.c)
         try self.declare("samm_init", "");
         try self.declare("samm_shutdown", "");
@@ -3622,13 +3627,39 @@ pub const ExprEmitter = struct {
         const desc_addr = try self.builder.newTemp();
         try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
-        // Bounds check
-        const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
-        try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+        // Check if this is a 2D array access
+        const is_2d = indices.len >= 2;
 
-        const elem_addr = try self.builder.newTemp();
-        const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
-        try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
+        const elem_addr = if (is_2d) blk_2d: {
+            // ── 2D array access ─────────────────────────────────────
+            const index_val2 = try self.emitExpression(indices[1]);
+            const idx_type2 = self.inferExprType(indices[1]);
+            const index_int2 = if (idx_type2 == .integer) index_val2 else blk2: {
+                const t2 = try self.builder.newTemp();
+                try self.builder.emitConvert(t2, "w", "dtosi", index_val2);
+                break :blk2 t2;
+            };
+
+            // 2D bounds check
+            const bc_args_2d = try bufPrintDupe(self.allocator, "l {s}, w {s}, w {s}", .{ desc_addr, index_int, index_int2 });
+            try self.builder.emitCall("", "", "fbc_array_bounds_check_2d", bc_args_2d);
+
+            // 2D element address
+            const ea = try self.builder.newTemp();
+            const ea_args_2d = try bufPrintDupe(self.allocator, "l {s}, w {s}, w {s}", .{ desc_addr, index_int, index_int2 });
+            try self.builder.emitCall(ea, "l", "fbc_array_element_addr_2d", ea_args_2d);
+            break :blk_2d ea;
+        } else blk_1d: {
+            // ── 1D array access ─────────────────────────────────────
+            // Bounds check
+            const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+            try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+
+            const ea = try self.builder.newTemp();
+            const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+            try self.builder.emitCall(ea, "l", "fbc_array_element_addr", ea_args);
+            break :blk_1d ea;
+        };
 
         // Determine element type: prefer the declared array element type
         // from the symbol table over the suffix.  This is critical for
@@ -9253,14 +9284,40 @@ pub const BlockEmitter = struct {
             const desc_addr = try self.builder.newTemp();
             try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
-            // Bounds check
-            const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
-            try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+            // Check if this is a 2D array store
+            const is_2d_store = lt.indices.len >= 2;
 
-            // Get element address
-            const elem_addr = try self.builder.newTemp();
-            const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
-            try self.builder.emitCall(elem_addr, "l", "fbc_array_element_addr", ea_args);
+            const elem_addr = if (is_2d_store) blk_2d: {
+                // ── 2D array store ──────────────────────────────────
+                const index_val2 = try self.expr_emitter.emitExpression(lt.indices[1]);
+                const idx_type2 = self.expr_emitter.inferExprType(lt.indices[1]);
+                const index_int2 = if (idx_type2 == .integer) index_val2 else blk2: {
+                    const t2 = try self.builder.newTemp();
+                    try self.builder.emitConvert(t2, "w", "dtosi", index_val2);
+                    break :blk2 t2;
+                };
+
+                // 2D bounds check
+                const bc_args_2d = try bufPrintDupe(self.allocator, "l {s}, w {s}, w {s}", .{ desc_addr, index_int, index_int2 });
+                try self.builder.emitCall("", "", "fbc_array_bounds_check_2d", bc_args_2d);
+
+                // 2D element address
+                const ea = try self.builder.newTemp();
+                const ea_args_2d = try bufPrintDupe(self.allocator, "l {s}, w {s}, w {s}", .{ desc_addr, index_int, index_int2 });
+                try self.builder.emitCall(ea, "l", "fbc_array_element_addr_2d", ea_args_2d);
+                break :blk_2d ea;
+            } else blk_1d: {
+                // ── 1D array store ──────────────────────────────────
+                // Bounds check
+                const bc_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                try self.builder.emitCall("", "", "fbc_array_bounds_check", bc_args);
+
+                // Get element address
+                const ea = try self.builder.newTemp();
+                const ea_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ desc_addr, index_int });
+                try self.builder.emitCall(ea, "l", "fbc_array_element_addr", ea_args);
+                break :blk_1d ea;
+            };
 
             // Look up the array element type from the symbol table so we
             // use the correct store op (e.g. storel for class instances
@@ -9787,13 +9844,31 @@ pub const BlockEmitter = struct {
                 const desc_addr = try self.builder.newTemp();
                 try self.builder.emit("    {s} =l copy ${s}\n", .{ desc_addr, desc_name });
 
-                // Call array_create(ndims=1, desc, upper_bound, elem_size)
-                const create_args = try bufPrintDupe(
-                    self.allocator,
-                    "w 1, l {s}, w {s}, w {d}",
-                    .{ desc_addr, upper_int, actual_elem_size },
-                );
-                try self.builder.emitCall("", "", "fbc_array_create", create_args);
+                if (arr.dimensions.len >= 2) {
+                    // ── 2D array: evaluate second dimension and call fbc_array_create_2d ──
+                    const upper_val2 = try self.expr_emitter.emitExpression(arr.dimensions[1]);
+                    const upper_type2 = self.expr_emitter.inferExprType(arr.dimensions[1]);
+                    const upper_int2 = if (upper_type2 == .integer) upper_val2 else blk2: {
+                        const t2 = try self.builder.newTemp();
+                        try self.builder.emitConvert(t2, "w", "dtosi", upper_val2);
+                        break :blk2 t2;
+                    };
+
+                    const create_args_2d = try bufPrintDupe(
+                        self.allocator,
+                        "w 2, l {s}, w {s}, w {s}, w {d}",
+                        .{ desc_addr, upper_int, upper_int2, actual_elem_size },
+                    );
+                    try self.builder.emitCall("", "", "fbc_array_create_2d", create_args_2d);
+                } else {
+                    // Call array_create(ndims=1, desc, upper_bound, elem_size)
+                    const create_args = try bufPrintDupe(
+                        self.allocator,
+                        "w 1, l {s}, w {s}, w {d}",
+                        .{ desc_addr, upper_int, actual_elem_size },
+                    );
+                    try self.builder.emitCall("", "", "fbc_array_create", create_args);
+                }
             } else if (self.func_ctx != null) {
                 // ── Inside a FUNCTION/SUB: DIM creates a local variable ─
                 try self.emitDimAsLocal(arr);

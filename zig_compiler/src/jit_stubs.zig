@@ -97,6 +97,11 @@ extern fn fbc_array_bounds_check(...) callconv(.c) void;
 extern fn fbc_array_element_addr(...) callconv(.c) ?*anyopaque;
 extern fn array_descriptor_erase(...) callconv(.c) void;
 
+// ── 2D Arrays ──
+extern fn fbc_array_create_2d(...) callconv(.c) void;
+extern fn fbc_array_bounds_check_2d(...) callconv(.c) void;
+extern fn fbc_array_element_addr_2d(...) callconv(.c) ?*anyopaque;
+
 // ── Error / Debug ──
 extern fn basic_error(...) callconv(.c) void;
 extern fn basic_set_line(...) callconv(.c) void;
@@ -502,7 +507,12 @@ const entry_names = [_][]const u8{
     "_fbc_array_element_addr",
     "_array_descriptor_erase",
 
-    // ── Error / Debug (61-62) ──
+    // ── 2D Arrays (61-63) ──
+    "_fbc_array_create_2d",
+    "_fbc_array_bounds_check_2d",
+    "_fbc_array_element_addr_2d",
+
+    // ── Error / Debug (64-65) ──
     "_basic_error",
     "_basic_set_line",
 
@@ -901,6 +911,11 @@ fn initEntries() void {
         fnAddr(fbc_array_bounds_check),
         fnAddr(fbc_array_element_addr),
         fnAddr(array_descriptor_erase),
+
+        // ── 2D Arrays ──
+        fnAddr(fbc_array_create_2d),
+        fnAddr(fbc_array_bounds_check_2d),
+        fnAddr(fbc_array_element_addr_2d),
 
         // ── Error / Debug ──
         fnAddr(basic_error),

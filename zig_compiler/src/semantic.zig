@@ -571,6 +571,7 @@ pub const ArraySymbol = struct {
     name: []const u8,
     element_type_desc: TypeDescriptor = .{},
     dimensions: []const i32 = &.{},
+    num_dimensions: u32 = 1,
     is_declared: bool = false,
     declaration: SourceLocation = .{},
     total_size: i32 = 0,
@@ -2235,6 +2236,7 @@ pub const SemanticAnalyzer = struct {
                 try self.symbol_table.arrays.put(try self.allocator.dupe(u8, upper_name), .{
                     .name = arr.name,
                     .element_type_desc = elem_type,
+                    .num_dimensions = @intCast(arr.dimensions.len),
                     .is_declared = true,
                     .declaration = loc,
                     .as_type_name = arr.as_type_name,
