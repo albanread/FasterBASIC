@@ -67,6 +67,7 @@ const Options = struct {
     show_tokens: bool = false,
     run_after_compile: bool = false,
     jit_verbose: bool = false,
+    metrics: bool = false,
     cc_path: []const u8 = "cc",
     runtime_dir: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
@@ -110,6 +111,8 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
         } else if (std.mem.eql(u8, arg, "--jit-verbose")) {
             opts.mode = .jit;
             opts.jit_verbose = true;
+        } else if (std.mem.eql(u8, arg, "--metrics")) {
+            opts.metrics = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
@@ -165,6 +168,7 @@ fn printHelp(writer: anytype) void {
         \\
         \\JIT Options:
         \\  --jit-verbose            JIT mode with full pipeline/link/layout report
+        \\  --metrics                Print phase timings and SAMM memory stats after JIT run
         \\
         \\Debug / Trace:
         \\  --show-il                Print generated QBE IL to stderr
@@ -657,6 +661,98 @@ fn isBasicFile(path: []const u8) bool {
     return std.ascii.eqlIgnoreCase(ext, ".bas");
 }
 
+// ─── SAMM Stats (extern) ────────────────────────────────────────────────────
+
+const SAMMStats = extern struct {
+    scopes_entered: u64,
+    scopes_exited: u64,
+    objects_allocated: u64,
+    objects_freed: u64,
+    objects_cleaned: u64,
+    cleanup_batches: u64,
+    double_free_attempts: u64,
+    bloom_false_positives: u64,
+    retain_calls: u64,
+    total_bytes_allocated: u64,
+    total_bytes_freed: u64,
+    strings_tracked: u64,
+    strings_cleaned: u64,
+    current_scope_depth: c_int,
+    peak_scope_depth: c_int,
+    bloom_memory_bytes: usize,
+    total_cleanup_time_ms: f64,
+    background_worker_active: c_int,
+};
+
+extern fn samm_get_stats(out: ?*SAMMStats) callconv(.c) void;
+
+// ─── Metrics Helpers ────────────────────────────────────────────────────────
+
+fn nsToMs(ns: i128) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
+}
+
+fn phaseMs(start_ns: i128, end_ns: i128) f64 {
+    return nsToMs(end_ns - start_ns);
+}
+
+fn pct(part_ms: f64, total_ms: f64) f64 {
+    if (total_ms <= 0.0) return 0.0;
+    return (part_ms / total_ms) * 100.0;
+}
+
+const MetricsTimes = struct {
+    read_ms: f64,
+    lex_ms: f64,
+    parse_ms: f64,
+    semantic_ms: f64,
+    cfg_ms: f64,
+    codegen_ms: f64,
+    jit_compile_ms: f64,
+    jit_link_ms: f64,
+    jit_exec_ms: f64,
+    total_ms: f64,
+};
+
+fn printMetrics(writer: anytype, stats: SAMMStats, times: MetricsTimes) void {
+    writer.print("\n", .{}) catch {};
+    writer.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+    writer.print("  fbc --metrics (JIT)\n", .{}) catch {};
+    writer.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+    writer.print("  Read source:         {d:.3} ms ({d:.1}%)\n", .{ times.read_ms, pct(times.read_ms, times.total_ms) }) catch {};
+    writer.print("  Lexing:              {d:.3} ms ({d:.1}%)\n", .{ times.lex_ms, pct(times.lex_ms, times.total_ms) }) catch {};
+    writer.print("  Parsing:             {d:.3} ms ({d:.1}%)\n", .{ times.parse_ms, pct(times.parse_ms, times.total_ms) }) catch {};
+    writer.print("  Semantic analysis:   {d:.3} ms ({d:.1}%)\n", .{ times.semantic_ms, pct(times.semantic_ms, times.total_ms) }) catch {};
+    writer.print("  CFG build:           {d:.3} ms ({d:.1}%)\n", .{ times.cfg_ms, pct(times.cfg_ms, times.total_ms) }) catch {};
+    writer.print("  QBE IL codegen:      {d:.3} ms ({d:.1}%)\n", .{ times.codegen_ms, pct(times.codegen_ms, times.total_ms) }) catch {};
+    writer.print("  JIT compile/encode:  {d:.3} ms ({d:.1}%)\n", .{ times.jit_compile_ms, pct(times.jit_compile_ms, times.total_ms) }) catch {};
+    writer.print("  JIT link/finalize:   {d:.3} ms ({d:.1}%)\n", .{ times.jit_link_ms, pct(times.jit_link_ms, times.total_ms) }) catch {};
+    writer.print("  JIT execute:         {d:.3} ms ({d:.1}%)\n", .{ times.jit_exec_ms, pct(times.jit_exec_ms, times.total_ms) }) catch {};
+    writer.print("  TOTAL:               {d:.3} ms\n", .{times.total_ms}) catch {};
+
+    const leaked_objects: i64 = @as(i64, @intCast(stats.objects_allocated)) - @as(i64, @intCast(stats.objects_freed + stats.objects_cleaned));
+    const leaked_bytes: i64 = @as(i64, @intCast(stats.total_bytes_allocated)) - @as(i64, @intCast(stats.total_bytes_freed));
+
+    writer.print("\n", .{}) catch {};
+    writer.print("  SAMM Memory Manager\n", .{}) catch {};
+    writer.print("  ----------------------------------------------------\n", .{}) catch {};
+    writer.print("  Objects allocated:    {d}\n", .{stats.objects_allocated}) catch {};
+    writer.print("  Objects freed (DEL):  {d}\n", .{stats.objects_freed}) catch {};
+    writer.print("  Objects cleaned (bg): {d}\n", .{stats.objects_cleaned}) catch {};
+    writer.print("  Strings tracked:      {d}\n", .{stats.strings_tracked}) catch {};
+    writer.print("  Strings cleaned:      {d}\n", .{stats.strings_cleaned}) catch {};
+    writer.print("  Bytes allocated:      {d}\n", .{stats.total_bytes_allocated}) catch {};
+    writer.print("  Bytes freed:          {d}\n", .{stats.total_bytes_freed}) catch {};
+    writer.print("  Leaked objects:       {d}\n", .{if (leaked_objects > 0) leaked_objects else 0}) catch {};
+    writer.print("  Leaked bytes:         {d}\n", .{if (leaked_bytes > 0) leaked_bytes else 0}) catch {};
+    writer.print("  Cleanup batches:      {d}\n", .{stats.cleanup_batches}) catch {};
+    writer.print("  Cleanup time:         {d:.3} ms\n", .{stats.total_cleanup_time_ms}) catch {};
+    writer.print("  Scope depth (cur/peak): {d}/{d}\n", .{ stats.current_scope_depth, stats.peak_scope_depth }) catch {};
+    writer.print("  Bloom memory:         {d} bytes\n", .{stats.bloom_memory_bytes}) catch {};
+    writer.print("  Background worker:    {s}\n", .{if (stats.background_worker_active != 0) "active" else "stopped"}) catch {};
+    writer.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+}
+
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -710,6 +806,18 @@ pub fn main() !void {
         stderr.print("Mode: {s}\n", .{@tagName(opts.mode)}) catch {};
     }
 
+    // ── Metrics timing ──────────────────────────────────────────────────
+    const t_start_ns = std.time.nanoTimestamp();
+    var t_after_read_ns: i128 = t_start_ns;
+    var t_after_lex_ns: i128 = t_start_ns;
+    var t_after_parse_ns: i128 = t_start_ns;
+    var t_after_semantic_ns: i128 = t_start_ns;
+    var t_after_cfg_ns: i128 = t_start_ns;
+    var t_after_codegen_ns: i128 = t_start_ns;
+    var t_after_jit_compile_ns: i128 = t_start_ns;
+    var t_after_jit_link_ns: i128 = t_start_ns;
+    var t_after_jit_exec_ns: i128 = t_start_ns;
+
     // ── Phase 1: Read source file ───────────────────────────────────────
 
     const source = readSourceFile(input_path, allocator) catch |err| {
@@ -721,6 +829,7 @@ pub fn main() !void {
     if (opts.verbose) {
         stderr.print("Read {d} bytes from {s}\n", .{ source.len, input_path }) catch {};
     }
+    t_after_read_ns = std.time.nanoTimestamp();
 
     // ── Phase 2: Lexical analysis ───────────────────────────────────────
 
@@ -743,6 +852,7 @@ pub fn main() !void {
     if (opts.verbose) {
         stderr.print("Lexer: {d} tokens\n", .{lex.tokens.items.len}) catch {};
     }
+    t_after_lex_ns = std.time.nanoTimestamp();
 
     if (opts.show_tokens) {
         dumpTokens(lex.tokens.items, stderr);
@@ -774,6 +884,7 @@ pub fn main() !void {
     if (opts.verbose) {
         stderr.print("Parser: {d} program lines\n", .{program.lines.len}) catch {};
     }
+    t_after_parse_ns = std.time.nanoTimestamp();
 
     // ── Debug: AST dump ─────────────────────────────────────────────────
 
@@ -817,6 +928,7 @@ pub fn main() !void {
     if (opts.verbose) {
         stderr.print("Semantic analysis: OK ({d} warnings)\n", .{analyzer.warnings.items.len}) catch {};
     }
+    t_after_semantic_ns = std.time.nanoTimestamp();
 
     // ── Debug: Symbol table dump ────────────────────────────────────────
 
@@ -843,6 +955,7 @@ pub fn main() !void {
             program_cfg.unreachable_count,
         }) catch {};
     }
+    t_after_cfg_ns = std.time.nanoTimestamp();
 
     // ── Debug: CFG dump ─────────────────────────────────────────────────
 
@@ -891,6 +1004,7 @@ pub fn main() !void {
     if (opts.verbose) {
         stderr.print("Code generation: {d} bytes of QBE IL\n", .{il.len}) catch {};
     }
+    t_after_codegen_ns = std.time.nanoTimestamp();
 
     if (opts.show_il) {
         stderr.print("\n=== Generated QBE IL ===\n{s}\n=== End QBE IL ===\n\n", .{il}) catch {};
@@ -911,6 +1025,7 @@ pub fn main() !void {
                 stderr.print("Error: JIT compilation failed: {s}\n", .{@errorName(err)}) catch {};
                 std.process.exit(1);
             };
+            t_after_jit_compile_ns = std.time.nanoTimestamp();
 
             if (opts.jit_verbose) {
                 const pr = jit_result.pipelineReport();
@@ -956,6 +1071,7 @@ pub fn main() !void {
                 std.process.exit(1);
             };
             defer session.deinit();
+            t_after_jit_link_ns = std.time.nanoTimestamp();
 
             if (opts.jit_verbose) {
                 session.dumpFullReport(stderr) catch {};
@@ -974,9 +1090,40 @@ pub fn main() !void {
 
             // Step 3: Execute
             const exec_result = session.execute();
+            t_after_jit_exec_ns = std.time.nanoTimestamp();
 
             if (opts.jit_verbose) {
                 exec_result.dump(stderr) catch {};
+            }
+
+            // ── Metrics report ──────────────────────────────────────
+            if (opts.metrics) {
+                var samm_stats: SAMMStats = undefined;
+                samm_get_stats(&samm_stats);
+
+                const m_read = phaseMs(t_start_ns, t_after_read_ns);
+                const m_lex = phaseMs(t_after_read_ns, t_after_lex_ns);
+                const m_parse = phaseMs(t_after_lex_ns, t_after_parse_ns);
+                const m_sem = phaseMs(t_after_parse_ns, t_after_semantic_ns);
+                const m_cfg = phaseMs(t_after_semantic_ns, t_after_cfg_ns);
+                const m_cg = phaseMs(t_after_cfg_ns, t_after_codegen_ns);
+                const m_jc = phaseMs(t_after_codegen_ns, t_after_jit_compile_ns);
+                const m_jl = phaseMs(t_after_jit_compile_ns, t_after_jit_link_ns);
+                const m_je = phaseMs(t_after_jit_link_ns, t_after_jit_exec_ns);
+                const m_total = phaseMs(t_start_ns, t_after_jit_exec_ns);
+
+                printMetrics(stderr, samm_stats, .{
+                    .read_ms = m_read,
+                    .lex_ms = m_lex,
+                    .parse_ms = m_parse,
+                    .semantic_ms = m_sem,
+                    .cfg_ms = m_cfg,
+                    .codegen_ms = m_cg,
+                    .jit_compile_ms = m_jc,
+                    .jit_link_ms = m_jl,
+                    .jit_exec_ms = m_je,
+                    .total_ms = m_total,
+                });
             }
 
             if (exec_result.completed) {
