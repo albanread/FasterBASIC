@@ -1918,11 +1918,11 @@ pub const ExprEmitter = struct {
                     const rhs_val = try self.emitExpression(right);
                     // If one side isn't a string, convert it.
                     const lhs_str = if (left_type != .string)
-                        try self.emitNumericToString(lhs, left_type)
+                        try self.emitNumericToString(lhs, left_type, left)
                     else
                         lhs;
                     const rhs_str = if (right_type != .string)
-                        try self.emitNumericToString(rhs_val, right_type)
+                        try self.emitNumericToString(rhs_val, right_type, right)
                     else
                         rhs_val;
                     const dest = try self.builder.newTemp();
@@ -2077,13 +2077,22 @@ pub const ExprEmitter = struct {
     }
 
     /// Convert a numeric value to a StringDescriptor* via runtime call.
-    fn emitNumericToString(self: *ExprEmitter, temp: []const u8, et: ExprType) EmitError![]const u8 {
+    /// When `source_expr` is provided it is used to detect LONG expressions
+    /// whose value is already 64-bit, avoiding a spurious `extsw` that
+    /// would truncate the upper 32 bits.
+    fn emitNumericToString(self: *ExprEmitter, temp: []const u8, et: ExprType, source_expr: ?*const ast.Expression) EmitError![]const u8 {
         const dest = try self.builder.newTemp();
         switch (et) {
             .integer => {
-                // string_from_int expects int64_t (l), sign-extend w → l
-                const long_val = try self.builder.newTemp();
-                try self.builder.emitExtend(long_val, "l", "extsw", temp);
+                // string_from_int expects int64_t (l).  If the source is
+                // already a LONG (64-bit) expression the value is already
+                // an `l` — pass it directly.  Otherwise sign-extend w → l.
+                const is_already_long = if (source_expr) |expr| self.isLongExpr(expr) else false;
+                const long_val = if (is_already_long) temp else blk: {
+                    const ext = try self.builder.newTemp();
+                    try self.builder.emitExtend(ext, "l", "extsw", temp);
+                    break :blk ext;
+                };
                 const args = try std.fmt.allocPrint(self.allocator, "l {s}", .{long_val});
                 try self.builder.emitCall(dest, "l", "string_from_int", args);
             },
@@ -8118,7 +8127,9 @@ pub const BlockEmitter = struct {
                     const et = self.expr_emitter.inferExprType(item.expr);
                     // basic_print_int expects int64_t (l type).  If the expression
                     // produced a 32-bit word we must sign-extend it first.
-                    const print_val = if (et == .integer) blk: {
+                    // However, LONG expressions are already 64-bit — skip extsw
+                    // to avoid truncating the upper 32 bits.
+                    const print_val = if (et == .integer and !self.expr_emitter.isLongExpr(item.expr)) blk: {
                         const long_val = try self.builder.newTemp();
                         try self.builder.emitExtend(long_val, "l", "extsw", val);
                         break :blk long_val;
@@ -9176,8 +9187,17 @@ pub const BlockEmitter = struct {
             }
 
             // Convert value to target type if needed.
+            // When both source and target are LONG (64-bit integer), the
+            // value is already an `l`-typed QBE temporary.  Skip the
+            // generic emitTypeConversion which would insert a spurious
+            // `extsw` (sign-extend-word) that truncates the upper 32 bits.
             const expr_type = self.expr_emitter.inferExprType(lt.value);
-            const effective_val = try self.emitTypeConversion(val, expr_type, resolved.base_type);
+            const target_is_long = (resolved.base_type == .long or resolved.base_type == .ulong);
+            const source_is_long = (expr_type == .integer and self.expr_emitter.isLongExpr(lt.value));
+            const effective_val = if (source_is_long and target_is_long)
+                val
+            else
+                try self.emitTypeConversion(val, expr_type, resolved.base_type);
             try self.builder.emitStore(resolved.store_type, effective_val, var_addr);
             return;
         }
