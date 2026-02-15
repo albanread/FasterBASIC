@@ -1,39 +1,92 @@
-# Compiled binaries
+# ── Compiled binaries ────────────────────────────────────────
 fbc_qbe
 fbc
 *.out
 a.out
-test
-test_*
-!test_*.bas
-!test_programs/
 
-# Build artifacts directory
-build_artifacts/
-
-# Object files
+# ── Object files & libraries ────────────────────────────────
 *.o
 *.obj
 *.a
 *.so
 *.dylib
 
-# Assembly output
+# ── Assembly & intermediate output ──────────────────────────
 *.s
 *.asm
-
-# QBE intermediate
 *.ssa
+*.qbe
+*.il
 
-# Build directories
+# ── Build directories ───────────────────────────────────────
 build/
+build_artifacts/
 bin/
 obj/
 
-# Test scratch area
+# ── Zig build artifacts ─────────────────────────────────────
+zig_compiler/zig-out/
+zig_compiler/.zig-cache/
+
+# ── C/C++ compilation artifacts ──────────────────────────────
+*.d
+*.dSYM/
+
+# ── Test binaries & artifacts ────────────────────────────────
+# Covers compiled test binaries anywhere in the tree
+test
+test_*
+!test_*.bas
+!test_*.c
+!test_*.cpp
+!test_*.sh
+!test_*.md
+!test_*.expected
+!test_programs/
+
+# Named test/benchmark binaries that land in repo root
+ackermann
+arm64_encoder
+bench_abs_sgn
+compare_global
+compare_local
+day1jit
+day2jit
+day2jit_v2
+euler_method
+euler_method_v2
+gosub_if_control_flow
+hundred_doors
+jit_test_gosub
+jit_test_gosub_nested
+levenshtein_distance
+mersenne_factors
+simple_madd
+stress_test_global
+stress_test_local
+
+# Test data & scratch
+*.dat
+*.tmp
+test_output/
+temp_run/
+output/
+results/
 test_programs/scratch/
 
-# IDE and editor files
+# Stray source copies that are build artifacts
+jit_encode.zig
+arm64_encoder.zig
+debug_io.txt
+
+# Quoted-name test artifacts (created by file-I/O tests)
+"test_empty.txt"
+"test_large.txt"
+"test_poem.txt"
+"test_program.bas"
+"test_slurp_output.txt"
+
+# ── IDE & editor files ──────────────────────────────────────
 .vscode/
 .idea/
 *.swp
@@ -41,46 +94,9 @@ test_programs/scratch/
 *~
 .DS_Store
 
-# Temporary files
-*.tmp
+# ── Temporary / log files ───────────────────────────────────
 *.bak
 *.log
 
-# Test output
-output/
-results/
-
-# QBE IL output
-*.qbe
-
-# C/C++ compilation artifacts
-*.d
-*.dSYM/
-
-# Zig build artifacts
-zig_compiler/zig-out/
-zig_compiler/.zig-cache/
-
-# Test data artifacts
-*.dat
-
-# JIT test binaries and scratch files
-arm64_encoder
-day1jit
-day2jit
-day2jit_v2
-jit_test_gosub
-jit_test_gosub_nested
-jit_encode.zig
-arm64_encoder.zig
-debug_io.txt
-
-# External dependencies (vendored locally)
+# ── External vendored dependencies ──────────────────────────
 capstone/
-
-# Quoted-name test artifacts
-\"test_empty.txt\"
-\"test_large.txt\"
-\"test_poem.txt\"
-\"test_program.bas\"
-\"test_slurp_output.txt\"
