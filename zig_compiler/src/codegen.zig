@@ -25,6 +25,7 @@ const std = @import("std");
 const token = @import("token.zig");
 const ast = @import("ast.zig");
 const semantic = @import("semantic.zig");
+const ast_optimize = @import("ast_optimize.zig");
 const cfg_mod = @import("cfg.zig");
 const Tag = token.Tag;
 const SourceLocation = token.SourceLocation;
@@ -5085,7 +5086,10 @@ pub const BlockEmitter = struct {
     field_mappings: std.StringHashMap(FieldMapping),
 
     /// Whether SAMM is enabled.
-    samm_enabled: bool = true,
+    samm_enabled: bool = false,
+
+    /// FOR loop step direction map from the AST optimizer.
+    for_step_directions: ?*const std.StringHashMap(ast_optimize.StepDirection) = null,
 
     const ExprType = ExprEmitter.ExprType;
     const EmitError = error{OutOfMemory};
@@ -6959,6 +6963,56 @@ pub const BlockEmitter = struct {
         const limit_val = try self.builder.newTemp();
         try self.builder.emitLoad(limit_val, "w", ctx.end_addr);
 
+        // ── Specialised path: AST optimizer determined step direction ───
+        // When the step is a compile-time constant, we skip the runtime
+        // sign check entirely and emit a single comparison instruction
+        // instead of ~10.
+        if (self.for_step_directions) |dir_map| {
+            var upper_buf: [128]u8 = undefined;
+            const vlen = @min(ctx.variable.len, upper_buf.len);
+            for (0..vlen) |vi| upper_buf[vi] = std.ascii.toUpper(ctx.variable[vi]);
+            const dir = dir_map.get(upper_buf[0..vlen]) orelse .unknown;
+
+            switch (dir) {
+                .positive => {
+                    // Positive step: continue while cur <= limit
+                    try self.builder.emitComment("FOR step specialised: positive");
+                    const cond = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =w csgtw {s}, {s}\n", .{ cond, cur, limit_val });
+                    const not_cond = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =w xor {s}, 1\n", .{ not_cond, cond });
+                    try self.builder.emitBranch(
+                        not_cond,
+                        try blockLabel(self.cfg, true_target, self.allocator),
+                        try blockLabel(self.cfg, false_target, self.allocator),
+                    );
+                    return;
+                },
+                .negative => {
+                    // Negative step: continue while cur >= limit
+                    try self.builder.emitComment("FOR step specialised: negative");
+                    const cond = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =w csltw {s}, {s}\n", .{ cond, cur, limit_val });
+                    const not_cond = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =w xor {s}, 1\n", .{ not_cond, cond });
+                    try self.builder.emitBranch(
+                        not_cond,
+                        try blockLabel(self.cfg, true_target, self.allocator),
+                        try blockLabel(self.cfg, false_target, self.allocator),
+                    );
+                    return;
+                },
+                .zero => {
+                    // Step is zero — loop never progresses. Skip body.
+                    try self.builder.emitComment("FOR step specialised: zero (skip)");
+                    try self.builder.emitJump(try blockLabel(self.cfg, false_target, self.allocator));
+                    return;
+                },
+                .unknown => {}, // Fall through to generic path
+            }
+        }
+
+        // ── Generic path: runtime step-sign check ───────────────────────
         // Load stored step value (integer) to check sign.
         const step_val = try self.builder.newTemp();
         try self.builder.emitLoad(step_val, "w", ctx.step_addr);
@@ -12022,6 +12076,11 @@ pub const CFGCodeGenerator = struct {
     /// Whether SAMM is enabled.
     samm_enabled: bool = true,
 
+    /// FOR loop step direction map from the AST optimizer.
+    /// When non-null, codegen uses it to specialize FOR loop conditions
+    /// (eliminating the runtime step-sign check for known-positive/negative steps).
+    for_step_directions: ?*const std.StringHashMap(ast_optimize.StepDirection) = null,
+
     pub fn init(
         sem: *const semantic.SemanticAnalyzer,
         program_cfg: *const cfg_mod.CFG,
@@ -12035,6 +12094,7 @@ pub const CFGCodeGenerator = struct {
             .cfg_builder = the_cfg_builder,
             .verbose = false,
             .samm_enabled = true,
+            .for_step_directions = null,
             .builder = QBEBuilder.init(allocator),
             .type_manager = TypeManager.init(sem.getSymbolTable()),
             .symbol_mapper = SymbolMapper.init(allocator),
@@ -12080,6 +12140,7 @@ pub const CFGCodeGenerator = struct {
             self.allocator,
         );
         self.block_emitter.?.samm_enabled = self.samm_enabled;
+        self.block_emitter.?.for_step_directions = self.for_step_directions;
 
         // Phase 1: File header
         try self.emitFileHeader();
