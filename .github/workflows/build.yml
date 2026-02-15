@@ -23,6 +23,11 @@ jobs:
         with:
           version: 0.15.2
 
+      - name: Download Capstone
+        run: |
+          curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
+          mv capstone-6.0.0-Alpha6 capstone
+
       - name: Build FasterBASIC
         run: |
           cd zig_compiler
@@ -52,6 +57,11 @@ jobs:
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
+
+      - name: Download Capstone
+        run: |
+          curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
+          mv capstone-6.0.0-Alpha6 capstone
 
       - name: Run unit tests
         run: |
