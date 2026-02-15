@@ -10,8 +10,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    name: Build fbc (macOS ARM64)
+  build-and-unit-test:
+    name: Build & Unit Tests (macOS ARM64)
     runs-on: macos-14
 
     steps:
@@ -28,7 +28,7 @@ jobs:
           curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
           mv capstone-6.0.0-Alpha6 capstone
 
-      - name: Build FasterBASIC
+      - name: Build FasterBASIC (ReleaseFast)
         run: |
           cd zig_compiler
           zig build -Doptimize=ReleaseFast
@@ -38,6 +38,11 @@ jobs:
           file zig_compiler/zig-out/bin/fbc
           zig_compiler/zig-out/bin/fbc --version
 
+      - name: Run unit tests
+        run: |
+          cd zig_compiler
+          zig build test
+
       - name: Upload fbc binary
         uses: actions/upload-artifact@v4
         with:
@@ -45,37 +50,10 @@ jobs:
           path: zig_compiler/zig-out/bin/fbc
           retention-days: 7
 
-  unit-tests:
-    name: Unit Tests (zig build test)
-    runs-on: macos-14
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Install Zig
-        uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Download Capstone
-        run: |
-          curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
-          mv capstone-6.0.0-Alpha6 capstone
-
-      - name: Run unit tests
-        run: |
-          cd zig_compiler
-          zig build test 2>&1 | tee /tmp/unit_test_output.txt
-          echo ""
-          echo "============================================"
-          echo " Unit test run complete"
-          echo "============================================"
-
   jit-tests:
-    name: JIT Batch Tests
+    name: JIT Tests
     runs-on: macos-14
-    needs: [build]
+    needs: [build-and-unit-test]
 
     steps:
       - name: Checkout code
@@ -89,6 +67,9 @@ jobs:
 
       - name: Make fbc executable
         run: chmod +x bin/fbc
+
+      - name: Install coreutils (for timeout)
+        run: brew install --quiet coreutils
 
       - name: Run JIT batch tests (batch_test suite)
         run: |
@@ -113,15 +94,21 @@ jobs:
             test_name="$(basename "$f" .bas)"
             TOTAL=$((TOTAL + 1))
 
-            if output=$(timeout 30 bin/fbc --jit "$f" 2>&1); then
+            if output=$(gtimeout 30 bin/fbc --jit "$f" 2>&1); then
               PASSED=$((PASSED + 1))
               echo "PASS  $test_name"
             else
               rc=$?
-              FAILED=$((FAILED + 1))
-              FAILED_TESTS="$FAILED_TESTS  $test_name (exit $rc)\n"
-              echo "FAIL  $test_name (exit $rc)"
-              echo "  output: $output"
+              if [ $rc -eq 124 ]; then
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  $test_name (timeout)\n"
+                echo "FAIL  $test_name (timeout)"
+              else
+                FAILED=$((FAILED + 1))
+                FAILED_TESTS="$FAILED_TESTS  $test_name (exit $rc)\n"
+                echo "FAIL  $test_name (exit $rc)"
+                echo "  output: $output"
+              fi
             fi
           done
 
@@ -137,7 +124,7 @@ jobs:
             exit 1
           fi
 
-      - name: Run JIT tests on main test suite
+      - name: Run JIT tests on main test suite (informational)
         run: |
           echo "============================================"
           echo " JIT — Main Test Suite (best-effort)"
@@ -146,27 +133,34 @@ jobs:
           echo "Running with --timeout 10 and no --fail-fast"
           echo "Some tests may not yet work under JIT."
           echo ""
-
-          # Run but don't fail the build — this is informational
+          # Informational only — don't fail the build
           bin/fbc --batch-jit tests --timeout 10 2>&1 || true
 
   aot-tests:
     name: AOT End-to-End Tests
     runs-on: macos-14
-    needs: [build]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download fbc binary
-        uses: actions/download-artifact@v4
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          name: fbc-binary
-          path: bin
+          version: 0.15.2
 
-      - name: Make fbc executable
-        run: chmod +x bin/fbc
+      - name: Install coreutils (for timeout)
+        run: brew install --quiet coreutils
+
+      - name: Download Capstone
+        run: |
+          curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
+          mv capstone-6.0.0-Alpha6 capstone
+
+      - name: Build FasterBASIC
+        run: |
+          cd zig_compiler
+          zig build -Doptimize=ReleaseFast
 
       - name: Verify AOT compilation works
         run: |
@@ -174,19 +168,20 @@ jobs:
           PRINT "Hello from FasterBASIC!"
           END
           EOF
-          bin/fbc /tmp/test_hello.bas -o /tmp/test_hello
+          ./zig_compiler/zig-out/bin/fbc /tmp/test_hello.bas -o /tmp/test_hello
           /tmp/test_hello
 
       - name: Run AOT test suite
         run: |
           echo "============================================"
-          echo " AOT End-to-End Tests (parallel)"
+          echo " AOT End-to-End Tests"
           echo "============================================"
 
-          FBC="$(pwd)/bin/fbc"
+          FBC="$(pwd)/zig_compiler/zig-out/bin/fbc"
           TOTAL=0
           PASSED=0
           FAILED=0
+          SKIPPED=0
           FAILED_TESTS=""
 
           for bas_file in $(find tests -name '*.bas' -type f | sort); do
@@ -198,7 +193,7 @@ jobs:
             # Compile
             if ! $FBC "$bas_file" -o "$out_exe" 2>/tmp/fbc_compile_err.txt; then
               FAILED=$((FAILED + 1))
-              hint=$(head -1 /tmp/fbc_compile_err.txt)
+              hint=$(head -1 /tmp/fbc_compile_err.txt 2>/dev/null)
               FAILED_TESTS="$FAILED_TESTS  COMPILE: $test_name — $hint\n"
               echo "FAIL [compile] $test_name"
               rm -f "$out_exe"
@@ -213,7 +208,7 @@ jobs:
               continue
             fi
 
-            if output=$(timeout 15 "$out_exe" 2>&1); then
+            if output=$(gtimeout 15 "$out_exe" 2>&1); then
               PASSED=$((PASSED + 1))
               echo "PASS           $test_name"
             else
@@ -228,7 +223,7 @@ jobs:
                 FAILED_TESTS="$FAILED_TESTS  SIGNAL: $test_name (sig $sig)\n"
                 echo "FAIL [sig $sig] $test_name"
               else
-                # Non-zero exit is acceptable for some tests (e.g. error handling tests)
+                # Non-zero exit is acceptable for some tests (error handling, etc.)
                 PASSED=$((PASSED + 1))
                 echo "PASS           $test_name (exit $rc)"
               fi
@@ -247,41 +242,47 @@ jobs:
             echo -e "$FAILED_TESTS"
           fi
 
-          # Don't fail the workflow for AOT test failures — some tests
-          # require interactive input or specific runtime conditions.
-          # The pass rate is informational.
-          PASS_RATE=$((PASSED * 100 / TOTAL))
-          echo "Pass rate: ${PASSED}/${TOTAL} (${PASS_RATE}%)"
-
           # Fail if less than 80% pass
-          if [ "$PASS_RATE" -lt 80 ]; then
-            echo "ERROR: Pass rate below 80% threshold"
-            exit 1
+          if [ "$TOTAL" -gt 0 ]; then
+            PASS_RATE=$((PASSED * 100 / TOTAL))
+            echo "Pass rate: ${PASSED}/${TOTAL} (${PASS_RATE}%)"
+            if [ "$PASS_RATE" -lt 80 ]; then
+              echo "ERROR: Pass rate below 80% threshold"
+              exit 1
+            fi
           fi
 
   neon-tests:
     name: NEON & Array Expression Tests
     runs-on: macos-14
-    needs: [build]
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download fbc binary
-        uses: actions/download-artifact@v4
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
         with:
-          name: fbc-binary
-          path: bin
+          version: 0.15.2
 
-      - name: Make fbc executable
-        run: chmod +x bin/fbc
+      - name: Install coreutils (for timeout)
+        run: brew install --quiet coreutils
+
+      - name: Download Capstone
+        run: |
+          curl -sL https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha6.tar.gz | tar xz
+          mv capstone-6.0.0-Alpha6 capstone
+
+      - name: Build FasterBASIC
+        run: |
+          cd zig_compiler
+          zig build -Doptimize=ReleaseFast
 
       - name: Run NEON-path tests
         env:
           ENABLE_NEON_LOOP: "1"
         run: |
-          FBC="$(pwd)/bin/fbc"
+          FBC="$(pwd)/zig_compiler/zig-out/bin/fbc"
           TOTAL=0
           PASSED=0
           FAILED=0
@@ -309,7 +310,7 @@ jobs:
                 continue
               fi
 
-              output=$(timeout 15 "/tmp/neon_${test_name}" 2>&1) || true
+              output=$(gtimeout 15 "/tmp/neon_${test_name}" 2>&1) || true
 
               fail_count=$(echo "$output" | grep -ci "FAIL" || true)
               if [ "$fail_count" -gt 0 ]; then
@@ -349,7 +350,7 @@ jobs:
   package:
     name: Package Release
     runs-on: macos-14
-    needs: [build, unit-tests, jit-tests, aot-tests, neon-tests]
+    needs: [build-and-unit-test, jit-tests, aot-tests, neon-tests]
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
 
     steps:
@@ -379,17 +380,15 @@ jobs:
           cat > release/fasterbasic-macos-arm64/QUICKSTART.md << 'QUICKSTART'
           # FasterBASIC — Quick Start
 
-          ## Compile and Run (AOT)
-
-              echo 'PRINT "Hello, World!"' > hello.bas
-              echo 'END' >> hello.bas
-              ./fbc hello.bas -o hello
-              ./hello
-
           ## JIT Mode (no external toolchain needed)
 
               ./fbc --jit hello.bas
               ./fbc --run hello.bas
+
+          ## Compile and Run (AOT — requires clang/cc)
+
+              ./fbc hello.bas -o hello
+              ./hello
 
           ## Options
 
@@ -474,8 +473,8 @@ jobs:
           \`\`\`bash
           tar -xzf fasterbasic-macos-arm64.tar.gz
           cd fasterbasic-macos-arm64
-          ./fbc --jit hello.bas       # JIT mode
-          ./fbc hello.bas -o hello    # AOT mode
+          ./fbc --jit hello.bas       # JIT mode (no toolchain needed)
+          ./fbc hello.bas -o hello    # AOT mode (needs clang/cc)
           \`\`\`
 
           ## Building from Source
