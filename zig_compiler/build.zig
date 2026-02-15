@@ -484,6 +484,13 @@ pub fn build(b: *std.Build) void {
                 .files = qbe_core_sources,
                 .flags = qbe_c_flags,
             });
+            // Provide basic_exit and other runtime stubs that QBE C code
+            // references but that aren't available in test binaries.
+            mod.addCSourceFiles(.{
+                .root = b.path("qbe"),
+                .files = &.{"qbe_test_stubs.c"},
+                .flags = qbe_c_flags,
+            });
             mod.addCSourceFiles(.{
                 .root = b.path("qbe"),
                 .files = qbe_amd64_sources,

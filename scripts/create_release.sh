@@ -1,5 +1,12 @@
 #!/bin/bash
 # Helper script to create a FasterBASIC release
+#
+# Usage:
+#   bash scripts/create_release.sh [version]
+#
+# Examples:
+#   bash scripts/create_release.sh 2.0.0
+#   bash scripts/create_release.sh          # prompts for version
 
 set -e
 
@@ -14,7 +21,7 @@ echo -e "${BLUE}=== FasterBASIC Release Helper ===${NC}"
 echo ""
 
 # Check if we're in the right directory
-if [ ! -f "README.md" ] || [ ! -d "qbe_basic_integrated" ]; then
+if [ ! -f "README.md" ] || [ ! -d "zig_compiler" ]; then
     echo -e "${RED}Error: Must be run from the FasterBASIC project root${NC}"
     exit 1
 fi
@@ -79,6 +86,39 @@ echo -e "${YELLOW}Release notes:${NC}"
 echo "$RELEASE_NOTES"
 echo ""
 
+# Build and test before releasing
+echo ""
+echo -e "${BLUE}Building and testing...${NC}"
+echo ""
+
+if [ -x "zig_compiler/zig-out/bin/fbc" ]; then
+    echo -e "${GREEN}✓ fbc binary found${NC}"
+else
+    echo -e "${YELLOW}Building fbc...${NC}"
+    cd zig_compiler && zig build -Doptimize=ReleaseFast && cd ..
+    if [ -x "zig_compiler/zig-out/bin/fbc" ]; then
+        echo -e "${GREEN}✓ fbc built successfully${NC}"
+    else
+        echo -e "${RED}✗ Failed to build fbc${NC}"
+        exit 1
+    fi
+fi
+
+echo ""
+echo -e "${BLUE}Running JIT batch tests...${NC}"
+if zig_compiler/zig-out/bin/fbc --batch-jit zig_compiler/tests/batch_test --timeout 30 2>&1; then
+    echo -e "${GREEN}✓ JIT batch tests passed${NC}"
+else
+    echo -e "${RED}✗ JIT batch tests failed${NC}"
+    read -p "Continue anyway? (y/n) " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+echo ""
+
 # Confirm
 read -p "Create release? (y/n) " -n 1 -r
 echo
@@ -116,9 +156,12 @@ echo ""
 echo -e "${GREEN}=== Release Created Successfully! ===${NC}"
 echo ""
 echo "GitHub Actions will now:"
-echo "  1. Build binaries for macOS ARM64, macOS x86_64, and Linux x86_64"
-echo "  2. Run tests to verify the builds"
-echo "  3. Create a GitHub Release with all artifacts"
+echo "  1. Build fbc for macOS ARM64 (Zig 0.15)"
+echo "  2. Run unit tests (zig build test)"
+echo "  3. Run JIT batch tests (--batch-jit)"
+echo "  4. Run AOT end-to-end tests"
+echo "  5. Run NEON/array expression tests"
+echo "  6. Package and create a GitHub Release"
 echo ""
 echo "Monitor progress at:"
 echo -e "${BLUE}https://github.com/albanread/FasterBASIC/actions${NC}"

@@ -1,3 +1,4 @@
+#include <stdlib.h>
 // test_stubs.c — Weak stubs for extern symbols required by runtime unit tests.
 // These satisfy the linker when running `zig build test` on runtime modules
 // that declare extern functions from other runtime modules.
@@ -11,6 +12,7 @@
 #define WEAK __attribute__((weak))
 
 // basic_runtime stubs
+WEAK void basic_exit(int code) { exit(code); }
 WEAK void basic_error_msg(const char *msg) { (void)msg; }
 WEAK void basic_throw(int code) { (void)code; }
 
