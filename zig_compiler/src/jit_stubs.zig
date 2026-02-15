@@ -31,6 +31,9 @@ const RuntimeContext = linker.RuntimeContext;
 extern fn basic_init_args(...) callconv(.c) void;
 extern fn basic_runtime_init() callconv(.c) void;
 extern fn basic_runtime_cleanup() callconv(.c) void;
+extern fn basic_exit(code: c_int) callconv(.c) noreturn;
+extern fn basic_jit_call(callback: *const fn (*anyopaque) callconv(.c) c_int, ctx: *anyopaque) callconv(.c) c_int;
+extern fn basic_jit_exec(fn_ptr: *const anyopaque, argc: c_int, argv: [*][*:0]u8) callconv(.c) c_int;
 extern fn samm_init() callconv(.c) void;
 extern fn samm_shutdown() callconv(.c) void;
 extern fn samm_enter_scope() callconv(.c) void;
@@ -44,6 +47,8 @@ extern fn basic_print_double(...) callconv(.c) void;
 extern fn basic_print_string_desc(...) callconv(.c) void;
 extern fn basic_print_newline() callconv(.c) void;
 extern fn basic_print_tab() callconv(.c) void;
+extern fn basic_print_lock() callconv(.c) void;
+extern fn basic_print_unlock() callconv(.c) void;
 extern fn basic_input_string() callconv(.c) ?*anyopaque;
 extern fn basic_input_int() callconv(.c) i32;
 extern fn basic_input_double() callconv(.c) f64;
@@ -301,6 +306,8 @@ extern fn msg_marshall_array(...) callconv(.c) ?*anyopaque;
 extern fn msg_blob_free(...) callconv(.c) void;
 extern fn msg_blob_tag(...) callconv(.c) i32;
 extern fn msg_blob_type_id(...) callconv(.c) i32;
+extern fn msg_blob_payload_ptr(...) callconv(.c) ?*anyopaque;
+extern fn msg_blob_forward(...) callconv(.c) i32;
 extern fn msg_unmarshall_double(...) callconv(.c) f64;
 extern fn msg_unmarshall_int(...) callconv(.c) i32;
 extern fn msg_unmarshall_string(...) callconv(.c) ?*anyopaque;
@@ -479,6 +486,12 @@ extern fn samm_is_enabled() callconv(.c) i32;
 extern fn samm_scope_depth() callconv(.c) i32;
 extern fn samm_print_stats() callconv(.c) void;
 
+// ── Timer SEND ──
+extern fn timer_after_send(...) callconv(.c) i32;
+extern fn timer_every_send(...) callconv(.c) i32;
+extern fn timer_stop(...) callconv(.c) void;
+extern fn timer_stop_all() callconv(.c) void;
+
 // ============================================================================
 // Section: Jump Table Construction
 // ============================================================================
@@ -496,6 +509,9 @@ const entry_names = [_][]const u8{
     "_basic_init_args",
     "_basic_runtime_init",
     "_basic_runtime_cleanup",
+    "_basic_exit",
+    "_basic_jit_call",
+    "_basic_jit_exec",
     "_samm_init",
     "_samm_shutdown",
     "_samm_enter_scope",
@@ -509,6 +525,8 @@ const entry_names = [_][]const u8{
     "_basic_print_string_desc",
     "_basic_print_newline",
     "_basic_print_tab",
+    "_basic_print_lock",
+    "_basic_print_unlock",
     "_basic_input_string",
     "_basic_input_int",
     "_basic_input_double",
@@ -766,6 +784,8 @@ const entry_names = [_][]const u8{
     "_msg_blob_free",
     "_msg_blob_tag",
     "_msg_blob_type_id",
+    "_msg_blob_payload_ptr",
+    "_msg_blob_forward",
     "_msg_unmarshall_double",
     "_msg_unmarshall_int",
     "_msg_unmarshall_string",
@@ -919,6 +939,12 @@ const entry_names = [_][]const u8{
     "_samm_scope_depth",
     "_samm_print_stats",
 
+    // ── Timer SEND ──
+    "_timer_after_send",
+    "_timer_every_send",
+    "_timer_stop",
+    "_timer_stop_all",
+
     // ── Binary I/O ──
     "_file_put_record",
     "_file_get_record",
@@ -956,6 +982,9 @@ fn initEntries() void {
         fnAddr(basic_init_args),
         fnAddr(basic_runtime_init),
         fnAddr(basic_runtime_cleanup),
+        fnAddr(basic_exit),
+        fnAddr(basic_jit_call),
+        fnAddr(basic_jit_exec),
         fnAddr(samm_init),
         fnAddr(samm_shutdown),
         fnAddr(samm_enter_scope),
@@ -969,6 +998,8 @@ fn initEntries() void {
         fnAddr(basic_print_string_desc),
         fnAddr(basic_print_newline),
         fnAddr(basic_print_tab),
+        fnAddr(basic_print_lock),
+        fnAddr(basic_print_unlock),
         fnAddr(basic_input_string),
         fnAddr(basic_input_int),
         fnAddr(basic_input_double),
@@ -1226,6 +1257,8 @@ fn initEntries() void {
         fnAddr(msg_blob_free),
         fnAddr(msg_blob_tag),
         fnAddr(msg_blob_type_id),
+        fnAddr(msg_blob_payload_ptr),
+        fnAddr(msg_blob_forward),
         fnAddr(msg_unmarshall_double),
         fnAddr(msg_unmarshall_int),
         fnAddr(msg_unmarshall_string),
@@ -1378,6 +1411,12 @@ fn initEntries() void {
         fnAddr(samm_is_enabled),
         fnAddr(samm_scope_depth),
         fnAddr(samm_print_stats),
+
+        // ── Timer SEND ──
+        fnAddr(timer_after_send),
+        fnAddr(timer_every_send),
+        fnAddr(timer_stop),
+        fnAddr(timer_stop_all),
 
         // ── Binary I/O ──
         fnAddr(file_put_record),

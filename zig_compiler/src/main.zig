@@ -74,6 +74,13 @@ const Options = struct {
     /// Arguments to pass to the JIT-compiled program (collected after
     /// the input file when --run is used).
     program_args: []const []const u8 = &.{},
+    /// Path to a folder for --batch-jit mode: recursively scan for .bas
+    /// files and JIT-execute each one sequentially in a single process.
+    batch_jit_path: ?[]const u8 = null,
+    /// Stop batch-jit on first failure instead of continuing.
+    batch_fail_fast: bool = false,
+    /// Per-file timeout in seconds for batch-jit mode (0 = no timeout).
+    batch_timeout: u32 = 30,
 };
 
 fn parseArgs(allocator: std.mem.Allocator) Options {
@@ -115,6 +122,23 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
             opts.jit_verbose = true;
         } else if (std.mem.eql(u8, arg, "--metrics")) {
             opts.metrics = true;
+        } else if (std.mem.eql(u8, arg, "--batch-jit")) {
+            opts.batch_jit_path = args.next() orelse {
+                opts.error_message = "Missing folder argument for --batch-jit";
+                return opts;
+            };
+            opts.mode = .jit;
+        } else if (std.mem.eql(u8, arg, "--timeout")) {
+            const val = args.next() orelse {
+                opts.error_message = "Missing seconds argument for --timeout";
+                return opts;
+            };
+            opts.batch_timeout = std.fmt.parseInt(u32, val, 10) catch {
+                opts.error_message = "Invalid number for --timeout";
+                return opts;
+            };
+        } else if (std.mem.eql(u8, arg, "--fail-fast")) {
+            opts.batch_fail_fast = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
@@ -186,6 +210,9 @@ fn printHelp(writer: anytype) void {
         \\JIT Options:
         \\  --jit-verbose            JIT mode with full pipeline/link/layout report
         \\  --metrics                Print phase timings and SAMM memory stats after JIT run
+        \\  --batch-jit <folder>     Recursively find .bas files and JIT-execute each one
+        \\  --fail-fast              Stop batch-jit on first failure
+        \\  --timeout <secs>         Per-file timeout for batch-jit (default: 30, 0=none)
         \\
         \\Debug / Trace:
         \\  --show-il                Print generated QBE IL to stderr
@@ -210,6 +237,8 @@ fn printHelp(writer: anytype) void {
         \\  fbc --run hello.bas arg1 arg2    # JIT run with program arguments
         \\  fbc hello.bas --jit              # JIT compile and execute in-process
         \\  fbc hello.bas --jit-verbose      # JIT with full diagnostic report
+        \\  fbc --batch-jit tests/           # JIT-execute all .bas files in folder
+        \\  fbc --batch-jit tests/ --metrics # Batch with per-file metrics
         \\
         \\
     , .{version_string}) catch {};
@@ -702,6 +731,13 @@ const SAMMStats = extern struct {
 };
 
 extern fn samm_get_stats(out: ?*SAMMStats) callconv(.c) void;
+extern fn msg_metrics_reset() callconv(.c) void;
+extern fn basic_jit_call(callback: *const fn (*anyopaque) callconv(.c) c_int, ctx: *anyopaque) callconv(.c) c_int;
+extern fn basic_jit_set_timeout(seconds: c_uint) callconv(.c) void;
+extern fn basic_jit_suppress_stdout() callconv(.c) c_int;
+extern fn basic_jit_restore_stdout(saved_fd: c_int) callconv(.c) void;
+extern fn basic_jit_arm_signals() callconv(.c) void;
+extern fn basic_jit_disarm_signals() callconv(.c) void;
 
 // ─── Metrics Helpers ────────────────────────────────────────────────────────
 
@@ -772,6 +808,287 @@ fn printMetrics(writer: anytype, stats: SAMMStats, times: MetricsTimes) void {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
+// ─── Batch JIT: scan a directory recursively for .bas files ─────────────────
+
+fn scanBasicFilesRecursive(
+    dir_path: []const u8,
+    allocator: std.mem.Allocator,
+) ![][]const u8 {
+    var results: std.ArrayList([]const u8) = .empty;
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        stderr.print("Error: cannot open directory '{s}': {s}\n", .{ dir_path, @errorName(err) }) catch {};
+        return results.toOwnedSlice(allocator) catch &[_][]const u8{};
+    };
+    defer dir.close();
+
+    // Use a walker for recursive traversal
+    var walker = dir.walk(allocator) catch |err| {
+        const stderr = std.fs.File.stderr().deprecatedWriter();
+        stderr.print("Error: cannot walk directory '{s}': {s}\n", .{ dir_path, @errorName(err) }) catch {};
+        return results.toOwnedSlice(allocator) catch &[_][]const u8{};
+    };
+    defer walker.deinit();
+
+    while (walker.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isBasicFile(entry.path)) continue;
+
+        // Build full path: dir_path / entry.path
+        const full_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.path }) catch continue;
+        results.append(allocator, full_path) catch continue;
+    }
+
+    // Sort for deterministic execution order (sort in-place before extracting)
+    std.mem.sort([]const u8, results.items, {}, struct {
+        fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lessThan);
+    return results.toOwnedSlice(allocator) catch &[_][]const u8{};
+}
+
+// ─── Batch JIT: compile and execute a single .bas file ──────────────────────
+//
+// Returns true on success, false on failure.
+// Uses its own arena so all compiler memory is freed after each run.
+// The JIT-compiled program itself calls samm_init/samm_shutdown, so
+// runtime global state is properly cycled between runs.
+
+const DirectBLAnalysis = @import("jit_linker.zig").DirectBLAnalysis;
+const analyzeDirectBLReach = @import("jit_linker.zig").analyzeDirectBLReach;
+
+const BatchResult = struct {
+    ok: bool,
+    exit_code: i32,
+    compile_ms: f64,
+    exec_ms: f64,
+    error_phase: ?[]const u8,
+    timed_out: bool = false,
+    bl_analysis: DirectBLAnalysis = .{},
+};
+
+fn runSingleBatchFile(
+    file_path: []const u8,
+    gpa_alloc: std.mem.Allocator,
+    verbose: bool,
+    jit_verbose: bool,
+    show_metrics: bool,
+    timeout_secs: u32,
+) BatchResult {
+    const stderr = std.fs.File.stderr().deprecatedWriter();
+
+    // Create a per-file arena so all compiler objects are freed on return
+    var file_arena = std.heap.ArenaAllocator.init(gpa_alloc);
+    defer file_arena.deinit();
+    const allocator = file_arena.allocator();
+
+    const t_file_start = std.time.nanoTimestamp();
+
+    // ── Read source ─────────────────────────────────────────────────
+    const source = readSourceFile(file_path, allocator) catch |err| {
+        stderr.print("  ERROR: cannot read '{s}': {s}\n", .{ file_path, @errorName(err) }) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "read" };
+    };
+
+    // ── Lex ─────────────────────────────────────────────────────────
+    var lex = Lexer.init(source, allocator);
+    defer lex.deinit();
+    lex.tokenize() catch {
+        stderr.print("  ERROR: lexer failure\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "lex" };
+    };
+    if (lex.hasErrors()) {
+        for (lex.errors.items) |lerr| {
+            stderr.print("  LEX {d}:{d}: {s}\n", .{ lerr.location.line, lerr.location.column, lerr.message }) catch {};
+        }
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "lex" };
+    }
+
+    // ── Parse ───────────────────────────────────────────────────────
+    var parser = Parser.init(lex.tokens.items, allocator);
+    defer parser.deinit();
+    const program = parser.parse() catch {
+        stderr.print("  ERROR: parser failure\n", .{}) catch {};
+        if (parser.hasErrors()) {
+            for (parser.errors.items) |perr| {
+                stderr.print("  PARSE {d}:{d}: {s}\n", .{ perr.location.line, perr.location.column, perr.message }) catch {};
+            }
+        }
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "parse" };
+    };
+    if (parser.hasErrors()) {
+        for (parser.errors.items) |perr| {
+            stderr.print("  PARSE {d}:{d}: {s}\n", .{ perr.location.line, perr.location.column, perr.message }) catch {};
+        }
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "parse" };
+    }
+
+    // ── Semantic analysis ───────────────────────────────────────────
+    var analyzer = SemanticAnalyzer.init(allocator);
+    defer analyzer.deinit();
+    const sem_ok = analyzer.analyze(&program) catch {
+        stderr.print("  ERROR: semantic analysis failure\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "semantic" };
+    };
+    if (!sem_ok) {
+        for (analyzer.errors.items) |serr| {
+            stderr.print("  SEM {d}:{d}: [{s}] {s}\n", .{
+                serr.location.line,
+                serr.location.column,
+                @tagName(serr.error_type),
+                serr.message,
+            }) catch {};
+        }
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "semantic" };
+    }
+
+    // ── CFG ─────────────────────────────────────────────────────────
+    var cfg_builder = CFGBuilder.init(allocator);
+    defer cfg_builder.deinit();
+    const program_cfg = cfg_builder.buildFromProgram(&program) catch {
+        stderr.print("  ERROR: CFG construction failure\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "cfg" };
+    };
+
+    // ── Codegen ─────────────────────────────────────────────────────
+    var gen = CFGCodeGenerator.init(&analyzer, program_cfg, &cfg_builder, allocator);
+    defer gen.deinit();
+    gen.verbose = false; // suppress per-file codegen verbosity
+    gen.samm_enabled = analyzer.options.samm_enabled;
+
+    const il = gen.generate(&program) catch {
+        stderr.print("  ERROR: code generation failure\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "codegen" };
+    };
+
+    // ── JIT compile ─────────────────────────────────────────────────
+    // Wrap in basic_jit_call so that if QBE's die_() fires (calling
+    // basic_exit), we longjmp back here instead of killing the process.
+    const CompileCtx = struct {
+        alloc: std.mem.Allocator,
+        il_ptr: []const u8,
+        out: ?qbe.JitResult = null,
+
+        fn run(raw: *anyopaque) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.out = qbe.compileILJit(self.alloc, self.il_ptr, null) catch return -1;
+            return 0;
+        }
+    };
+    var compile_ctx = CompileCtx{ .alloc = allocator, .il_ptr = il };
+    const compile_rc = basic_jit_call(CompileCtx.run, @ptrCast(&compile_ctx));
+    if (compile_rc < 0) {
+        // QBE died or compilation error — compile_rc < -1 means basic_exit was called
+        stderr.print("  ERROR: JIT compilation failed\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "jit_compile" };
+    }
+    const jit_result = compile_ctx.out orelse {
+        stderr.print("  ERROR: JIT compilation returned no result\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "jit_compile" };
+    };
+
+    if (jit_verbose) {
+        const pr = jit_result.pipelineReport();
+        stderr.print("{s}\n", .{pr}) catch {};
+    }
+
+    // ── JIT link ────────────────────────────────────────────────────
+    const jit_runtime = @import("jit_runtime.zig");
+    const jit_stubs = @import("jit_stubs.zig");
+    const ctx = jit_stubs.buildJitRuntimeContext();
+
+    var session = jit_runtime.JitSession.compileFromModule(
+        allocator,
+        jit_result.module,
+        &ctx,
+        null,
+        0,
+        jit_result.inst_count,
+        jit_result.func_count,
+        jit_result.data_count,
+        jit_result.pipelineReport(),
+    ) catch {
+        stderr.print("  ERROR: JIT session creation failed\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "jit_link" };
+    };
+    defer session.deinit();
+
+    // ── Direct BL reach analysis (non-destructive) ──────────────────
+    const bl_analysis = analyzeDirectBLReach(
+        &session.region,
+        &session.module,
+        &session.link_result.resolved_symbols,
+    );
+
+    if (!session.finalized) {
+        stderr.print("  ERROR: JIT session failed to finalize\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "jit_link" };
+    }
+
+    const t_before_exec = std.time.nanoTimestamp();
+
+    // ── Arm per-file timeout ────────────────────────────────────────
+    if (timeout_secs > 0)
+        basic_jit_set_timeout(@intCast(timeout_secs));
+
+    // ── Execute ─────────────────────────────────────────────────────
+    const exec_result = session.execute();
+
+    // ── Disarm timeout ──────────────────────────────────────────────
+    if (timeout_secs > 0)
+        basic_jit_set_timeout(0);
+
+    const t_after_exec = std.time.nanoTimestamp();
+
+    const compile_ms = phaseMs(t_file_start, t_before_exec);
+    const exec_ms = phaseMs(t_before_exec, t_after_exec);
+
+    // ── Per-file metrics ────────────────────────────────────────────
+    if (show_metrics) {
+        var samm_stats: SAMMStats = undefined;
+        samm_get_stats(&samm_stats);
+
+        const total_ms = phaseMs(t_file_start, t_after_exec);
+
+        stderr.print("  compile={d:.3}ms  exec={d:.3}ms  total={d:.3}ms", .{ compile_ms, exec_ms, total_ms }) catch {};
+        stderr.print("  samm_alloc={d}  samm_freed={d}", .{ samm_stats.objects_allocated, samm_stats.objects_freed + samm_stats.objects_cleaned }) catch {};
+
+        const leaked: i64 = @as(i64, @intCast(samm_stats.objects_allocated)) - @as(i64, @intCast(samm_stats.objects_freed + samm_stats.objects_cleaned));
+        if (leaked > 0) {
+            stderr.print("  LEAKED={d}", .{leaked}) catch {};
+        }
+        stderr.print("\n", .{}) catch {};
+    }
+
+    if (verbose) {
+        stderr.print("  compile={d:.3}ms  exec={d:.3}ms\n", .{ compile_ms, exec_ms }) catch {};
+    }
+
+    if (exec_result.completed) {
+        const is_timeout = exec_result.exit_code == 124;
+        return .{
+            .ok = exec_result.exit_code == 0,
+            .exit_code = exec_result.exit_code,
+            .compile_ms = compile_ms,
+            .exec_ms = exec_ms,
+            .error_phase = if (is_timeout) "timeout" else if (exec_result.exit_code != 0) "runtime" else null,
+            .timed_out = is_timeout,
+            .bl_analysis = bl_analysis,
+        };
+    } else {
+        stderr.print("  ERROR: JIT execution did not complete", .{}) catch {};
+        if (exec_result.signal != 0) {
+            stderr.print(" (signal {d})", .{exec_result.signal}) catch {};
+        }
+        stderr.print("\n", .{}) catch {};
+        return .{ .ok = false, .exit_code = -1, .compile_ms = compile_ms, .exec_ms = exec_ms, .error_phase = "exec", .bl_analysis = bl_analysis };
+    }
+}
+
+// ─── Entry Point ────────────────────────────────────────────────────────────
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -803,6 +1120,104 @@ pub fn main() !void {
         stderr.print("Error: {s}\n", .{msg}) catch {};
         stderr.print("Try 'fbc --help' for usage information.\n", .{}) catch {};
         std.process.exit(1);
+    }
+
+    // ── Batch JIT mode ──────────────────────────────────────────────
+    if (opts.batch_jit_path) |batch_dir| {
+        stderr.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+        stderr.print("  fbc --batch-jit  {s}\n", .{batch_dir}) catch {};
+        stderr.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+
+        const files = scanBasicFilesRecursive(batch_dir, allocator) catch |err| {
+            stderr.print("Error: cannot scan '{s}': {s}\n", .{ batch_dir, @errorName(err) }) catch {};
+            std.process.exit(1);
+        };
+
+        if (files.len == 0) {
+            stderr.print("No .bas files found in '{s}'\n", .{batch_dir}) catch {};
+            std.process.exit(1);
+        }
+
+        stderr.print("Found {d} .bas file(s)\n\n", .{files.len}) catch {};
+
+        // Arm SIGABRT + SIGALRM handlers for the entire batch run so
+        // they stay active across both compilation (basic_jit_call) and
+        // execution (basic_jit_exec) phases.
+        basic_jit_arm_signals();
+        defer basic_jit_disarm_signals();
+
+        // Reset opcode histogram so we get a clean tally for this batch
+        qbe.histogramReset();
+
+        const t_batch_start = std.time.nanoTimestamp();
+        var passed: usize = 0;
+        var failed: usize = 0;
+        var total_compile_ms: f64 = 0;
+        var total_exec_ms: f64 = 0;
+        var batch_bl_analysis = DirectBLAnalysis{};
+
+        for (files, 0..) |file_path, i| {
+            // Reset messaging metrics between runs so they don't accumulate
+            msg_metrics_reset();
+
+            stderr.print("[{d}/{d}] {s}\n", .{ i + 1, files.len, file_path }) catch {};
+
+            const result = runSingleBatchFile(
+                file_path,
+                gpa.allocator(),
+                opts.verbose,
+                opts.jit_verbose,
+                opts.metrics,
+                opts.batch_timeout,
+            );
+
+            total_compile_ms += result.compile_ms;
+            total_exec_ms += result.exec_ms;
+            batch_bl_analysis.accumulate(&result.bl_analysis);
+
+            if (result.ok) {
+                stderr.print("  OK    {s}\n", .{file_path}) catch {};
+                passed += 1;
+            } else {
+                if (result.timed_out) {
+                    stderr.print("  TIMEOUT (>{d}s)  {s}\n", .{ opts.batch_timeout, file_path }) catch {};
+                } else if (result.error_phase) |phase| {
+                    stderr.print("  FAIL ({s}, exit={d})  {s}\n", .{ phase, result.exit_code, file_path }) catch {};
+                } else {
+                    stderr.print("  FAIL (exit={d})  {s}\n", .{ result.exit_code, file_path }) catch {};
+                }
+                failed += 1;
+                if (opts.batch_fail_fast) {
+                    stderr.print("\n--fail-fast: stopping after first failure\n", .{}) catch {};
+                    break;
+                }
+            }
+        }
+
+        const t_batch_end = std.time.nanoTimestamp();
+        const batch_total_ms = phaseMs(t_batch_start, t_batch_end);
+
+        stderr.print("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+        stderr.print("  Batch Summary\n", .{}) catch {};
+        stderr.print("──────────────────────────────────────────────────────\n", .{}) catch {};
+        stderr.print("  Files:     {d}\n", .{files.len}) catch {};
+        stderr.print("  Passed:    {d}\n", .{passed}) catch {};
+        stderr.print("  Failed:    {d}\n", .{failed}) catch {};
+        stderr.print("  Compile:   {d:.3} ms\n", .{total_compile_ms}) catch {};
+        stderr.print("  Execute:   {d:.3} ms\n", .{total_exec_ms}) catch {};
+        stderr.print("  Total:     {d:.3} ms\n", .{batch_total_ms}) catch {};
+        stderr.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+
+        // Print the accumulated opcode histogram when --metrics is active
+        if (opts.metrics) {
+            qbe.histogramDump();
+            batch_bl_analysis.dump(stderr);
+        }
+
+        if (failed > 0) {
+            std.process.exit(1);
+        }
+        return;
     }
 
     // Require input file

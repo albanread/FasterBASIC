@@ -111,6 +111,20 @@ struct JitCollector;
 int qbe_compile_il_jit(const char *il_text, size_t il_len,
                        struct JitCollector *jc, const char *target_name);
 
+/* ── QBE JIT cleanup after aborted compilation ─────────────────────────
+ *
+ * When basic_exit() fires during QBE compilation (from err(), die_(), or
+ * an assert), the longjmp skips all cleanup in qbe_compile_il_jit().
+ * Call this from the recovery path to:
+ *
+ *   1. Close the fmemopen FILE handle that parse() was reading from.
+ *   2. Call freeall() to release QBE's pool allocator memory.
+ *   3. Reset the bridge_jc pointer so the next compilation starts clean.
+ *
+ * Safe to call even when no compilation was in progress.
+ */
+void qbe_jit_cleanup(void);
+
 #ifdef __cplusplus
 }
 #endif

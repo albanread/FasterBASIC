@@ -81,6 +81,10 @@ const c = struct {
         jc: *JitCollector,
         target_name: ?[*:0]const u8,
     ) c_int;
+
+    // ── Opcode histogram (jit_collect.c) ───────────────────────────
+    extern fn jit_histogram_reset() void;
+    extern fn jit_histogram_dump() void;
 };
 
 // ── JitCollector C struct ──────────────────────────────────────────────
@@ -442,6 +446,23 @@ pub fn collectILJit(
 
     c.jit_collector_dump(&collector);
     return collector.ninst;
+}
+
+// ── Opcode histogram ───────────────────────────────────────────────────
+//
+// Global counters indexed by JitInstKind, accumulated across multiple
+// qbe_compile_il_jit() calls.  Useful for profiling the instruction mix
+// across a batch run.
+
+/// Reset all histogram counters to zero.  Call before a batch run.
+pub fn histogramReset() void {
+    c.jit_histogram_reset();
+}
+
+/// Print the accumulated histogram to stderr, sorted by count descending,
+/// with percentages and a simple bar chart.
+pub fn histogramDump() void {
+    c.jit_histogram_dump();
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────

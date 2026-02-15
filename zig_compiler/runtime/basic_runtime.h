@@ -75,6 +75,16 @@ void basic_runtime_init(void);
 // Cleanup runtime (call once at program end)
 void basic_runtime_cleanup(void);
 
+// JIT exit override — in JIT mode longjmps back to harness instead of exit()
+void basic_exit(int code);
+
+// JIT protected call — arms setjmp, invokes callback, catches basic_exit().
+// Returns callback's return value on success, -(exit_code+1) on basic_exit().
+int basic_jit_call(int (*callback)(void *ctx), void *ctx);
+
+// JIT execution wrapper — arms setjmp, calls fn_ptr, catches basic_exit()
+int basic_jit_exec(void *fn_ptr, int argc, char **argv);
+
 // Print memory statistics (if DEBUG_MEMORY enabled)
 void basic_mem_stats(void);
 

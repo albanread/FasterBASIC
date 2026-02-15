@@ -19,7 +19,7 @@ const c = std.c;
 
 extern fn fprintf(stream: *anyopaque, fmt: [*:0]const u8, ...) c_int;
 extern const __stderrp: *anyopaque;
-extern fn exit(status: c_int) noreturn;
+extern fn basic_exit(status: c_int) noreturn;
 extern fn array_descriptor_erase(desc: ?*ArrayDescriptor) void;
 
 // =========================================================================
@@ -148,7 +148,7 @@ export fn fbc_array_create(
 ) callconv(.c) void {
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: fbc_array_create called with NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     // Zero the descriptor first
@@ -161,24 +161,24 @@ export fn fbc_array_create(
 
     if (rc != 0) {
         _ = fprintf(__stderrp, "ERROR: fbc_array_create failed (upper=%d, elem_size=%d)\n", upper_bound, elem_size);
-        exit(1);
+        basic_exit(1);
     }
 }
 
 export fn fbc_array_bounds_check(desc: ?*ArrayDescriptor, index: i32) callconv(.c) void {
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: array bounds check on NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     if (d.data == null) {
         _ = fprintf(__stderrp, "ERROR: array not initialised (DIM not executed?)\n");
-        exit(1);
+        basic_exit(1);
     }
 
     if (!arrayDescriptorCheckBounds(d, @intCast(index))) {
         _ = fprintf(__stderrp, "ERROR: array index %d out of bounds [%lld..%lld]\n", index, d.lowerBound1, d.upperBound1);
-        exit(1);
+        basic_exit(1);
     }
 }
 
@@ -248,7 +248,7 @@ export fn fbc_array_create_2d(
     _ = ndims;
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: fbc_array_create_2d called with NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     // Zero the descriptor first
@@ -259,24 +259,24 @@ export fn fbc_array_create_2d(
 
     if (rc != 0) {
         _ = fprintf(__stderrp, "ERROR: fbc_array_create_2d failed (upper1=%d, upper2=%d, elem_size=%d)\n", upper_bound1, upper_bound2, elem_size);
-        exit(1);
+        basic_exit(1);
     }
 }
 
 export fn fbc_array_bounds_check_2d(desc: ?*ArrayDescriptor, index1: i32, index2: i32) callconv(.c) void {
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: 2D array bounds check on NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     if (d.data == null) {
         _ = fprintf(__stderrp, "ERROR: 2D array not initialised (DIM not executed?)\n");
-        exit(1);
+        basic_exit(1);
     }
 
     if (!arrayDescriptorCheckBounds2D(d, @intCast(index1), @intCast(index2))) {
         _ = fprintf(__stderrp, "ERROR: 2D array index (%d, %d) out of bounds [%lld..%lld, %lld..%lld]\n", index1, index2, d.lowerBound1, d.upperBound1, d.lowerBound2, d.upperBound2);
-        exit(1);
+        basic_exit(1);
     }
 }
 
@@ -288,26 +288,26 @@ export fn fbc_array_element_addr_2d(desc: ?*ArrayDescriptor, index1: i32, index2
 export fn fbc_array_redim(desc: ?*ArrayDescriptor, new_upper: i32) callconv(.c) void {
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: fbc_array_redim called with NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     const rc = arrayDescriptorRedim(d, 0, @intCast(new_upper));
     if (rc != 0) {
         _ = fprintf(__stderrp, "ERROR: fbc_array_redim failed (new_upper=%d)\n", new_upper);
-        exit(1);
+        basic_exit(1);
     }
 }
 
 export fn fbc_array_redim_preserve(desc: ?*ArrayDescriptor, new_upper: i32) callconv(.c) void {
     const d = desc orelse {
         _ = fprintf(__stderrp, "ERROR: fbc_array_redim_preserve called with NULL descriptor\n");
-        exit(1);
+        basic_exit(1);
     };
 
     const rc = arrayDescriptorRedimPreserve(d, 0, @intCast(new_upper));
     if (rc != 0) {
         _ = fprintf(__stderrp, "ERROR: fbc_array_redim_preserve failed (new_upper=%d)\n", new_upper);
-        exit(1);
+        basic_exit(1);
     }
 }
 

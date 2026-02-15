@@ -435,8 +435,10 @@ pub const JitSession = struct {
         setCurrentSession(self);
         defer setCurrentSession(null);
 
-        // Execute!
-        const exit_code = fn_ptr(argc, argv);
+        // Execute via basic_jit_exec which arms a setjmp so that
+        // runtime calls to basic_exit() longjmp back instead of
+        // killing the host process.  This is essential for --batch-jit.
+        const exit_code = basic_jit_exec(@ptrCast(fn_ptr), argc, argv);
 
         result.exit_code = exit_code;
         result.completed = true;
@@ -617,6 +619,11 @@ pub const JitSession = struct {
 /// Thread-local pointer to the currently executing JitSession.
 /// Used by signal handlers to map crash PCs to source lines.
 threadlocal var current_session: ?*JitSession = null;
+
+// ── JIT exit override ───────────────────────────────────────────────────
+// basic_jit_exec arms a setjmp; if the runtime calls basic_exit() it
+// longjmps back instead of calling real exit(), so the host survives.
+extern fn basic_jit_exec(fn_ptr: *const anyopaque, argc: i32, argv: [*][*:0]u8) callconv(.c) i32;
 
 fn setCurrentSession(session: ?*JitSession) void {
     current_session = session;

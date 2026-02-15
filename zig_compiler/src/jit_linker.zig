@@ -169,6 +169,8 @@ pub const LinkStats = struct {
     trampolines_generated: u32 = 0,
     /// Number of external call sites patched
     ext_calls_patched: u32 = 0,
+    /// Number of external calls patched with direct BL (no trampoline)
+    ext_calls_direct: u32 = 0,
     /// Number of symbols resolved via jump table
     symbols_from_jump_table: u32 = 0,
     /// Number of symbols resolved via dlsym
@@ -708,6 +710,26 @@ pub const JitLinker = struct {
                 continue;
             }
 
+            // Try direct BL first — skip the trampoline if target is
+            // within ±128MB of the call site.
+            var target_addr: u64 = 0;
+            for (resolved_symbols.items) |sym| {
+                if (sym.source != .Internal and std.mem.eql(u8, sym.getName(), name)) {
+                    target_addr = sym.address;
+                    break;
+                }
+            }
+
+            if (target_addr != 0) {
+                if (region.patchBLDirect(ext_call.code_offset, target_addr)) {
+                    stats.ext_calls_patched += 1;
+                    stats.ext_calls_direct += 1;
+                    continue;
+                } else |_| {
+                    // Out of range — fall through to trampoline path
+                }
+            }
+
             // Find the corresponding trampoline stub
             var found_stub: ?*const TrampolineStub = null;
             for (trampoline_stubs.items) |*stub| {
@@ -1064,6 +1086,219 @@ pub const JitLinker = struct {
         return .{ .result = link_result, .executable = true };
     }
 };
+
+// ============================================================================
+// Section: Direct BL Reach Analysis
+// ============================================================================
+
+/// A sample address pair captured during analysis for verification.
+pub const BLSample = struct {
+    bl_addr: u64,
+    target_addr: u64,
+    delta: i64,
+    name: [jit.JIT_SYM_MAX]u8,
+    name_len: u8,
+
+    pub fn getName(self: *const BLSample) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+/// Results of analyzing whether external call sites could use a direct BL
+/// instruction (±128MB range) instead of going through a trampoline.
+pub const DirectBLAnalysis = struct {
+    /// Total external (non-internal) call sites analyzed
+    total_ext_calls: u32 = 0,
+    /// Call sites where the target is within ±128MB of the BL instruction
+    in_range: u32 = 0,
+    /// Call sites where the target is outside ±128MB
+    out_of_range: u32 = 0,
+    /// Call sites that were internal (already direct, not counted)
+    internal_calls: u32 = 0,
+    /// Call sites where the target could not be resolved
+    unresolved_calls: u32 = 0,
+    /// Minimum absolute distance seen (bytes)
+    min_distance: u64 = std.math.maxInt(u64),
+    /// Maximum absolute distance seen (bytes)
+    max_distance: u64 = 0,
+    /// Sum of all distances (for computing average)
+    total_distance: u128 = 0,
+    /// Code base address used for the analysis
+    code_base: u64 = 0,
+    /// Sample address pairs for verification (up to MAX_SAMPLES)
+    samples: [MAX_SAMPLES]BLSample = undefined,
+    sample_count: u8 = 0,
+
+    const MAX_SAMPLES: u8 = 8;
+
+    /// BL instruction range: ±128MB (26-bit signed offset × 4)
+    const BL_RANGE: u64 = 128 * 1024 * 1024;
+
+    pub fn avgDistance(self: *const DirectBLAnalysis) u64 {
+        if (self.total_ext_calls == 0) return 0;
+        return @intCast(self.total_distance / self.total_ext_calls);
+    }
+
+    pub fn pctInRange(self: *const DirectBLAnalysis) f64 {
+        if (self.total_ext_calls == 0) return 0;
+        return 100.0 * @as(f64, @floatFromInt(self.in_range)) / @as(f64, @floatFromInt(self.total_ext_calls));
+    }
+
+    /// Merge another analysis result into this one (for batch accumulation).
+    pub fn accumulate(self: *DirectBLAnalysis, other: *const DirectBLAnalysis) void {
+        self.total_ext_calls += other.total_ext_calls;
+        self.in_range += other.in_range;
+        self.out_of_range += other.out_of_range;
+        self.internal_calls += other.internal_calls;
+        self.unresolved_calls += other.unresolved_calls;
+        if (other.total_ext_calls > 0) {
+            self.min_distance = @min(self.min_distance, other.min_distance);
+            self.max_distance = @max(self.max_distance, other.max_distance);
+        }
+        self.total_distance += other.total_distance;
+        // Keep the first set of samples we see (from the first file
+        // that has external calls) so the dump can show real addresses.
+        if (self.sample_count == 0 and other.sample_count > 0) {
+            self.sample_count = other.sample_count;
+            self.samples = other.samples;
+            self.code_base = other.code_base;
+        }
+    }
+
+    /// Print the analysis to stderr.
+    pub fn dump(self: *const DirectBLAnalysis, writer: anytype) void {
+        writer.print("\n", .{}) catch {};
+        writer.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+        writer.print("  Direct BL Reach Analysis\n", .{}) catch {};
+        writer.print("──────────────────────────────────────────────────────\n", .{}) catch {};
+        if (self.code_base != 0) {
+            writer.print("  Code base:        0x{x:0>12}\n", .{self.code_base}) catch {};
+        }
+        writer.print("  BL range:         ±{d} MB\n", .{BL_RANGE / (1024 * 1024)}) catch {};
+        writer.print("──────────────────────────────────────────────────────\n", .{}) catch {};
+        writer.print("  External calls:   {d}\n", .{self.total_ext_calls}) catch {};
+        writer.print("  In range (direct):{d}  ({d:.1}%)\n", .{ self.in_range, self.pctInRange() }) catch {};
+        writer.print("  Out of range:     {d}  ({d:.1}%)\n", .{
+            self.out_of_range,
+            if (self.total_ext_calls > 0)
+                100.0 - self.pctInRange()
+            else
+                @as(f64, 0),
+        }) catch {};
+        writer.print("  Internal (skip):  {d}\n", .{self.internal_calls}) catch {};
+        writer.print("  Unresolved:       {d}\n", .{self.unresolved_calls}) catch {};
+        if (self.total_ext_calls > 0) {
+            writer.print("──────────────────────────────────────────────────────\n", .{}) catch {};
+            const min_mb = @as(f64, @floatFromInt(self.min_distance)) / (1024.0 * 1024.0);
+            const max_mb = @as(f64, @floatFromInt(self.max_distance)) / (1024.0 * 1024.0);
+            const avg_mb = @as(f64, @floatFromInt(self.avgDistance())) / (1024.0 * 1024.0);
+            writer.print("  Min distance:     {d:.2} MB\n", .{min_mb}) catch {};
+            writer.print("  Max distance:     {d:.2} MB\n", .{max_mb}) catch {};
+            writer.print("  Avg distance:     {d:.2} MB\n", .{avg_mb}) catch {};
+            if (self.in_range == self.total_ext_calls) {
+                writer.print("  Verdict:          ALL calls could be direct BL ✓\n", .{}) catch {};
+            } else if (self.in_range == 0) {
+                writer.print("  Verdict:          NO calls in direct BL range ✗\n", .{}) catch {};
+            } else {
+                writer.print("  Verdict:          {d:.1}% of calls could skip trampoline\n", .{self.pctInRange()}) catch {};
+            }
+            // Show sample address pairs so the real addresses are visible
+            if (self.sample_count > 0) {
+                writer.print("──────────────────────────────────────────────────────\n", .{}) catch {};
+                writer.print("  Sample BL→target addresses:\n", .{}) catch {};
+                for (0..self.sample_count) |i| {
+                    const s = &self.samples[i];
+                    const d_mb = @as(f64, @floatFromInt(if (s.delta < 0) -s.delta else s.delta)) / (1024.0 * 1024.0);
+                    const in_r: []const u8 = if (@as(u64, @intCast(if (s.delta < 0) -s.delta else s.delta)) < BL_RANGE) "✓" else "✗";
+                    writer.print("    BL@0x{x:0>12} → 0x{x:0>12}  Δ{d:.1}MB {s}\n", .{
+                        s.bl_addr, s.target_addr, d_mb, in_r,
+                    }) catch {};
+                    writer.print("      {s}\n", .{s.getName()}) catch {};
+                }
+            }
+        }
+        writer.print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{}) catch {};
+    }
+};
+
+/// Analyze whether external call sites could use a direct BL instruction
+/// instead of a trampoline indirect branch.
+///
+/// This does NOT modify anything — it's a pure read-only analysis pass.
+/// Call after `link()` completes, while the region is still writable or
+/// has been made executable (we only read addresses, not code bytes).
+pub fn analyzeDirectBLReach(
+    region: *const JitMemoryRegion,
+    module: *const JitModule,
+    resolved_symbols: *const std.ArrayListUnmanaged(ResolvedSymbol),
+) DirectBLAnalysis {
+    var result = DirectBLAnalysis{};
+
+    const code_base_addr = region.codeAddress(0) orelse return result;
+    result.code_base = code_base_addr;
+
+    for (module.ext_calls.items) |ext_call| {
+        const name = ext_call.getName();
+        if (name.len == 0) continue;
+
+        // Find the resolved symbol
+        var sym_addr: u64 = 0;
+        var source: SymbolSource = .Unresolved;
+        for (resolved_symbols.items) |sym| {
+            if (std.mem.eql(u8, sym.getName(), name)) {
+                sym_addr = sym.address;
+                source = sym.source;
+                break;
+            }
+        }
+
+        if (source == .Internal) {
+            result.internal_calls += 1;
+            continue; // Already a direct BL within the code buffer
+        }
+
+        if (source == .Unresolved) {
+            result.unresolved_calls += 1;
+            continue;
+        }
+
+        // Compute absolute address of the BL instruction
+        const bl_addr = code_base_addr + ext_call.code_offset;
+
+        // Compute signed distance
+        const delta: i64 = @as(i64, @intCast(sym_addr)) - @as(i64, @intCast(bl_addr));
+        const abs_delta: u64 = @intCast(if (delta < 0) -delta else delta);
+
+        result.total_ext_calls += 1;
+        result.total_distance += abs_delta;
+        result.min_distance = @min(result.min_distance, abs_delta);
+        result.max_distance = @max(result.max_distance, abs_delta);
+
+        if (abs_delta < DirectBLAnalysis.BL_RANGE) {
+            result.in_range += 1;
+        } else {
+            result.out_of_range += 1;
+        }
+
+        // Capture sample address pairs for verification
+        if (result.sample_count < DirectBLAnalysis.MAX_SAMPLES) {
+            var sample = BLSample{
+                .bl_addr = bl_addr,
+                .target_addr = sym_addr,
+                .delta = delta,
+                .name = [_]u8{0} ** jit.JIT_SYM_MAX,
+                .name_len = 0,
+            };
+            const n = @min(name.len, jit.JIT_SYM_MAX);
+            @memcpy(sample.name[0..n], name[0..n]);
+            sample.name_len = @intCast(n);
+            result.samples[result.sample_count] = sample;
+            result.sample_count += 1;
+        }
+    }
+
+    return result;
+}
 
 // ============================================================================
 // Section: Tests

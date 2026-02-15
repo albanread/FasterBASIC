@@ -88,3 +88,16 @@ void saveCursor(void) {
 void restoreCursor(void) {
     basic_cursor_restore();
 }
+
+/* ── qbe_jit_cleanup ───────────────────────────────────────────────── */
+/*
+ * In JIT mode this is defined in jit_collect.c and releases QBE pool
+ * memory / closes the fmemopen FILE handle after an aborted compilation.
+ *
+ * In AOT-compiled programs jit_collect.c is not linked, so we provide
+ * a no-op stub here.  basic_jit_call() calls this unconditionally in
+ * its longjmp recovery path.
+ */
+void __attribute__((weak)) qbe_jit_cleanup(void) {
+    /* no-op for AOT builds */
+}

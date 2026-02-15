@@ -1740,7 +1740,13 @@ pub const ExprEmitter = struct {
                 return false;
             },
             .binary => |b| {
-                return self.isLongExpr(b.left) or self.isLongExpr(b.right);
+                // Comparisons and logical operators always produce 'w'
+                // results regardless of operand types — do not recurse.
+                return switch (b.op) {
+                    .equal, .not_equal, .less_than, .less_equal, .greater_than, .greater_equal => false,
+                    .kw_and, .kw_or, .kw_xor, .kw_not => false,
+                    else => self.isLongExpr(b.left) or self.isLongExpr(b.right),
+                };
             },
             .unary => |u| {
                 return self.isLongExpr(u.operand);
@@ -2126,17 +2132,33 @@ pub const ExprEmitter = struct {
             },
             .int_divide => {
                 // Integer division always truncates.
-                const li = if (left_type == .integer) lhs else blk: {
+                // For LONG operands, use "l" and the already-extended eff_lhs/eff_rhs.
+                // For non-integer operands, convert from double to the appropriate int type.
+                const int_type: []const u8 = if (is_long_op) "l" else "w";
+                const li = if (left_type != .integer) blk: {
                     const t = try self.builder.newTemp();
-                    try self.builder.emitConvert(t, "w", "dtosi", lhs);
+                    if (is_long_op) {
+                        // double → 64-bit int
+                        const tw = try self.builder.newTemp();
+                        try self.builder.emitConvert(tw, "w", "dtosi", lhs);
+                        try self.builder.emitExtend(t, "l", "extsw", tw);
+                    } else {
+                        try self.builder.emitConvert(t, "w", "dtosi", lhs);
+                    }
                     break :blk t;
-                };
-                const ri = if (right_type == .integer) rhs else blk: {
+                } else eff_lhs;
+                const ri = if (right_type != .integer) blk: {
                     const t = try self.builder.newTemp();
-                    try self.builder.emitConvert(t, "w", "dtosi", rhs);
+                    if (is_long_op) {
+                        const tw = try self.builder.newTemp();
+                        try self.builder.emitConvert(tw, "w", "dtosi", rhs);
+                        try self.builder.emitExtend(t, "l", "extsw", tw);
+                    } else {
+                        try self.builder.emitConvert(t, "w", "dtosi", rhs);
+                    }
                     break :blk t;
-                };
-                try self.builder.emitBinary(dest, "w", "div", li, ri);
+                } else eff_rhs;
+                try self.builder.emitBinary(dest, int_type, "div", li, ri);
             },
 
             // Comparison operators — result is always w (int).
@@ -2148,9 +2170,9 @@ pub const ExprEmitter = struct {
             .greater_equal => try self.builder.emitCompare(dest, arith_type, "ge", eff_lhs, eff_rhs),
 
             // Logical operators — always w.
-            .kw_and => try self.builder.emitBinary(dest, "w", "and", eff_lhs, eff_rhs),
-            .kw_or => try self.builder.emitBinary(dest, "w", "or", eff_lhs, eff_rhs),
-            .kw_xor => try self.builder.emitBinary(dest, "w", "xor", eff_lhs, eff_rhs),
+            .kw_and => try self.builder.emitBinary(dest, if (is_long_op) "l" else "w", "and", eff_lhs, eff_rhs),
+            .kw_or => try self.builder.emitBinary(dest, if (is_long_op) "l" else "w", "or", eff_lhs, eff_rhs),
+            .kw_xor => try self.builder.emitBinary(dest, if (is_long_op) "l" else "w", "xor", eff_lhs, eff_rhs),
 
             else => {
                 try self.builder.emitComment("WARN: unhandled binary op, treating as add");

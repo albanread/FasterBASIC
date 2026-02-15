@@ -505,6 +505,20 @@ void jit_collector_dump(const JitCollector *jc);
 int qbe_compile_il_jit(const char *il_text, size_t il_len,
                        JitCollector *jc, const char *target_name);
 
+/* ── Opcode histogram ───────────────────────────────────────────── */
+
+/* Reset all histogram counters to zero. Call before a batch run. */
+void jit_histogram_reset(void);
+
+/* Accumulate instruction counts from a collector into the global
+ * histogram.  Called automatically at the end of qbe_compile_il_jit()
+ * on success; can also be called manually. */
+void jit_histogram_accumulate(const JitCollector *jc);
+
+/* Print the histogram to stderr, sorted by count descending, with
+ * a simple bar chart and percentages. */
+void jit_histogram_dump(void);
+
 #ifdef __cplusplus
 }
 #endif

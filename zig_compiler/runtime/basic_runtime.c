@@ -13,7 +13,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <stdlib.h>
+#include <setjmp.h>
+#include <signal.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 // External SAMM function for printing statistics
 extern void samm_print_stats_always(void);
@@ -48,6 +51,234 @@ static int32_t g_last_error = 0;
 static int32_t g_last_error_line = 0;
 
 // =============================================================================
+// JIT Exit Override
+// =============================================================================
+//
+// In JIT mode the compiled program runs in-process.  If the runtime calls
+// exit() (e.g. from basic_error) or QBE calls die_(), it would kill the
+// entire fbc process.
+//
+// We maintain a small stack of jmp_bufs so that nested protected regions
+// work correctly (e.g. basic_jit_call wrapping compilation, then
+// basic_jit_exec wrapping execution inside the same callback).
+//
+// basic_exit() longjmps to the most recently armed jmp_buf instead of
+// calling real exit().
+
+#define JIT_JMP_STACK_MAX 4
+
+static sigjmp_buf g_jit_jmp_stack[JIT_JMP_STACK_MAX];
+static int      g_jit_jmp_depth = 0;
+static int      g_jit_exit_code = 0;
+
+void basic_exit(int code) {
+    if (g_jit_jmp_depth > 0) {
+        g_jit_exit_code = code;
+        siglongjmp(g_jit_jmp_stack[g_jit_jmp_depth - 1], 1);
+    }
+    exit(code);
+}
+
+// ── Signal handlers for batch-mode protection ───────────────────────
+//
+// SIGABRT — QBE uses assert() liberally.  A failed assert calls abort()
+//   which raises SIGABRT.  We longjmp back to the setjmp point.  This
+//   is safe because the stack is intact (abort just raises a signal).
+//
+// SIGALRM — per-file execution timeout.  The batch harness calls
+//   basic_jit_set_timeout(seconds) before executing each file.  When
+//   the alarm fires we longjmp back with exit code 124 (matching the
+//   GNU timeout convention).
+//
+// We do NOT catch SIGSEGV/SIGBUS — longjmp from those is undefined
+// behaviour when the stack is corrupted.
+//
+// Signal installation is decoupled from basic_jit_call so the batch
+// harness can keep signals armed across both compilation and execution
+// phases.  Call basic_jit_arm_signals() once at the start of a batch
+// run and basic_jit_disarm_signals() at the end.
+
+static volatile sig_atomic_t g_signals_active = 0;
+static struct sigaction       g_prev_sigabrt;
+static struct sigaction       g_prev_sigalrm;
+
+static void
+jit_signal_handler(int sig)
+{
+    if (g_jit_jmp_depth > 0) {
+        if (sig == SIGABRT)
+            g_jit_exit_code = 134; /* 128 + SIGABRT(6) */
+        else if (sig == SIGALRM)
+            g_jit_exit_code = 124; /* GNU timeout convention */
+        else
+            g_jit_exit_code = 128 + sig;
+        siglongjmp(g_jit_jmp_stack[g_jit_jmp_depth - 1], 1);
+    }
+    /* No protection armed — fall back to default behaviour. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+// ── Public API: arm/disarm signal handlers ──────────────────────────
+//
+// The batch harness calls these once around the entire batch loop so
+// that SIGABRT and SIGALRM are caught during both QBE compilation
+// (inside basic_jit_call) and JIT execution (inside basic_jit_exec).
+// Calling them multiple times is safe — they refcount internally.
+
+void basic_jit_arm_signals(void)
+{
+    if (g_signals_active)
+        return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = jit_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* no SA_RESTART — we want the longjmp */
+    sigaction(SIGABRT, &sa, &g_prev_sigabrt);
+    sigaction(SIGALRM, &sa, &g_prev_sigalrm);
+    g_signals_active = 1;
+}
+
+void basic_jit_disarm_signals(void)
+{
+    if (!g_signals_active)
+        return;
+    alarm(0); /* cancel any pending timeout */
+    sigaction(SIGABRT, &g_prev_sigabrt, NULL);
+    sigaction(SIGALRM, &g_prev_sigalrm, NULL);
+    g_signals_active = 0;
+}
+
+// ── Per-file timeout ────────────────────────────────────────────────
+//
+// basic_jit_set_timeout(seconds) — arm a SIGALRM that will fire after
+//   `seconds` wall-clock seconds.  Pass 0 to disarm.  The signal
+//   handler longjmps back with exit code 124.
+//
+// The alarm is automatically cancelled when basic_jit_call returns
+// (normal or longjmp path).
+
+void basic_jit_set_timeout(unsigned int seconds) {
+    alarm(seconds);
+}
+
+// ── Stdout redirection for batch mode ───────────────────────────────
+//
+// basic_jit_suppress_stdout()  — redirect fd 1 to /dev/null, return
+//                                 the saved fd (or -1 on error).
+// basic_jit_restore_stdout(fd) — restore fd 1 from the saved fd.
+//
+// This keeps JIT program output out of the batch harness report.
+// The harness can choose to call these around execution when not in
+// verbose mode.
+
+int basic_jit_suppress_stdout(void) {
+    fflush(stdout);
+    int saved = dup(STDOUT_FILENO);
+    if (saved < 0) return -1;
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull < 0) { close(saved); return -1; }
+    dup2(devnull, STDOUT_FILENO);
+    close(devnull);
+    return saved;
+}
+
+void basic_jit_restore_stdout(int saved_fd) {
+    if (saved_fd < 0) return;
+    fflush(stdout);
+    dup2(saved_fd, STDOUT_FILENO);
+    close(saved_fd);
+}
+
+// ── QBE cleanup after aborted compilation ───────────────────────────
+// Defined in jit_collect.c (JIT builds) or runtime_shims.c (AOT builds).
+// Releases QBE pool memory, closes the fmemopen FILE handle, and resets
+// the bridge collector pointer.
+extern void qbe_jit_cleanup(void);
+
+// ── basic_jit_call ──────────────────────────────────────────────────
+// Generic protected call.  Arms a setjmp, invokes the callback, and
+// catches any basic_exit() that fires during the callback (including
+// from QBE's die_(), err(), assert failures, runtime errors, etc.).
+//
+// Returns the callback's return value on success.
+// On basic_exit() / abort, returns -(exit_code + 1)  (always negative).
+int basic_jit_call(int (*callback)(void *ctx), void *ctx) {
+    if (g_jit_jmp_depth >= JIT_JMP_STACK_MAX) {
+        fprintf(stderr, "FATAL: JIT jmp_buf stack overflow\n");
+        exit(1);
+    }
+
+    /* Ensure signal handlers are armed.  If the caller already called
+     * basic_jit_arm_signals() this is a no-op. */
+    basic_jit_arm_signals();
+
+    int slot = g_jit_jmp_depth++;
+    int result;
+    if (sigsetjmp(g_jit_jmp_stack[slot], 1) == 0) {
+        result = callback(ctx);
+    } else {
+        /* Arrived here via longjmp from basic_exit(), SIGABRT, or
+         * SIGALRM.  Cancel any pending alarm and clean up QBE state. */
+        alarm(0);
+        qbe_jit_cleanup();
+        result = -(g_jit_exit_code + 1);
+    }
+    g_jit_jmp_depth = slot;  // pop (also handles nested unwind)
+
+    /* NOTE: we intentionally do NOT disarm signals here.  The batch
+     * harness keeps them armed across the entire run via
+     * basic_jit_arm_signals / basic_jit_disarm_signals.  For single-
+     * file mode the signals stay armed harmlessly until process exit. */
+
+    return result;
+}
+
+// ── basic_jit_exec ──────────────────────────────────────────────────
+// Specialised wrapper for JIT program execution.  Arms a setjmp,
+// calls the JIT main(argc, argv), and on basic_exit() cleans up
+// runtime state (SAMM, files, timers) so the next program starts fresh.
+int basic_jit_exec(void *fn_ptr, int argc, char **argv) {
+    extern void samm_shutdown(void);
+    extern void samm_force_abandon(void);
+    extern void basic_print_force_unlock(void);
+
+    if (g_jit_jmp_depth >= JIT_JMP_STACK_MAX) {
+        fprintf(stderr, "FATAL: JIT jmp_buf stack overflow\n");
+        exit(1);
+    }
+    int slot = g_jit_jmp_depth++;
+    int result;
+    if (sigsetjmp(g_jit_jmp_stack[slot], 1) == 0) {
+        typedef int (*main_fn_t)(int, char **);
+        result = ((main_fn_t)fn_ptr)(argc, argv);
+    } else {
+        // Arrived here via longjmp from basic_exit() or SIGALRM.
+        result = g_jit_exit_code;
+        // The program didn't exit normally — clean up runtime state
+        // so the next batch run starts fresh.
+        if (g_jit_exit_code == 124) {
+            // SIGALRM timeout: any mutex may be held at interrupt time.
+            // We cannot call samm_shutdown (it acquires queue_mutex and
+            // joins the worker thread, both of which can deadlock).
+            // Instead, abandon the entire SAMM state and let the next
+            // samm_init() start fresh.  Accept the memory leak.
+            basic_print_force_unlock();
+            samm_force_abandon();
+        } else {
+            // Normal basic_exit (runtime error, END statement, etc.)
+            // The program was between operations, so mutexes are not
+            // held and a regular shutdown is safe.
+            samm_shutdown();
+        }
+        basic_runtime_cleanup();
+    }
+    g_jit_jmp_depth = slot;  // pop
+    return result;
+}
+
+// =============================================================================
 // Runtime Initialization and Cleanup
 // =============================================================================
 
@@ -56,7 +287,7 @@ void basic_runtime_init(void) {
     g_arena = (char*)malloc(ARENA_SIZE);
     if (!g_arena) {
         fprintf(stderr, "FATAL: Failed to allocate arena memory\n");
-        exit(1);
+        basic_exit(1);
     }
     g_arena_offset = 0;
     
@@ -116,7 +347,7 @@ void* basic_alloc_temp(size_t size) {
     
     if (g_arena_offset + size > ARENA_SIZE) {
         fprintf(stderr, "FATAL: Arena memory exhausted\n");
-        exit(1);
+        basic_exit(1);
     }
     
     void* ptr = g_arena + g_arena_offset;
@@ -134,7 +365,7 @@ void basic_clear_temps(void) {
 
 void basic_error(int32_t line_number, const char* message) {
     fprintf(stderr, "Runtime error at line %d: %s\n", line_number, message);
-    exit(1);
+    basic_exit(1);
 }
 
 void basic_error_msg(const char* message) {
@@ -143,7 +374,7 @@ void basic_error_msg(const char* message) {
     } else {
         fprintf(stderr, "Runtime error: %s\n", message);
     }
-    exit(1);
+    basic_exit(1);
 }
 
 void basic_set_line(int32_t line_number) {
@@ -313,7 +544,7 @@ ExceptionContext* basic_exception_push(int32_t has_finally) {
     ExceptionContext* ctx = (ExceptionContext*)malloc(sizeof(ExceptionContext));
     if (!ctx) {
         fprintf(stderr, "FATAL: Failed to allocate exception context\n");
-        exit(1);
+        basic_exit(1);
     }
     
     ctx->prev = (ExceptionContext*)g_exception_stack;
@@ -364,7 +595,7 @@ void basic_throw(int32_t error_code) {
         
         fprintf(stderr, "Unhandled exception at line %d: %s (error code %d)\n",
                 g_current_line, error_msg, error_code);
-        exit(1);
+        basic_exit(1);
     }
 }
 
@@ -390,7 +621,7 @@ void basic_rethrow(void) {
     } else {
         // No exception context - this shouldn't happen
         fprintf(stderr, "FATAL: basic_rethrow called with no active exception\n");
-        exit(1);
+        basic_exit(1);
     }
 }
 
@@ -399,7 +630,7 @@ int32_t basic_setjmp(void) {
     ExceptionContext* ctx = (ExceptionContext*)g_exception_stack;
     if (!ctx) {
         fprintf(stderr, "FATAL: basic_setjmp called without exception context\n");
-        exit(1);
+        basic_exit(1);
     }
     
     return setjmp(ctx->jump_buffer);
@@ -428,7 +659,7 @@ void basic_global_init(int64_t count) {
     if (!g_global_vector) {
         fprintf(stderr, "FATAL: Failed to allocate global variable vector (%lld slots)\n", 
                 (long long)count);
-        exit(1);
+        basic_exit(1);
     }
 }
 

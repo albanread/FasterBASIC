@@ -448,6 +448,31 @@ pub const SourceMapEntry = struct {
 };
 
 // ============================================================================
+// Section: Comment Map Entry
+// ============================================================================
+
+/// Maps a code offset to a codegen comment string.
+/// Comments are pseudo-instructions emitted by jit_collect (JIT_COMMENT)
+/// that annotate the generated code with human-readable context (e.g.
+/// "TRY block", "DIM X(...)", "unhandled op 42").  The encoder records
+/// the current code_len when it encounters a JIT_COMMENT so that
+/// Capstone disassembly can interleave these annotations at the
+/// corresponding machine-code offsets.
+pub const CommentEntry = struct {
+    /// Byte offset in code buffer where this comment applies
+    /// (the next instruction emitted after this comment)
+    code_offset: u32,
+    /// Comment text (copied from JitInst.sym_name)
+    text: [JIT_SYM_MAX]u8,
+    /// Length of the comment text
+    text_len: u8,
+
+    pub fn getText(self: *const CommentEntry) []const u8 {
+        return self.text[0..self.text_len];
+    }
+};
+
+// ============================================================================
 // Section: Load Address Relocation Entry
 // ============================================================================
 
@@ -536,6 +561,9 @@ pub const JitModule = struct {
     /// Source map (code offset → BASIC line)
     source_map: std.ArrayListUnmanaged(SourceMapEntry),
 
+    /// Comment map (code offset → codegen comment text)
+    comment_map: std.ArrayListUnmanaged(CommentEntry),
+
     /// Symbol table (name → offset)
     symbols: std.StringHashMap(SymbolEntry),
 
@@ -583,6 +611,7 @@ pub const JitModule = struct {
             .fixups = .{},
             .ext_calls = .{},
             .source_map = .{},
+            .comment_map = .{},
             .symbols = std.StringHashMap(SymbolEntry).init(allocator),
             .load_addr_relocs = .{},
             .data_sym_refs = .{},
@@ -604,6 +633,7 @@ pub const JitModule = struct {
         self.fixups.deinit(self.allocator);
         self.ext_calls.deinit(self.allocator);
         self.source_map.deinit(self.allocator);
+        self.comment_map.deinit(self.allocator);
         self.symbols.deinit();
         self.load_addr_relocs.deinit(self.allocator);
         self.data_sym_refs.deinit(self.allocator);
@@ -766,6 +796,7 @@ pub const EncodeStats = struct {
     skipped_pseudo: u32 = 0,
     functions_encoded: u32 = 0,
     neon_ops_encoded: u32 = 0,
+    comments_recorded: u32 = 0,
 };
 
 // ============================================================================
@@ -895,6 +926,18 @@ pub fn encodeInstruction(mod: *JitModule, inst: *const JitInst, inst_index: u32)
         },
 
         .JIT_COMMENT => {
+            // Record the comment at the current code offset so Capstone
+            // disassembly can display it alongside the machine code.
+            const name = inst.getSymName();
+            const len: u8 = @intCast(@min(name.len, JIT_SYM_MAX));
+            var entry = CommentEntry{
+                .code_offset = mod.code_len,
+                .text = [_]u8{0} ** JIT_SYM_MAX,
+                .text_len = len,
+            };
+            @memcpy(entry.text[0..len], name[0..len]);
+            mod.comment_map.append(mod.allocator, entry) catch {};
+            mod.stats.comments_recorded += 1;
             mod.stats.skipped_pseudo += 1;
         },
 
@@ -2917,6 +2960,7 @@ pub fn dumpModuleSummary(mod: *const JitModule, writer: anytype) !void {
             "  Fixups:          {d} created, {d} resolved\n" ++
             "  External calls:  {d}\n" ++
             "  Source map:       {d} entries\n" ++
+            "  Comments:        {d}\n" ++
             "  Functions:       {d}\n" ++
             "  NEON ops:        {d}\n" ++
             "  Pseudo skipped:  {d}\n" ++
@@ -2931,6 +2975,7 @@ pub fn dumpModuleSummary(mod: *const JitModule, writer: anytype) !void {
             mod.stats.fixups_resolved,
             mod.stats.ext_calls_recorded,
             mod.stats.source_map_entries,
+            mod.stats.comments_recorded,
             mod.stats.functions_encoded,
             mod.stats.neon_ops_encoded,
             mod.stats.skipped_pseudo,

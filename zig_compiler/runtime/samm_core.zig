@@ -265,6 +265,11 @@ const SAMMState = struct {
     peak_scope_depth: c_int = 0,
     scope_mutex: std.Thread.Mutex = .{},
 
+    // When true, SAMM has been forcibly abandoned after a timeout and
+    // must not be reinitialised (the orphaned worker thread may still
+    // be touching pool mutexes).  All SAMM calls become no-ops.
+    poisoned: bool = false,
+
     // Bloom filter (lazily allocated)
     bloom: BloomFilter = BloomFilter.init(),
 
@@ -592,6 +597,11 @@ const pool_init_table = struct {
 
 export fn samm_init() callconv(.c) void {
     if (g_samm.initialised) return;
+    // After a timeout-induced force-abandon, SAMM is permanently
+    // poisoned for this process.  The orphaned worker thread may
+    // still be touching pool mutexes, so reinitialising would race.
+    // All subsequent files run with SAMM disabled (no-ops).
+    if (g_samm.poisoned) return;
 
     // Reset state to defaults
     g_samm = .{};
@@ -748,6 +758,51 @@ export fn samm_shutdown() callconv(.c) void {
 
     g_samm.initialised = false;
     g_samm.enabled = false;
+}
+
+// =========================================================================
+// Public API: Force-abandon after SIGALRM timeout
+// =========================================================================
+//
+// When a JIT-executed program is killed by SIGALRM (timeout) while
+// holding a SAMM mutex, the siglongjmp leaves the mutex locked.
+// We cannot call samm_shutdown() because:
+//   1. samm_shutdown acquires queue_mutex (might be locked → deadlock)
+//   2. thread.join() waits for the worker, which may be blocked on a
+//      condition variable we're about to destroy (→ hang forever)
+//
+// We also cannot reinitialise SAMM for the next file because the
+// orphaned worker thread may still be touching slab-pool mutexes,
+// causing a race with pthread_mutex_init on the same memory.
+//
+// Instead we mark SAMM as **poisoned**.  samm_init() will refuse to
+// reinitialise, and all SAMM entry points (samm_enter_scope, etc.)
+// check `g_samm.enabled` which stays false.  Subsequent batch files
+// run without SAMM — scopes and background cleanup are no-ops, but
+// the programs still execute correctly (just without SAMM tracking).
+//
+// The memory leak from the timed-out program is accepted.
+
+export fn samm_force_abandon() callconv(.c) void {
+    if (!g_samm.initialised) return;
+
+    // Tell the worker to stop (best-effort; it may never see this).
+    g_samm.shutdown_flag = true;
+
+    // Detach the worker thread so we don't need to join it.
+    if (g_samm.worker_thread) |thread| {
+        thread.detach();
+    }
+
+    // Mark poisoned so samm_init() becomes a permanent no-op.
+    // Set enabled=false so all SAMM calls (enter_scope, exit_scope,
+    // track, free, alloc) short-circuit immediately.
+    // Set initialised=false so samm_shutdown() also becomes a no-op.
+    g_samm.worker_thread = null;
+    g_samm.worker_running = false;
+    g_samm.enabled = false;
+    g_samm.initialised = false;
+    g_samm.poisoned = true;
 }
 
 // =========================================================================

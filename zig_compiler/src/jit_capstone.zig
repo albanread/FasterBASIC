@@ -318,9 +318,23 @@ pub fn dumpModuleDisassembly(
         ext_at.put(ext.code_offset, ext.getName()) catch {};
     }
 
+    // Comment map cursor — comments are sorted by code_offset (emission order)
+    var comment_idx: usize = 0;
+
     // Disassemble instruction by instruction so we can interleave annotations
     var offset: u32 = 0;
     while (offset < mod.code_len) {
+        // Emit any codegen comments at or before this offset
+        while (comment_idx < mod.comment_map.items.len) {
+            const entry = &mod.comment_map.items[comment_idx];
+            if (entry.code_offset <= offset) {
+                try std.fmt.format(writer, "                          ; {s}\n", .{entry.getText()});
+                comment_idx += 1;
+            } else {
+                break;
+            }
+        }
+
         // Emit function symbol if present at this offset
         if (func_at.get(offset)) |sym_name| {
             try writer.writeAll("\n");
@@ -377,6 +391,13 @@ pub fn dumpModuleDisassembly(
             });
             offset += 4;
         }
+    }
+
+    // Emit any trailing comments past the last instruction
+    while (comment_idx < mod.comment_map.items.len) {
+        const entry = &mod.comment_map.items[comment_idx];
+        try std.fmt.format(writer, "                          ; {s}\n", .{entry.getText()});
+        comment_idx += 1;
     }
 
     try writer.writeAll("\n");
@@ -522,6 +543,7 @@ pub fn dumpFullDisassemblyReport(
 ///   • function entry labels from the module symbol table
 ///   • block labels from the label map
 ///   • external call target names resolved via the link result
+///   • codegen comments from the comment map (JIT_COMMENT pseudo-instructions)
 ///   • BASIC source-line numbers from the source map
 pub fn dumpLinkedDisassembly(
     code_ptr: [*]const u8,
@@ -584,9 +606,23 @@ pub fn dumpLinkedDisassembly(
         tramp_at.put(abs_addr, stub.getName()) catch {};
     }
 
+    // Comment map cursor — comments are sorted by code_offset (emission order)
+    var comment_idx: usize = 0;
+
     // Disassemble instruction by instruction with annotations
     var offset: u32 = 0;
     while (offset < code_len) {
+        // Emit any codegen comments at or before this offset
+        while (comment_idx < mod.comment_map.items.len) {
+            const centry = &mod.comment_map.items[comment_idx];
+            if (centry.code_offset <= offset) {
+                try std.fmt.format(writer, "                                    ; {s}\n", .{centry.getText()});
+                comment_idx += 1;
+            } else {
+                break;
+            }
+        }
+
         // Emit function symbol if present at this offset
         if (func_at.get(offset)) |sym_name| {
             try writer.writeAll("\n");
@@ -661,6 +697,13 @@ pub fn dumpLinkedDisassembly(
             });
             offset += 4;
         }
+    }
+
+    // Emit any trailing comments past the last instruction
+    while (comment_idx < mod.comment_map.items.len) {
+        const centry = &mod.comment_map.items[comment_idx];
+        try std.fmt.format(writer, "                                    ; {s}\n", .{centry.getText()});
+        comment_idx += 1;
     }
 
     try writer.writeAll("\n");

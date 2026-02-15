@@ -105,6 +105,15 @@ export fn basic_print_unlock() callconv(.c) void {
     g_print_mutex.unlock();
 }
 
+/// Force-reset the print mutex after a SIGALRM timeout longjmp.
+/// When a timeout fires while a PRINT statement holds the lock,
+/// the siglongjmp leaves it locked and the next file deadlocks.
+/// Reinitialising to the default unlocked state breaks the deadlock.
+/// SAFETY: only call when no other thread is mid-PRINT.
+export fn basic_print_force_unlock() callconv(.c) void {
+    g_print_mutex = .{};
+}
+
 // POSIX (for INKEY$)
 extern fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;

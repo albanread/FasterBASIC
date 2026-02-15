@@ -171,6 +171,8 @@ static int nblk;
 static int rcls;
 static uint ntyp;
 
+extern void basic_exit(int code);
+
 void
 err(char *s, ...)
 {
@@ -181,7 +183,7 @@ err(char *s, ...)
 	vfprintf(stderr, s, ap);
 	fprintf(stderr, "\n");
 	va_end(ap);
-	exit(1);
+	basic_exit(1);
 }
 
 static void

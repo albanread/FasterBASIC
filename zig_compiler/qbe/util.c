@@ -49,17 +49,19 @@ hash(char *s)
 	return h;
 }
 
+extern void basic_exit(int code);
+
 void
 die_(char *file, char *s, ...)
 {
 	va_list ap;
 
-	fprintf(stderr, "%s: dying: ", file);
+	fprintf(stderr, "qbe:%s: ", file);
 	va_start(ap, s);
 	vfprintf(stderr, s, ap);
 	va_end(ap);
 	fputc('\n', stderr);
-	abort();
+	basic_exit(1);
 }
 
 void *

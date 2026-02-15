@@ -37,11 +37,12 @@ const CLASS_HEADER_SIZE: usize = 16; // vtable ptr (8) + class_id (8)
 // =========================================================================
 // C library imports
 // =========================================================================
+extern fn basic_exit(status: c_int) noreturn;
+
 const c = struct {
     extern fn calloc(count: usize, size: usize) ?*anyopaque;
     extern fn free(ptr: ?*anyopaque) void;
     extern fn fprintf(stream: *anyopaque, fmt: [*:0]const u8, ...) c_int;
-    extern fn exit(status: c_int) noreturn;
 
     // macOS stderr
     extern const __stderrp: *anyopaque;
@@ -67,7 +68,7 @@ export fn class_object_new(object_size: i64, vtable: ?*anyopaque, class_id: i64)
 
     if (size < CLASS_HEADER_SIZE) {
         _ = c.fprintf(c.getStderr(), "INTERNAL ERROR: class_object_new called with object_size=%lld (minimum is %d)\n", @as(c_longlong, object_size), @as(c_int, @intCast(CLASS_HEADER_SIZE)));
-        c.exit(1);
+        basic_exit(1);
     }
 
     // Allocate through SAMM if available, otherwise raw calloc.
@@ -76,12 +77,12 @@ export fn class_object_new(object_size: i64, vtable: ?*anyopaque, class_id: i64)
         if (samm_is_enabled() != 0) {
             break :blk samm_alloc_object(size) orelse {
                 _ = c.fprintf(c.getStderr(), "ERROR: Out of memory allocating object (%lld bytes)\n", @as(c_longlong, object_size));
-                c.exit(1);
+                basic_exit(1);
             };
         } else {
             break :blk c.calloc(1, size) orelse {
                 _ = c.fprintf(c.getStderr(), "ERROR: Out of memory allocating object (%lld bytes)\n", @as(c_longlong, object_size));
-                c.exit(1);
+                basic_exit(1);
             };
         }
     };
@@ -190,14 +191,14 @@ export fn class_null_method_error(location: ?[*:0]const u8, method_name: ?[*:0]c
     const loc = location orelse "unknown";
     const meth = method_name orelse "unknown";
     _ = c.fprintf(c.getStderr(), "ERROR: Method call on NOTHING reference at %s (method: %s)\n", @as([*:0]const u8, loc), @as([*:0]const u8, meth));
-    c.exit(1);
+    basic_exit(1);
 }
 
 export fn class_null_field_error(location: ?[*:0]const u8, field_name: ?[*:0]const u8) void {
     const loc = location orelse "unknown";
     const fld = field_name orelse "unknown";
     _ = c.fprintf(c.getStderr(), "ERROR: Field access on NOTHING reference at %s (field: %s)\n", @as([*:0]const u8, loc), @as([*:0]const u8, fld));
-    c.exit(1);
+    basic_exit(1);
 }
 
 // =========================================================================

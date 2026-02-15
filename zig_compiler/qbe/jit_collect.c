@@ -21,6 +21,11 @@
 #include <stdio.h>
 #include <inttypes.h>
 
+/* ── Opcode histogram (accumulated across batch runs) ───────────── */
+
+static uint64_t jit_histogram[JIT_INST_KIND_COUNT];
+static uint64_t jit_histogram_total;
+
 /* ── Forward declarations ───────────────────────────────────────── */
 
 /* from arm64/emit.c — fusion kill-switch checks */
@@ -632,6 +637,11 @@ jc_ins(Ins *i, JC *e)
             /* sdiv ip1, rn, rm; msub rd, ip1, rm, rn */
             ji = jit_grow(e->jc);
             if (!ji) return;
+            ji->kind = JIT_COMMENT;
+            snprintf(ji->sym_name, JIT_SYM_MAX, "MOD: SDIV+MSUB sequence");
+
+            ji = jit_grow(e->jc);
+            if (!ji) return;
             ji->kind = JIT_SDIV_RRR;
             ji->cls = jcls;
             ji->rd = JIT_REG_IP1;
@@ -649,6 +659,11 @@ jc_ins(Ins *i, JC *e)
             return;
         }
         if (i->op == Ourem) {
+            ji = jit_grow(e->jc);
+            if (!ji) return;
+            ji->kind = JIT_COMMENT;
+            snprintf(ji->sym_name, JIT_SYM_MAX, "UMOD: UDIV+MSUB sequence");
+
             ji = jit_grow(e->jc);
             if (!ji) return;
             ji->kind = JIT_UDIV_RRR;
@@ -1383,6 +1398,11 @@ jc_try_madd(Ins *i, Ins *prev, JC *e, Blk *b)
 
     JitInst *ji = jit_grow(e->jc);
     if (!ji) return 0;
+    ji->kind = JIT_COMMENT;
+    snprintf(ji->sym_name, JIT_SYM_MAX, "fused: MUL+ADD -> MADD");
+
+    ji = jit_grow(e->jc);
+    if (!ji) return 0;
 
     if (KBASE(i->cls) == 0)
         ji->kind = JIT_MADD_RRRR;
@@ -1428,6 +1448,11 @@ jc_try_msub(Ins *i, Ins *prev, JC *e, Blk *b)
         return 0; /* only integer MSUB for now */
 
     JitInst *ji = jit_grow(e->jc);
+    if (!ji) return 0;
+    ji->kind = JIT_COMMENT;
+    snprintf(ji->sym_name, JIT_SYM_MAX, "fused: MUL-SUB -> MSUB");
+
+    ji = jit_grow(e->jc);
     if (!ji) return 0;
     ji->kind = JIT_MSUB_RRRR;
     ji->cls = mapcls(i->cls);
@@ -1511,6 +1536,31 @@ jc_try_shift_fusion(Ins *i, Ins *prev, JC *e, Blk *b)
 
     JitInst *ji = jit_grow(e->jc);
     if (!ji) return 0;
+    ji->kind = JIT_COMMENT;
+    {
+        const char *op_name = "alu";
+        switch (i->op) {
+        case Oadd: op_name = "ADD"; break;
+        case Osub: op_name = "SUB"; break;
+        case Oand: op_name = "AND"; break;
+        case Oor:  op_name = "ORR"; break;
+        case Oxor: op_name = "EOR"; break;
+        default: break;
+        }
+        const char *sh_name = "?";
+        switch (prev->op) {
+        case Oshl: sh_name = "LSL"; break;
+        case Oshr: sh_name = "LSR"; break;
+        case Osar: sh_name = "ASR"; break;
+        default: break;
+        }
+        snprintf(ji->sym_name, JIT_SYM_MAX,
+                 "fused: %s(shifted) -> %s %s #%d",
+                 op_name, op_name, sh_name, shift_amt);
+    }
+
+    ji = jit_grow(e->jc);
+    if (!ji) return 0;
     ji->kind = kind;
     ji->cls = mapcls(i->cls);
     ji->rd = mapreg(i->to.val);
@@ -1571,6 +1621,15 @@ jc_try_ldp_stp(Ins *i, Ins *prev_mem, JC *e, Blk *b)
     int is_load = isload(prev_mem->op);
 
     JitInst *ji = jit_grow(e->jc);
+    if (!ji) return 0;
+    ji->kind = JIT_COMMENT;
+    snprintf(ji->sym_name, JIT_SYM_MAX,
+             "fused: %s+%s -> %s",
+             is_load ? "LDR" : "STR",
+             is_load ? "LDR" : "STR",
+             is_load ? "LDP" : "STP");
+
+    ji = jit_grow(e->jc);
     if (!ji) return 0;
 
     ji->kind = is_load ? JIT_LDP : JIT_STP;
@@ -1704,6 +1763,13 @@ jit_collect_fn(JitCollector *jc, Fn *fn)
     }
     ji->imm = (int64_t)(env.frame + 16);
 
+    /* Emit prologue frame-size comment for Capstone listing */
+    ji = jit_grow(jc);
+    if (!ji) return;
+    ji->kind = JIT_COMMENT;
+    snprintf(ji->sym_name, JIT_SYM_MAX, "prologue: frame=%d bytes",
+             (int)(env.frame + 16));
+
     /* ── Prologue: HINT #34 (BTI C) ── */
     ji = jit_grow(jc);
     if (!ji) return;
@@ -1765,6 +1831,15 @@ jit_collect_fn(JitCollector *jc, Fn *fn)
     for (lbl = 0, b = fn->start; b; b = b->link) {
         Ins *prev = NULL;
 
+        /* Emit a comment with the QBE block name so Capstone
+         * disassembly can display it alongside the machine code. */
+        if (b->name[0]) {
+            ji = jit_grow(jc);
+            if (!ji) return;
+            ji->kind = JIT_COMMENT;
+            snprintf(ji->sym_name, JIT_SYM_MAX, "block @%s", b->name);
+        }
+
         if (lbl || b->npred > 1) {
             ji = jit_grow(jc);
             if (!ji) return;
@@ -1816,6 +1891,12 @@ jit_collect_fn(JitCollector *jc, Fn *fn)
         if (prev) {
             if (jc_try_cbz(prev, b, &env, &use_cbz, &cbz_reg, &cbz_cls)) {
                 /* CBZ/CBNZ fusion — don't emit the CMP */
+                ji = jit_grow(jc);
+                if (!ji) return;
+                ji->kind = JIT_COMMENT;
+                snprintf(ji->sym_name, JIT_SYM_MAX,
+                         "fused: CMP+B.cond -> %s",
+                         (use_cbz == 1) ? "CBZ" : "CBNZ");
             } else {
                 jc_ins(prev, &env);
             }
@@ -1835,6 +1916,11 @@ jit_collect_fn(JitCollector *jc, Fn *fn)
 
         case Jret0:
             /* ── Epilogue: restore callee-saved regs ── */
+            ji = jit_grow(jc);
+            if (!ji) return;
+            ji->kind = JIT_COMMENT;
+            snprintf(ji->sym_name, JIT_SYM_MAX, "epilogue: restore frame");
+
             {
                 int rs = (int)((env.frame - env.padding) / 4);
                 for (r = arm64_rclob; *r >= 0; r++) {
@@ -1922,6 +2008,20 @@ jit_collect_fn(JitCollector *jc, Fn *fn)
             } else {
                 c = cmpneg(c);
             }
+
+            /* Emit a comment showing branch target block names */
+            ji = jit_grow(jc);
+            if (!ji) return;
+            ji->kind = JIT_COMMENT;
+            if (b->s1->name[0] && b->s2->name[0])
+                snprintf(ji->sym_name, JIT_SYM_MAX,
+                         "branch: true->@%s, false->@%s",
+                         b->s1->name, b->s2->name);
+            else
+                snprintf(ji->sym_name, JIT_SYM_MAX,
+                         "branch: true->.L%d, false->.L%d",
+                         (int)(id0 + b->s1->id),
+                         (int)(id0 + b->s2->id));
 
             if (use_cbz) {
                 ji = jit_grow(jc);
@@ -2446,6 +2546,9 @@ jit_dbgfile_cb(char *fn)
     (void)fn; /* We don't need debug file markers in JIT mode */
 }
 
+/* ── Global FILE handle for cleanup after longjmp ───────────────────── */
+static FILE *g_jit_parse_file = NULL;
+
 /* Select target (duplicated from qbe_bridge.c to avoid link issues) */
 extern Target T_amd64_sysv;
 extern Target T_amd64_apple;
@@ -2504,8 +2607,13 @@ qbe_compile_il_jit(const char *il_text, size_t il_len,
         return -2;
     }
 
+    /* Track the FILE handle globally so qbe_jit_cleanup() can close it
+     * if parse() longjmps out via err()/die_() → basic_exit(). */
+    g_jit_parse_file = inf;
+
     parse(inf, "<jit>", jit_dbgfile_cb, jit_data_cb, jit_func_cb);
 
+    g_jit_parse_file = NULL;
     fclose(inf);
 
     /* Emit any floating-point constants that were stashed during
@@ -2517,5 +2625,122 @@ qbe_compile_il_jit(const char *il_text, size_t il_len,
 
     bridge_jc = NULL;
 
+    /* Accumulate opcode histogram for this compilation */
+    if (!jc->error)
+        jit_histogram_accumulate(jc);
+
     return jc->error ? -1 : 0;
+}
+
+/* ── Opcode histogram API ──────────────────────────────────────────────
+ *
+ * The histogram is a global array of counters indexed by JitInstKind.
+ * It accumulates across multiple qbe_compile_il_jit() calls (e.g. in
+ * --batch-jit mode) and can be dumped as a sorted table at the end.
+ */
+
+void
+jit_histogram_reset(void)
+{
+    memset(jit_histogram, 0, sizeof jit_histogram);
+    jit_histogram_total = 0;
+}
+
+void
+jit_histogram_accumulate(const JitCollector *jc)
+{
+    for (uint32_t i = 0; i < jc->ninst; i++) {
+        uint16_t k = jc->insts[i].kind;
+        if (k < JIT_INST_KIND_COUNT) {
+            jit_histogram[k]++;
+            jit_histogram_total++;
+        }
+    }
+}
+
+void
+jit_histogram_dump(void)
+{
+    /* Build a list of (kind, count) pairs for non-zero entries */
+    typedef struct { uint16_t kind; uint64_t count; } Entry;
+    Entry entries[JIT_INST_KIND_COUNT];
+    int n = 0;
+
+    for (int i = 0; i < JIT_INST_KIND_COUNT; i++) {
+        if (jit_histogram[i] > 0) {
+            entries[n].kind = (uint16_t)i;
+            entries[n].count = jit_histogram[i];
+            n++;
+        }
+    }
+
+    if (n == 0) {
+        fprintf(stderr, "  (no instructions collected)\n");
+        return;
+    }
+
+    /* Sort descending by count (simple insertion sort — n is small) */
+    for (int i = 1; i < n; i++) {
+        Entry tmp = entries[i];
+        int j = i - 1;
+        while (j >= 0 && entries[j].count < tmp.count) {
+            entries[j + 1] = entries[j];
+            j--;
+        }
+        entries[j + 1] = tmp;
+    }
+
+    /* Find the maximum count for bar scaling */
+    uint64_t max_count = entries[0].count;
+
+    /* Print header */
+    fprintf(stderr, "\n");
+    fprintf(stderr, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+    fprintf(stderr, "  JIT Opcode Histogram  (%"PRIu64" total instructions)\n",
+            jit_histogram_total);
+    fprintf(stderr, "──────────────────────────────────────────────────────\n");
+
+    /* Bar width in characters */
+    const int bar_max = 30;
+
+    for (int i = 0; i < n; i++) {
+        const char *name = jit_inst_kind_name(entries[i].kind);
+        uint64_t cnt = entries[i].count;
+        double pct = 100.0 * (double)cnt / (double)jit_histogram_total;
+
+        /* Compute bar length */
+        int bar_len = (int)((double)cnt / (double)max_count * bar_max);
+        if (bar_len < 1 && cnt > 0) bar_len = 1;
+
+        fprintf(stderr, "  %-16s %7"PRIu64"  %5.1f%%  ", name, cnt, pct);
+        for (int b = 0; b < bar_len; b++)
+            fputc('#', stderr);
+        fputc('\n', stderr);
+    }
+
+    fprintf(stderr, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+}
+
+/* ── QBE JIT cleanup after aborted compilation ─────────────────────────
+ *
+ * When basic_exit() fires during QBE compilation (from err(), die_(), or
+ * an assert), the longjmp skips all cleanup in qbe_compile_il_jit().
+ * This function is called from basic_jit_call()'s recovery path to:
+ *
+ *   1. Close the fmemopen FILE handle that parse() was reading from.
+ *   2. Call freeall() to release QBE's pool allocator memory.
+ *   3. Reset the bridge_jc pointer so the next compilation starts clean.
+ *
+ * It is safe to call this even when no compilation was in progress
+ * (all operations are guarded).
+ */
+void
+qbe_jit_cleanup(void)
+{
+    if (g_jit_parse_file) {
+        fclose(g_jit_parse_file);
+        g_jit_parse_file = NULL;
+    }
+    freeall();
+    bridge_jc = NULL;
 }

@@ -89,6 +89,8 @@ const PROT_EXEC: u32 = 0x4;
 // ============================================================================
 
 pub const JitMemoryError = error{
+    /// Target address is beyond ±128MB BL instruction range.
+    BLOutOfRange,
     /// Failed to reserve virtual address space
     ReserveFailed,
     /// Failed to commit code region
@@ -439,6 +441,37 @@ pub const JitMemoryRegion = struct {
 
         // Return absolute offset from code_base
         return self.code_capacity + off;
+    }
+
+    /// Patch a BL instruction at the given code offset to branch directly
+    /// to an absolute target address.  Returns `BLOutOfRange` if the
+    /// target is beyond ±128 MB from the BL instruction.
+    pub fn patchBLDirect(self: *JitMemoryRegion, bl_offset: usize, target_addr: u64) JitMemoryError!void {
+        if (self.state != .Writable) return JitMemoryError.NotWritable;
+
+        const code = self.code_base orelse return JitMemoryError.AlreadyFreed;
+
+        // Absolute address of the BL instruction
+        const bl_addr: u64 = @intFromPtr(code) + bl_offset;
+
+        // Signed byte delta from BL to target
+        const delta_bytes: i64 = @as(i64, @intCast(target_addr)) - @as(i64, @intCast(bl_addr));
+
+        // BL range: imm26 is signed, scaled by 4 → ±128 MB
+        const BL_MAX: i64 = 128 * 1024 * 1024;
+        if (delta_bytes >= BL_MAX or delta_bytes < -BL_MAX) {
+            return JitMemoryError.BLOutOfRange;
+        }
+
+        // Must be 4-byte aligned
+        if (@rem(delta_bytes, 4) != 0) return JitMemoryError.InvalidAlignment;
+
+        const delta_words: i32 = @intCast(@divExact(delta_bytes, 4));
+        const delta_u32: u32 = @bitCast(delta_words);
+
+        // BL encoding: opcode[31:26] = 100101, imm26[25:0]
+        const bl_word: u32 = 0x94000000 | (delta_u32 & 0x03ffffff);
+        writeU32(code[bl_offset..][0..4], bl_word);
     }
 
     /// Patch a BL instruction at the given code offset to branch to
