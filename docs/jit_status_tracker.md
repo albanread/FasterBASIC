@@ -188,7 +188,7 @@ Converting the intermediate form to executable bytes.
 - ✅ **309 Zig unit tests** — all pass
 - ✅ **828 clang/otool verification cases** — all match system assembler output
 
-### Phase 5: Debugging & Diagnostics 🟡 IN PROGRESS
+### Phase 5: Debugging & Diagnostics ✅ MOSTLY COMPLETE
 Tools for runtime introspection and crash handling.
 
 - [x] **Pipeline Report**: `dumpPipelineReport()` produces comprehensive phase-by-phase reports covering collection, code generation, data generation, branch linking, external calls, and diagnostics with source mapping.
@@ -203,21 +203,25 @@ Tools for runtime introspection and crash handling.
 - [ ] **Signal Handler**: Implement a `SIGTRAP` / `SIGSEGV` handler to catch exceptions. *(Stub installed in jit_runtime.zig; full sigaction + ucontext_t parsing is Phase 5 remaining work.)*
 - [ ] **Context Dumper**: Implement `ucontext_t` parsing to dump registers (`x0-x30`, `sp`, `pc`) and stack trace in a signal-safe manner.
 
-### Phase 6: Execution & Verification 🟡 HARNESS READY
+### Phase 6: Execution & Verification ✅ COMPLETE
 Running the code and ensuring correctness.
 
 - [x] **Execution Harness**: `jit_runtime.zig` — `JitSession.execute()` / `executeFunction()`. Casts code buffer to `fn() callconv(.C) i32` function pointer and calls it. Signal handler stubs installed/restored around execution.
 - [x] **JitSession Lifecycle**: `compile()` → `compileFromModule()` → `execute()` → `deinit()`. Full resource management with deferred cleanup.
 - [x] **Function Pointer API**: `JitSession.getFunctionPtr(T, name)` — typed function pointer extraction for custom calling conventions.
 - [x] **Symbol Lookup**: Searches module symbol table, tries `$`-prefixed names (QBE convention), falls back to offset 0 for "main".
-- [ ] **Integration Tests**: Run the standard test suite in JIT mode. *(Requires BASIC runtime function stubs to be wired into RuntimeContext.)*
-- [ ] **Smoke Test**: Execute a trivial JIT'd function (e.g., `ret 42`) end-to-end. *(All infrastructure is in place; needs a test that doesn't call external BASIC runtime functions.)*
+- [x] **Integration Tests**: Full batch test suite (12 tests + subdirs) runs under `--batch-jit`. All JIT smoke/unit tests pass. GOSUB/RETURN, FUNCTION/RETURN, recursive functions, math double-return all verified working.
+- [x] **Smoke Test**: Multiple trivial and non-trivial programs execute end-to-end via `fbc --jit`, including `PRINT "hello"`, arithmetic, control flow, string ops, hashmaps, and user-defined functions.
 
-### Phase 7: Lifecycle & Polish 🟡 PARTIALLY COMPLETE
+### Phase 7: Lifecycle & Polish ✅ MOSTLY COMPLETE
 Cleanup and platform hardening.
 
 - [x] **Memory Teardown**: `JitMemoryRegion.free()` — `munmap` all regions, `JitSession.deinit()` — frees module + region + reports. Tested for leak-freedom with `std.testing.allocator` (GPA).
 - [x] **Linux Support**: Buddy allocation with `mprotect`-based W^X switching implemented in `jit_memory.zig`. Code region: RW → RX via `mprotect`. Data region: always RW. icache invalidation via DC CVAU + IC IVAU.
+- [x] **Codegen Comment Annotations**: `CommentEntry` + `comment_map` in `JitModule` preserves `JIT_COMMENT` pseudo-instructions through encoding. Capstone disassembly interleaves block names, prologue/epilogue markers, branch targets, fusion explanations, and MOD expansion annotations alongside machine instructions.
+- [x] **Batch Test Harness**: `--batch-jit` flag runs directory of `.bas` files with recursive subdirectory support, pass/fail reporting, and metrics.
+- [x] **`--run` flag**: Execute JIT programs with argument passthrough (`fbc --run program.bas arg1 arg2`).
+- [x] **`--metrics` flag**: Phase timings and SAMM memory stats for JIT runs.
 - [ ] **Windows Support**: Implement `VirtualAlloc` based allocation for Windows.
 - [ ] **Benchmarks**: Compare JIT startup and execution time vs compiled binaries.
 
@@ -304,20 +308,32 @@ Replaced the no-op stub table with real runtime function wiring. Five categories
 
 459 runtime symbols now exported from `fbc`. Verified with `nm -gU`. All unit tests pass.
 
-### Linked Disassembly (Next Priority)
+### ~~Linked Disassembly~~ ✅ DONE
 
 - ✅ `dumpLinkedDisassembly()` reads the live post-link code buffer at real addresses
 - ✅ `dumpLinkedReport()` combines code + trampoline + instruction analysis
 - ✅ Shows patched BL targets, patched ADRP page deltas, real trampoline addresses
 - ✅ Annotations: function entries, block labels, ext-call target names, source lines
+- ✅ Codegen comment annotations interleaved in both pre-link and post-link Capstone disassembly
+
+### ~~GOSUB/RETURN~~ ✅ FIXED
+
+Subroutine calls now work correctly under JIT. RETURN resumes at the correct call site. Verified with simple, nested, and multi-call GOSUB tests (`jit_test_gosub.bas`, `jit_test_gosub_nested.bas`, batch `10_gosub.bas`).
+
+### ~~FUNCTION/RETURN~~ ✅ FIXED
+
+User-defined functions (FUNCTION/END FUNCTION with RETURN) work under JIT, including recursive calls. Verified with integer functions, recursive factorial (`Factorial(10)` → `3628800`), and iterative factorial performance tests (`jit_perf_factorial.bas`).
+
+### ~~SQR/Math Double-Return~~ ✅ FIXED
+
+Math functions returning doubles (SQR, etc.) display correctly under JIT. `SQR(144.0)` → `12`, `SQR(2.0)` → `1.41421`. Fixed via FMOV FP→GP encoding correction (`is64()` not `isDouble()`).
 
 ### Remaining Work
 
-- **GOSUB/RETURN**: Subroutine call reaches the target but RETURN does not resume correctly after the GOSUB call site
-- **FUNCTION calls**: User-defined functions (FUNCTION/END FUNCTION with RETURN) timeout under JIT — likely a calling convention or stack frame issue
-- **SQR/math double-return**: Some math functions (e.g., SQR) that return doubles may not display results correctly under JIT
-- **Signal Handler**: Full `sigaction` + `ucontext_t` parsing for crash diagnostics (Phase 5)
+- **Signal Handler**: Full `sigaction` + `ucontext_t` parsing for crash diagnostics (Phase 5 — stubs in place)
 - **Breakpoint API**: Hot-patch BRK instructions for debugging
+- **Windows Support**: `VirtualAlloc` based allocation
+- **Benchmarks**: JIT startup and execution time vs compiled binaries
 
 ---
 
@@ -493,10 +509,32 @@ Linux: PROT_NONE reservation → mprotect RW → mprotect RX (code only)
 | `jit_test_nested_if.bas` | ✅ PASS | `"both"` |
 | `jit_test_two_prints.bas` | ✅ PASS | `"hello"`, `"world"` |
 | `jit_test_print_semi.bas` | ✅ PASS | Semicolons work |
-| `jit_test_gosub.bas` | 🟡 Partial | Calls subroutine, RETURN incomplete |
+| `jit_test_gosub.bas` | ✅ PASS | `"before"`, `"inside"`, `"after"` |
+| `jit_test_gosub_nested.bas` | ✅ PASS | Nested GOSUB/RETURN with correct resume |
+| `jit_test_float.bas` | ✅ PASS | `3.14`, `6.28` |
+| `jit_test_string.bas` | ✅ PASS | `"hello world"` |
+| `jit_perf_factorial.bas` | ✅ PASS | Iterative factorial performance test |
+| `jit_perf_factorial_10m.bas` | ✅ PASS | 10M reps, `18!` = `6402373705728000` |
 | `test_if_simple.bas` | ✅ PASS | Full test from suite |
 | `test_for_variable_bounds.bas` | ✅ PASS | Nested FOR with GOSUB |
 | `test_while_nested_simple.bas` | ✅ PASS | Nested WHILE loops |
+
+#### Batch Test Results (--batch-jit)
+
+| Test | Status | Output |
+|:---|:---|:---|
+| `01_hello.bas` | ✅ PASS | `"hello from batch 1"` |
+| `02_arith.bas` | ✅ PASS | `30` |
+| `03_string.bas` | ✅ PASS | `"batch three"` |
+| `04_for_loop.bas` | ✅ PASS | `1`, `2`, `3` |
+| `05_done.bas` | ✅ PASS | `"batch complete"` |
+| `sub/06_nested.bas` | ✅ PASS | Recursive subdirectory test |
+| `sub/07_while.bas` | ✅ PASS | WHILE loop in subdirectory |
+| `08_string_stress.bas` | ✅ PASS | String concat, `LEN` = `60` |
+| `09_ifelse.bas` | ✅ PASS | `"medium"`, `"done"` |
+| `10_gosub.bas` | ✅ PASS | `"result: 30"` (3× GOSUB AddTen) |
+| `11_runtime_error.bas` | ✅ PASS | Division by zero handled |
+| `12_after_error.bas` | ✅ PASS | `"survived"` |
 
 #### Runtime Integration Tests (real runtime, no stubs)
 
@@ -511,4 +549,5 @@ Linux: PROT_NONE reservation → mprotect RW → mprotect RX (code only)
 | String concatenation | ✅ PASS | `c = a + b` via real `string_concat` |
 | WHILE loop | ✅ PASS | `1` through `5` |
 | Mixed (IF + hashmap + FOR) | ✅ PASS | All features combined in one program |
-| User-defined FUNCTION | 🟡 Timeout | FUNCTION/RETURN not yet working under JIT |
+| User-defined FUNCTION | ✅ PASS | `MyDouble(21)` → `42`, recursive `Factorial(10)` → `3628800` |
+| SQR / math doubles | ✅ PASS | `SQR(144.0)` → `12`, `SQR(2.0)` → `1.41421` |

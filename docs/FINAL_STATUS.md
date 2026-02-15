@@ -1,5 +1,7 @@
 # Hashmap Integration & String Pool Fix - Final Status
 
+> **Historical snapshot** — This document records the state of the hashmap integration at the time it was completed. Test counts and performance notes below reflect that point in time. The project has since grown to 312+ end-to-end tests (all passing) and the hashmap performance issues noted here have been resolved. See the main [README](../README.md) for current status.
+
 ## ✅ All Core Functionality Working!
 
 ### Tests Passing Quickly (< 1 second each)

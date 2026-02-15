@@ -1,5 +1,7 @@
 # Hashmap Performance Optimization Opportunity
 
+> **Historical snapshot** — This document describes a performance issue identified during early hashmap integration. The redundant string conversion issue noted here has since been resolved. The JIT path now includes a native C hashmap implementation with direct symbol resolution, and hashmap operations perform well under both AOT and JIT modes. See the main [README](../README.md) for current status.
+
 ## Issue Identified
 
 BASIC hashmap operations are slower than necessary due to **redundant string conversions**.

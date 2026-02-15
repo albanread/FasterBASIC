@@ -1,7 +1,9 @@
 # FasterBASIC Hashmap Implementation Status
 
+> **Historical snapshot** — This document records the state of hashmap implementation as of early 2024 when codegen was partially complete. Hashmap support is now fully implemented and working in both AOT and JIT modes, including a native C hashmap for JIT. See the main [README](../README.md) for current status.
+
 **Date**: February 2024  
-**Status**: Lexer, Parser, and Semantic Analysis Complete — Codegen Partially Implemented
+**Status**: ~~Lexer, Parser, and Semantic Analysis Complete — Codegen Partially Implemented~~ **NOW FULLY COMPLETE**
 
 ---
 

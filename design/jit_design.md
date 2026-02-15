@@ -591,8 +591,14 @@ The JIT calls the real FasterBASIC runtime functions in-process — no stubs, no
 
 - ~~**CLI `--jit` flag**~~: ✅ Done — `--jit` and `--jit-verbose` route through JIT pipeline.
 - ~~**Runtime function wiring**~~: ✅ Done — 200+ real runtime functions wired via jump table, native hashmap, shims for inline/legacy names.
-- **FUNCTION/RETURN under JIT**: User-defined functions (FUNCTION/END FUNCTION with RETURN) timeout under JIT — likely a calling convention or stack frame issue in the collector/encoder.
-- **GOSUB/RETURN**: Subroutine call reaches the target but RETURN does not resume correctly after the GOSUB call site.
+- ~~**FUNCTION/RETURN under JIT**~~: ✅ Fixed — User-defined functions work under JIT including recursive calls. Verified with `Factorial(10)` → `3628800`.
+- ~~**GOSUB/RETURN**~~: ✅ Fixed — Subroutine calls resume correctly after the GOSUB call site. Verified with simple, nested, and multi-call tests.
+- ~~**SQR/math double-return**~~: ✅ Fixed — Math functions returning doubles display correctly. Fixed via FMOV FP→GP encoding correction (`is64()` not `isDouble()`).
+- ~~**`--run` flag**~~: ✅ Done — `fbc --run program.bas arg1 arg2` for JIT execution with argument passthrough.
+- ~~**`--metrics` flag**~~: ✅ Done — Phase timings and SAMM memory stats for JIT runs.
+- ~~**`--batch-jit` flag**~~: ✅ Done — Batch test harness with recursive subdirectory support and pass/fail reporting.
+- ~~**Codegen comment annotations**~~: ✅ Done — `JIT_COMMENT` pseudo-instructions preserved through encoding; Capstone disassembly shows block names, prologue/epilogue, branch targets, fusion explanations.
+- ~~**Linked disassembly**~~: ✅ Done — Post-link Capstone disassembly of live code buffer with patched addresses and comment annotations.
 - **Signal handler implementation**: Full `sigaction` + `ucontext_t` parsing for crash diagnostics (stubs are in place).
 - **Breakpoint API**: Hot-patch `BRK` instructions using the `makeWritable()` → patch → `makeExecutable()` cycle.
 - **Windows support**: `VirtualAlloc` based allocation.

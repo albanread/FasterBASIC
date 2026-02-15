@@ -40,8 +40,9 @@ Aims to be a modern BASIC compiler that combines the ease of traditional BASIC w
 
 ### JIT for ARM64
 
-FasterBASIC for ARM64 includes a just in time compiler mode.
-This means FasterBASIC can load, compile and run BASIC faster, which will allow for a more QB like experience in future, and is useful in general.
+FasterBASIC includes a fully working JIT compiler for ARM64. Programs compile and execute entirely in-memory — no external assembler, linker, or file I/O required. This makes compilation dramatically faster than the AOT path (which invokes clang), enabling a more interactive, QB-like experience.
+
+Features: user-defined functions (including recursion), GOSUB/RETURN, all control flow, string operations, hashmaps, math functions, and 200+ real runtime functions — all executing natively via the JIT. Annotated Capstone disassembly (`--jit-verbose`) shows block boundaries, branch targets, fused instructions, and prologue/epilogue markers alongside machine code.
 
 ### AOT - exe files
 
@@ -49,8 +50,7 @@ FasterBASIC creates Assembly language output and assuming you have a c compiler 
 
 ### One compiler to Exe and Jit them all
 
-The compiler is the same for both modes, it just the last stage that is different.
-The code created is only slightly different, we use our CLANG verifier to cross check our own ARM64 encoders to Clangs assembler in hundreds of tests.
+The compiler is the same for both modes — only the final stage differs. The JIT path encodes ARM64 directly into executable memory using our own encoder (300+ emit functions, 828 clang-verified cases), while the AOT path emits assembly text for clang. Both produce equivalent machine code from the same QBE IL.
 
 
 ### Workers & Concurrency
@@ -245,7 +245,7 @@ SAMM is not a garbage collector, SAMM clears up Dynamic memory the way you expec
 
 ## Project Status
 
-**Latest Update (February 2026)**: Compiler fully rewritten in Zig. Workers with `MARSHALL`/`UNMARSHALL` for thread-safe data passing. Deep string marshalling via static offset tables. 312 end-to-end tests passing (100%). Full OOP, HashMaps, Lists, NEON SIMD, and plugin system.
+**Latest Update (February 2026)**: Compiler fully rewritten in Zig. Full JIT compiler for ARM64 — in-memory compilation and execution with no external toolchain. Workers with `MARSHALL`/`UNMARSHALL` for thread-safe data passing. Deep string marshalling via static offset tables. 312 end-to-end tests passing (100%). Full OOP, HashMaps, Lists, NEON SIMD, and plugin system.
 
 ### ✅ Core Language Features
 
@@ -416,17 +416,37 @@ SAMM is not a garbage collector, SAMM clears up Dynamic memory the way you expec
 - ✅ Correct sub-word memory ops (storeb/loadsb, storeh/loadsh)
 - ✅ Scalar MAX(a,b) / MIN(a,b) overloads
 
+**JIT Compiler (ARM64):**
+- ✅ In-memory ARM64 code generation — no external toolchain required
+- ✅ `--jit` and `--jit-verbose` CLI flags
+- ✅ `--run` flag for JIT execution with argument passthrough
+- ✅ `--batch-jit` batch test harness with recursive subdirectory support
+- ✅ `--metrics` flag for phase timings and SAMM memory stats
+- ✅ 300+ ARM64 encoder functions, 309 unit tests, 828 clang-verified cases
+- ✅ Two-pass branch linking (forward/backward fixups for B, BL, B.cond, CBZ, CBNZ)
+- ✅ ADRP+ADD data relocations for global variables and string literals
+- ✅ Trampoline island for external runtime calls (16-byte stubs, ±128MB range)
+- ✅ macOS MAP_JIT with W^X protection, separate data mmap
+- ✅ Linux mmap+mprotect with manual icache invalidation
+- ✅ GOSUB/RETURN — correct resume after call site
+- ✅ FUNCTION/END FUNCTION — user-defined functions including recursion
+- ✅ SQR and math functions returning doubles
+- ✅ 200+ real runtime functions wired via jump table (no stubs)
+- ✅ Native C hashmap for JIT (replacing QBE-IL-only implementation)
+- ✅ Capstone disassembly with codegen comment annotations (block names, prologue/epilogue, branch targets, fusion explanations)
+- ✅ All batch tests passing (12 tests + subdirs), all JIT smoke/unit tests passing
+
 ### 🚧 In Progress
 
 - **Superterminal Integration**: Graphics, sprites, and audio via Superterminal project
-- **Advanced string functions**: Additional string manipulation functions
-- **File I/O**: Expanded file handling capabilities
-- **Optimization passes**: Additional peephole optimizations
+- **JIT signal handler**: Full `sigaction` + `ucontext_t` crash diagnostics (stubs in place)
+- **JIT breakpoint API**: Hot-patch BRK instructions for debugging
 
 ### 📋 Planned
 
 - **Graphics & Multimedia**: Integration with Superterminal for advanced graphics, sprites, and audio
-- **Debug info**: Enhanced debugging support with source maps
+- **JIT benchmarks**: Compile-time and execution-time comparison vs AOT compiled binaries
+- **Windows JIT support**: `VirtualAlloc` based allocation
 - **Additional platforms**: Intel Mac, Linux, Windows support
 - **Standard library**: Expanded built-in functions
 

@@ -1,5 +1,7 @@
 # Hashmap Method Calls - Implementation Status
 
+> **Historical snapshot** — This document records the state of hashmap method call implementation at the time it was completed. All hashmap methods are now fully working in both AOT and JIT modes. See the main [README](../README.md) for current project status.
+
 ## ✅ What Was Implemented
 
 ### 1. Parser Support
