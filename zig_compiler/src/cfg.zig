@@ -1046,6 +1046,7 @@ pub const CFGBuilder = struct {
             .repeat_stmt => |rs| try self.processRepeatStatement(stmt, &rs),
             .case_stmt => |cs| try self.processCaseStatement(stmt, &cs),
             .match_type => |mt| try self.processMatchTypeStatement(stmt, &mt),
+            .match_receive => |mr| try self.processMatchReceiveStatement(stmt, &mr),
             .try_catch => |tc| try self.processTryCatchStatement(stmt, &tc),
 
             // ── Unstructured control flow ───────────────────────────────
@@ -1521,6 +1522,57 @@ pub const CFGBuilder = struct {
 
             self.current_block = otherwise_block;
             for (mt.case_else_body) |s| {
+                try self.processStatement(s);
+            }
+            if (!self.cfg.getBlock(self.current_block).hasTerminator()) {
+                try self.cfg.addEdge(self.current_block, merge_block, .fallthrough);
+            }
+        } else {
+            // No CASE ELSE: fall through from last test to merge.
+            try self.cfg.addEdge(prev_test_block, merge_block, .case_next);
+        }
+
+        self.current_block = merge_block;
+    }
+
+    // ── MATCH RECEIVE ───────────────────────────────────────────────────
+
+    fn processMatchReceiveStatement(self: *CFGBuilder, stmt: *const ast.Statement, mr: *const ast.MatchReceiveStmt) !void {
+        // The MATCH RECEIVE statement goes into the current block (it holds
+        // the handle expression for later codegen to pop and inspect).
+        try self.cfg.getBlock(self.current_block).addStatement(self.allocator, stmt);
+        const match_entry = self.current_block;
+        const merge_block = try self.cfg.newBlock(.merge);
+
+        var prev_test_block = match_entry;
+
+        for (mr.case_arms) |arm| {
+            // Test block: compare message blob tag (and optionally type_id)
+            const test_block = try self.cfg.newBlock(.case_test);
+            try self.cfg.addEdge(prev_test_block, test_block, if (prev_test_block == match_entry) .fallthrough else .case_next);
+
+            // Body block: statements for this CASE arm
+            const body_block = try self.cfg.newBlock(.case_body);
+            try self.cfg.addEdge(test_block, body_block, .case_match);
+
+            self.current_block = body_block;
+            for (arm.body) |s| {
+                try self.processStatement(s);
+            }
+            if (!self.cfg.getBlock(self.current_block).hasTerminator()) {
+                try self.cfg.addEdge(self.current_block, merge_block, .fallthrough);
+            }
+
+            prev_test_block = test_block;
+        }
+
+        // CASE ELSE
+        if (mr.case_else_body.len > 0) {
+            const otherwise_block = try self.cfg.newBlock(.case_otherwise);
+            try self.cfg.addEdge(prev_test_block, otherwise_block, .case_next);
+
+            self.current_block = otherwise_block;
+            for (mr.case_else_body) |s| {
                 try self.processStatement(s);
             }
             if (!self.cfg.getBlock(self.current_block).hasTerminator()) {

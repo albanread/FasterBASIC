@@ -76,6 +76,10 @@ void basic_runtime_init(void) {
     g_current_line = 0;
 }
 
+/* ── Forward declarations for message metrics (implemented in messaging.zig) ── */
+extern void msg_metrics_report(void);
+extern int32_t msg_metrics_check_leaks(void);
+
 void basic_runtime_cleanup(void) {
     // Close all open files
     file_close_all();
@@ -91,7 +95,11 @@ void basic_runtime_cleanup(void) {
     if (getenv("BASIC_MEMORY_STATS") != NULL) {
         basic_mem_stats();
         samm_print_stats_always();
+        msg_metrics_report();
     }
+
+    // Always check for message leaks (prints to stderr only if leaks found)
+    msg_metrics_check_leaks();
 }
 
 // =============================================================================

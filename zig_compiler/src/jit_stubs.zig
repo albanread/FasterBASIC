@@ -257,12 +257,55 @@ extern fn basic_mouse_poll() callconv(.c) void;
 
 // ── Worker / Parallel ──
 extern fn worker_spawn(...) callconv(.c) ?*anyopaque;
+extern fn worker_spawn_messaging(...) callconv(.c) ?*anyopaque;
 extern fn worker_await(...) callconv(.c) f64;
 extern fn worker_ready(...) callconv(.c) i32;
 extern fn worker_args_alloc(...) callconv(.c) ?*anyopaque;
 extern fn worker_args_set_double(...) callconv(.c) void;
 extern fn worker_args_set_int(...) callconv(.c) void;
 extern fn worker_args_set_ptr(...) callconv(.c) void;
+extern fn worker_future_outbox_offset() callconv(.c) i32;
+extern fn worker_future_inbox_offset() callconv(.c) i32;
+
+// ── Worker Messaging ──
+extern fn msg_queue_create() callconv(.c) ?*anyopaque;
+extern fn msg_queue_destroy(...) callconv(.c) void;
+extern fn msg_queue_push(...) callconv(.c) i32;
+extern fn msg_queue_pop(...) callconv(.c) ?*anyopaque;
+extern fn msg_queue_has_message(...) callconv(.c) i32;
+extern fn msg_queue_close(...) callconv(.c) void;
+extern fn msg_send_double(...) callconv(.c) i32;
+extern fn msg_send_int(...) callconv(.c) i32;
+extern fn msg_send_string(...) callconv(.c) i32;
+extern fn msg_send_udt(...) callconv(.c) i32;
+extern fn msg_send_marshalled(...) callconv(.c) i32;
+extern fn msg_send_udt_typed(...) callconv(.c) i32;
+extern fn msg_send_class(...) callconv(.c) i32;
+extern fn msg_receive_double(...) callconv(.c) f64;
+extern fn msg_receive_int(...) callconv(.c) i32;
+extern fn msg_receive_string(...) callconv(.c) ?*anyopaque;
+extern fn msg_receive_udt(...) callconv(.c) void;
+extern fn msg_receive_marshalled(...) callconv(.c) ?*anyopaque;
+extern fn msg_cancel(...) callconv(.c) void;
+extern fn msg_is_cancelled(...) callconv(.c) i32;
+extern fn msg_get_outbox(...) callconv(.c) ?*anyopaque;
+extern fn msg_get_inbox(...) callconv(.c) ?*anyopaque;
+extern fn msg_drain_and_destroy(...) callconv(.c) void;
+extern fn msg_marshall_double(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_int(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_signal(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_udt_typed(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_class(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_string(...) callconv(.c) ?*anyopaque;
+extern fn msg_marshall_array(...) callconv(.c) ?*anyopaque;
+extern fn msg_blob_free(...) callconv(.c) void;
+extern fn msg_blob_tag(...) callconv(.c) i32;
+extern fn msg_blob_type_id(...) callconv(.c) i32;
+extern fn msg_unmarshall_double(...) callconv(.c) f64;
+extern fn msg_unmarshall_int(...) callconv(.c) i32;
+extern fn msg_unmarshall_string(...) callconv(.c) ?*anyopaque;
+extern fn msg_unmarshall_udt(...) callconv(.c) void;
+extern fn msg_unmarshall_array(...) callconv(.c) void;
 
 // ── Marshalling ──
 extern fn marshall_array(...) callconv(.c) ?*anyopaque;
@@ -679,12 +722,55 @@ const entry_names = [_][]const u8{
 
     // ── Worker / Parallel ──
     "_worker_spawn",
+    "_worker_spawn_messaging",
     "_worker_await",
     "_worker_ready",
     "_worker_args_alloc",
     "_worker_args_set_double",
     "_worker_args_set_int",
     "_worker_args_set_ptr",
+    "_worker_future_outbox_offset",
+    "_worker_future_inbox_offset",
+
+    // ── Worker Messaging ──
+    "_msg_queue_create",
+    "_msg_queue_destroy",
+    "_msg_queue_push",
+    "_msg_queue_pop",
+    "_msg_queue_has_message",
+    "_msg_queue_close",
+    "_msg_send_double",
+    "_msg_send_int",
+    "_msg_send_string",
+    "_msg_send_udt",
+    "_msg_send_marshalled",
+    "_msg_send_udt_typed",
+    "_msg_send_class",
+    "_msg_receive_double",
+    "_msg_receive_int",
+    "_msg_receive_string",
+    "_msg_receive_udt",
+    "_msg_receive_marshalled",
+    "_msg_cancel",
+    "_msg_is_cancelled",
+    "_msg_get_outbox",
+    "_msg_get_inbox",
+    "_msg_drain_and_destroy",
+    "_msg_marshall_double",
+    "_msg_marshall_int",
+    "_msg_marshall_signal",
+    "_msg_marshall_udt_typed",
+    "_msg_marshall_class",
+    "_msg_marshall_string",
+    "_msg_marshall_array",
+    "_msg_blob_free",
+    "_msg_blob_tag",
+    "_msg_blob_type_id",
+    "_msg_unmarshall_double",
+    "_msg_unmarshall_int",
+    "_msg_unmarshall_string",
+    "_msg_unmarshall_udt",
+    "_msg_unmarshall_array",
 
     // ── Marshalling ──
     "_marshall_array",
@@ -1096,12 +1182,55 @@ fn initEntries() void {
 
         // ── Worker / Parallel ──
         fnAddr(worker_spawn),
+        fnAddr(worker_spawn_messaging),
         fnAddr(worker_await),
         fnAddr(worker_ready),
         fnAddr(worker_args_alloc),
         fnAddr(worker_args_set_double),
         fnAddr(worker_args_set_int),
         fnAddr(worker_args_set_ptr),
+        fnAddr(worker_future_outbox_offset),
+        fnAddr(worker_future_inbox_offset),
+
+        // ── Worker Messaging ──
+        fnAddr(msg_queue_create),
+        fnAddr(msg_queue_destroy),
+        fnAddr(msg_queue_push),
+        fnAddr(msg_queue_pop),
+        fnAddr(msg_queue_has_message),
+        fnAddr(msg_queue_close),
+        fnAddr(msg_send_double),
+        fnAddr(msg_send_int),
+        fnAddr(msg_send_string),
+        fnAddr(msg_send_udt),
+        fnAddr(msg_send_marshalled),
+        fnAddr(msg_send_udt_typed),
+        fnAddr(msg_send_class),
+        fnAddr(msg_receive_double),
+        fnAddr(msg_receive_int),
+        fnAddr(msg_receive_string),
+        fnAddr(msg_receive_udt),
+        fnAddr(msg_receive_marshalled),
+        fnAddr(msg_cancel),
+        fnAddr(msg_is_cancelled),
+        fnAddr(msg_get_outbox),
+        fnAddr(msg_get_inbox),
+        fnAddr(msg_drain_and_destroy),
+        fnAddr(msg_marshall_double),
+        fnAddr(msg_marshall_int),
+        fnAddr(msg_marshall_signal),
+        fnAddr(msg_marshall_udt_typed),
+        fnAddr(msg_marshall_class),
+        fnAddr(msg_marshall_string),
+        fnAddr(msg_marshall_array),
+        fnAddr(msg_blob_free),
+        fnAddr(msg_blob_tag),
+        fnAddr(msg_blob_type_id),
+        fnAddr(msg_unmarshall_double),
+        fnAddr(msg_unmarshall_int),
+        fnAddr(msg_unmarshall_string),
+        fnAddr(msg_unmarshall_udt),
+        fnAddr(msg_unmarshall_array),
 
         // ── Marshalling ──
         fnAddr(marshall_array),

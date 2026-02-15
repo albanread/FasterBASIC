@@ -620,5 +620,7 @@ NEXT E
 
 ## Further Reading
 
+- [MATCH RECEIVE — Typed Message Dispatch](match-receive.md) — the same dispatch pattern applied to worker messages instead of list elements
 - [Classes and Objects](classes-and-objects.md) — the full CLASS system: fields, methods, inheritance, constructors, destructors, and virtual dispatch
+- [Workers: Safe Concurrency](workers.md) — the full worker system: SPAWN, AWAIT, SEND, RECEIVE, MARSHALL, and cooperative cancellation
 - [NEON SIMD Support](neon-simd-support.md) — automatic vectorization for User-Defined Types

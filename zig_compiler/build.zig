@@ -224,6 +224,7 @@ pub fn build(b: *std.Build) void {
         "binary_io",
         "array_ops",
         "marshalling",
+        "messaging",
         "terminal_io",
     };
 

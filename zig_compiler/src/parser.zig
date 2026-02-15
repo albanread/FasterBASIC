@@ -290,6 +290,8 @@ pub const Parser = struct {
             .kw_sub => self.parseSubStatement(),
             .kw_worker => self.parseWorkerStatement(),
             .kw_unmarshall => self.parseUnmarshallStatement(),
+            .kw_send => self.parseSendStatement(),
+            .kw_cancel => self.parseCancelStatement(),
             .kw_call => self.parseCallStatement(),
             .kw_def => self.parseDefStatement(),
             .kw_class => self.parseClassDeclaration(),
@@ -2408,6 +2410,38 @@ pub const Parser = struct {
         } });
     }
 
+    /// Parse SEND handle, expression
+    /// Sends a marshalled message to a worker or to PARENT.
+    fn parseSendStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume SEND
+
+        // The handle is either PARENT or an expression (future handle variable)
+        const handle = try self.parseExpression();
+
+        _ = try self.consume(.comma, "Expected ',' between handle and message in SEND");
+
+        const message = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{ .send = .{
+            .handle = handle,
+            .message = message,
+        } });
+    }
+
+    /// Parse CANCEL handle
+    /// Sends a cancellation signal to a running worker.
+    fn parseCancelStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume CANCEL
+
+        const handle = try self.parseExpression();
+
+        return self.builder.stmt(loc, .{ .cancel = .{
+            .handle = handle,
+        } });
+    }
+
     fn parseCallStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
 
@@ -3582,6 +3616,11 @@ pub const Parser = struct {
         const loc = self.currentLocation();
         _ = self.advance(); // consume MATCH
 
+        // MATCH RECEIVE(handle) — dispatch to message-type matching
+        if (self.check(.kw_receive)) {
+            return self.parseMatchReceiveStatement(loc);
+        }
+
         // Consume optional TYPE keyword after MATCH.
         if (self.check(.kw_type)) {
             _ = self.advance();
@@ -3728,6 +3767,170 @@ pub const Parser = struct {
         return self.builder.stmt(loc, .{ .match_type = .{
             .match_expression = match_expr,
             .case_arms = try self.allocator.dupe(ast.MatchTypeStmt.CaseArm, case_arms.items),
+            .case_else_body = case_else_body,
+        } });
+    }
+
+    /// Parse MATCH RECEIVE(handle) — pop a message and dispatch on its
+    /// type tag.  Arms can match scalar types (DOUBLE, INTEGER, STRING),
+    /// specific UDT type names, or specific CLASS names.
+    ///
+    /// Syntax:
+    ///   MATCH RECEIVE(handle)
+    ///     CASE DOUBLE x
+    ///       ...
+    ///     CASE INTEGER n%
+    ///       ...
+    ///     CASE STRING s$
+    ///       ...
+    ///     CASE Point p          ' specific UDT
+    ///       ...
+    ///     CASE Dog d            ' specific CLASS
+    ///       ...
+    ///     CASE ELSE
+    ///       ...
+    ///   END MATCH
+    fn parseMatchReceiveStatement(self: *Parser, loc: ast.SourceLocation) ExprError!ast.StmtPtr {
+        _ = self.advance(); // consume RECEIVE
+
+        // Parse (handle_expression)
+        _ = try self.consume(.lparen, "Expected '(' after MATCH RECEIVE");
+        const handle_expr = try self.parseExpression();
+        _ = try self.consume(.rparen, "Expected ')' after handle expression");
+
+        if (self.check(.end_of_line)) _ = self.advance();
+
+        var case_arms: std.ArrayList(ast.MatchReceiveStmt.CaseArm) = .empty;
+        defer case_arms.deinit(self.allocator);
+
+        var case_else_body: []ast.StmtPtr = @constCast(&.{});
+
+        while (!self.isAtEnd()) {
+            self.skipBlankLines();
+
+            // Check for END MATCH / ENDMATCH
+            if (self.check(.kw_endmatch)) {
+                _ = self.advance();
+                break;
+            }
+            if (self.check(.kw_end)) {
+                if (self.pos + 1 < self.tokens.len) {
+                    const next = self.tokens[self.pos + 1];
+                    if (next.tag == .kw_match) {
+                        _ = self.advance(); // consume END
+                        _ = self.advance(); // consume MATCH
+                        break;
+                    }
+                }
+                break;
+            }
+
+            // Parse CASE arm
+            if (self.check(.kw_case)) {
+                _ = self.advance(); // consume CASE
+
+                // CASE ELSE
+                if (self.check(.kw_else)) {
+                    _ = self.advance();
+                    if (self.check(.end_of_line)) _ = self.advance();
+
+                    var else_stmts: std.ArrayList(ast.StmtPtr) = .empty;
+                    defer else_stmts.deinit(self.allocator);
+
+                    while (!self.isAtEnd()) {
+                        self.skipBlankLines();
+                        if (self.check(.kw_case) or self.check(.kw_endmatch) or self.check(.kw_end)) break;
+                        try else_stmts.append(self.allocator, try self.parseStatement());
+                        if (self.check(.end_of_line)) _ = self.advance();
+                    }
+                    case_else_body = try self.allocator.dupe(ast.StmtPtr, else_stmts.items);
+                    continue;
+                }
+
+                // CASE <type> [binding_var]
+                var type_keyword: []const u8 = "";
+                var binding_variable: []const u8 = "";
+                var binding_suffix: ?Tag = null;
+                var is_class_match = false;
+                var match_class_name: []const u8 = "";
+                var is_udt_match = false;
+                var udt_type_name: []const u8 = "";
+
+                if (self.isTypeKeyword()) {
+                    type_keyword = self.current().lexeme;
+                    _ = self.advance();
+                } else if (self.check(.identifier)) {
+                    // Could be a class name, UDT name, or OBJECT keyword.
+                    // The parser stores the name; codegen disambiguates via
+                    // the symbol table (lookupType vs lookupClass).
+                    const type_name = self.current().lexeme;
+                    _ = self.advance();
+
+                    if (std.ascii.eqlIgnoreCase(type_name, "OBJECT")) {
+                        type_keyword = type_name;
+                    } else {
+                        // Store the name in both fields — codegen will check
+                        // the symbol table to determine UDT vs CLASS.
+                        is_udt_match = true;
+                        udt_type_name = type_name;
+                        is_class_match = true;
+                        match_class_name = type_name;
+                    }
+                } else {
+                    try self.addError("Expected type name after CASE in MATCH RECEIVE");
+                    return error.ParseError;
+                }
+
+                // Optional binding variable name
+                if (self.check(.identifier)) {
+                    binding_variable = self.current().lexeme;
+                    _ = self.advance();
+                    if (self.isTypeSuffix()) {
+                        binding_suffix = self.current().tag;
+                        _ = self.advance();
+                    }
+                } else if (self.current().isKeyword() and !self.check(.end_of_line) and !self.check(.kw_case) and !self.check(.kw_end)) {
+                    binding_variable = self.current().lexeme;
+                    _ = self.advance();
+                    if (self.isTypeSuffix()) {
+                        binding_suffix = self.current().tag;
+                        _ = self.advance();
+                    }
+                }
+
+                if (self.check(.end_of_line)) _ = self.advance();
+
+                // Parse body statements for this CASE arm.
+                var body: std.ArrayList(ast.StmtPtr) = .empty;
+                defer body.deinit(self.allocator);
+
+                while (!self.isAtEnd()) {
+                    self.skipBlankLines();
+                    if (self.check(.kw_case) or self.check(.kw_endmatch) or self.check(.kw_end)) break;
+                    try body.append(self.allocator, try self.parseStatement());
+                    if (self.check(.end_of_line)) _ = self.advance();
+                }
+
+                try case_arms.append(self.allocator, .{
+                    .type_keyword = type_keyword,
+                    .binding_variable = binding_variable,
+                    .binding_suffix = binding_suffix,
+                    .body = try self.allocator.dupe(ast.StmtPtr, body.items),
+                    .is_class_match = is_class_match,
+                    .match_class_name = match_class_name,
+                    .is_udt_match = is_udt_match,
+                    .udt_type_name = udt_type_name,
+                });
+            } else {
+                _ = self.advance();
+            }
+        }
+
+        if (self.check(.end_of_line)) _ = self.advance();
+
+        return self.builder.stmt(loc, .{ .match_receive = .{
+            .handle_expression = handle_expr,
+            .case_arms = try self.allocator.dupe(ast.MatchReceiveStmt.CaseArm, case_arms.items),
             .case_else_body = case_else_body,
         } });
     }
@@ -4617,6 +4820,40 @@ pub const Parser = struct {
                 return self.builder.expr(loc, .{ .ready = .{
                     .future = future_expr,
                 } });
+            },
+            .kw_receive => {
+                _ = self.advance(); // consume RECEIVE
+                _ = try self.consume(.lparen, "Expected '(' after RECEIVE");
+                const handle_expr = try self.parseExpression();
+                _ = try self.consume(.rparen, "Expected ')' after RECEIVE argument");
+                return self.builder.expr(loc, .{ .receive = .{
+                    .handle = handle_expr,
+                } });
+            },
+            .kw_hasmessage => {
+                _ = self.advance(); // consume HASMESSAGE
+                _ = try self.consume(.lparen, "Expected '(' after HASMESSAGE");
+                const handle_expr = try self.parseExpression();
+                _ = try self.consume(.rparen, "Expected ')' after HASMESSAGE argument");
+                return self.builder.expr(loc, .{ .has_message = .{
+                    .handle = handle_expr,
+                } });
+            },
+            .kw_parent => {
+                _ = self.advance(); // consume PARENT
+                return self.builder.expr(loc, .{ .parent = {} });
+            },
+            .kw_cancelled => {
+                _ = self.advance(); // consume CANCELLED
+                _ = try self.consume(.lparen, "Expected '(' after CANCELLED");
+                // CANCELLED only takes PARENT as argument
+                if (!self.check(.kw_parent)) {
+                    try self.addError("CANCELLED() requires PARENT as argument");
+                    return error.ParseError;
+                }
+                _ = self.advance(); // consume PARENT
+                _ = try self.consume(.rparen, "Expected ')' after CANCELLED(PARENT)");
+                return self.builder.expr(loc, .{ .cancelled = {} });
             },
             .kw_marshall => {
                 _ = self.advance(); // consume MARSHALL

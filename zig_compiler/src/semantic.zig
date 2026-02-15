@@ -592,6 +592,8 @@ pub const FunctionSymbol = struct {
     body: ?*const ast.Expression = null,
     /// True if this is a WORKER (isolated concurrency function).
     is_worker: bool = false,
+    /// True if this WORKER uses messaging (SEND/RECEIVE/HASMESSAGE via PARENT).
+    uses_messaging: bool = false,
 };
 
 /// A line number symbol.
@@ -1424,6 +1426,78 @@ pub const SemanticAnalyzer = struct {
                     for (arm.body) |s| try self.collectDeclaration(s);
                 }
                 for (mt.case_else_body) |s| try self.collectDeclaration(s);
+            },
+            // Recurse into MATCH RECEIVE blocks — same binding-variable
+            // registration logic as MATCH TYPE, but arms may reference
+            // specific UDT or CLASS names for typed message dispatch.
+            .match_receive => |mr| {
+                for (mr.case_arms) |arm| {
+                    if (arm.binding_variable.len > 0) {
+                        var bt: BaseType = .double;
+                        if (arm.is_udt_match and arm.udt_type_name.len > 0) {
+                            // Check if it's a CLASS first, then UDT
+                            var tu_buf: [128]u8 = undefined;
+                            const tu_len = @min(arm.udt_type_name.len, tu_buf.len);
+                            for (0..tu_len) |i| tu_buf[i] = std.ascii.toUpper(arm.udt_type_name[i]);
+                            const tu_upper = tu_buf[0..tu_len];
+                            if (self.symbol_table.lookupClass(tu_upper) != null) {
+                                bt = .class_instance;
+                            } else {
+                                bt = .user_defined;
+                            }
+                        } else if (arm.is_class_match) {
+                            bt = .class_instance;
+                        } else if (arm.type_keyword.len > 0) {
+                            const kw = arm.type_keyword;
+                            if (std.ascii.eqlIgnoreCase(kw, "INTEGER")) {
+                                bt = .integer;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "DOUBLE")) {
+                                bt = .double;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "SINGLE")) {
+                                bt = .single;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "STRING")) {
+                                bt = .string;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "LONG")) {
+                                bt = .long;
+                            } else if (std.ascii.eqlIgnoreCase(kw, "OBJECT")) {
+                                bt = .class_instance;
+                            }
+                        } else if (arm.binding_suffix) |suf| {
+                            bt = switch (suf) {
+                                .type_int, .percent => .integer,
+                                .type_double, .hash => .double,
+                                .type_float, .exclamation => .single,
+                                .type_string => .string,
+                                .ampersand => .long,
+                                else => .double,
+                            };
+                        }
+                        const name = arm.binding_variable;
+                        var upper_buf: [128]u8 = undefined;
+                        const ulen = @min(name.len, upper_buf.len);
+                        for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(name[i]);
+                        const upper_name = upper_buf[0..ulen];
+                        if (self.symbol_table.lookupVariable(upper_name) == null) {
+                            const key = try self.allocator.dupe(u8, upper_name);
+                            const td = if (bt == .class_instance and arm.match_class_name.len > 0)
+                                TypeDescriptor.fromClass(arm.match_class_name)
+                            else if (bt == .user_defined and arm.udt_type_name.len > 0)
+                                TypeDescriptor.fromUDT(arm.udt_type_name, self.symbol_table.getTypeId(arm.udt_type_name) orelse -1)
+                            else
+                                TypeDescriptor.fromBase(bt);
+                            try self.symbol_table.insertVariable(key, .{
+                                .name = name,
+                                .type_desc = td,
+                                .is_declared = false,
+                                .first_use = stmt.loc,
+                                .scope = if (self.in_function) Scope.makeFunction(self.current_function_name) else Scope.makeGlobal(),
+                                .is_global = !self.in_function,
+                            });
+                        }
+                    }
+                    for (arm.body) |s| try self.collectDeclaration(s);
+                }
+                for (mr.case_else_body) |s| try self.collectDeclaration(s);
             },
             // Auto-register INPUT target variables (INPUT X%, Y$).
             .input => |inp| {
@@ -2355,6 +2429,9 @@ pub const SemanticAnalyzer = struct {
             self.current_line_number = line.line_number;
             for (line.statements) |stmt_ptr| {
                 try self.validateStatement(stmt_ptr);
+                // Tag forward (bounce) arms in MATCH RECEIVE statements.
+                // Must run with the mutable StmtPtr so we can set is_forward.
+                self.detectForwardArms(stmt_ptr);
             }
         }
 
@@ -2621,8 +2698,156 @@ pub const SemanticAnalyzer = struct {
             .expression_stmt => |es| {
                 for (es.arguments) |arg| try self.validateExpression(arg);
             },
+            .send => |sd| {
+                try self.validateExpression(sd.handle);
+                try self.validateExpression(sd.message);
+            },
+            .cancel => |cn| {
+                try self.validateExpression(cn.handle);
+            },
+            .match_receive => |mr| {
+                try self.validateExpression(mr.handle_expression);
+                for (mr.case_arms) |arm| {
+                    for (arm.body) |s| try self.validateStatement(s);
+                }
+                for (mr.case_else_body) |s| try self.validateStatement(s);
+            },
+            // Note: forward-arm detection (is_forward tagging) runs in
+            // detectForwardArms via pass2Validate with mutable StmtPtr.
             else => {},
         }
+    }
+
+    // ── Forward-arm detection (bounce pattern) ──────────────────────────
+
+    /// Scan a statement for MATCH RECEIVE blocks and tag arms that contain
+    /// a SEND back to the same handle with the binding variable as payload.
+    /// This is the "bounce" / "ping-pong" pattern:
+    ///
+    ///     MATCH RECEIVE(PARENT)
+    ///         CASE Point p
+    ///             p.x = p.x + 1
+    ///             SEND PARENT, p    ← detected: same handle, same binding var
+    ///     END MATCH
+    ///
+    /// Tagged arms get `is_forward = true` so codegen can emit zero-copy
+    /// forwarding (msg_blob_payload_ptr + msg_blob_forward) instead of the
+    /// normal unmarshal → re-marshal → push cycle.
+    ///
+    /// Only flat UDT/CLASS types (no string fields) are eligible — string
+    /// fields would require SAMM scope coordination across threads.
+    ///
+    /// Called from pass2Validate with the mutable StmtPtr.
+    fn detectForwardArms(self: *SemanticAnalyzer, stmt: *ast.Statement) void {
+        switch (stmt.data) {
+            .match_receive => |*mr| {
+                const handle_is_parent = (mr.handle_expression.data == .parent);
+
+                for (mr.case_arms) |*arm| {
+                    // Must be a UDT or CLASS arm with a binding variable.
+                    if (arm.binding_variable.len == 0) continue;
+                    if (!arm.is_udt_match and !arm.is_class_match) continue;
+
+                    // Reject types with string fields.
+                    if (self.typeHasStringFields(arm)) continue;
+
+                    // Scan body for SEND <same-handle>, <binding-var>.
+                    if (self.bodyHasBounce(arm.body, arm.binding_variable, handle_is_parent)) {
+                        arm.is_forward = true;
+                    }
+                }
+            },
+            // Recurse into compound statements so nested MATCH RECEIVEs
+            // (e.g. inside IF or WHILE inside a worker) are also tagged.
+            .if_stmt => |ifs| {
+                for (ifs.then_statements) |s| self.detectForwardArms(s);
+                for (ifs.elseif_clauses) |clause| {
+                    for (clause.statements) |s| self.detectForwardArms(s);
+                }
+                for (ifs.else_statements) |s| self.detectForwardArms(s);
+            },
+            .for_stmt => |fs| {
+                for (fs.body) |s| self.detectForwardArms(s);
+            },
+            .while_stmt => |ws| {
+                for (ws.body) |s| self.detectForwardArms(s);
+            },
+            .do_stmt => |ds| {
+                for (ds.body) |s| self.detectForwardArms(s);
+            },
+            .repeat_stmt => |rs| {
+                for (rs.body) |s| self.detectForwardArms(s);
+            },
+            .worker => |wkr| {
+                for (wkr.body) |s| self.detectForwardArms(s);
+            },
+            .function => |fd| {
+                for (fd.body) |s| self.detectForwardArms(s);
+            },
+            .sub => |sd| {
+                for (sd.body) |s| self.detectForwardArms(s);
+            },
+            else => {},
+        }
+    }
+
+    /// Check whether a UDT/CLASS arm's type has string fields.
+    /// Returns true if strings are present (not eligible for zero-copy).
+    fn typeHasStringFields(self: *SemanticAnalyzer, arm: *const ast.MatchReceiveStmt.CaseArm) bool {
+        if (arm.is_udt_match and arm.udt_type_name.len > 0) {
+            var tu_buf: [128]u8 = undefined;
+            const tu_upper = upperBuf(arm.udt_type_name, &tu_buf) orelse return true;
+            if (self.symbol_table.lookupType(tu_upper)) |ts| {
+                for (ts.fields) |field| {
+                    if (field.type_desc.base_type == .string) return true;
+                }
+            }
+            return false;
+        }
+        if (arm.is_class_match and arm.match_class_name.len > 0) {
+            var tc_buf: [128]u8 = undefined;
+            const tc_upper = upperBuf(arm.match_class_name, &tc_buf) orelse return true;
+            if (self.symbol_table.lookupClass(tc_upper)) |cls| {
+                for (cls.fields) |field| {
+                    if (field.type_desc.base_type == .string) return true;
+                }
+            }
+            return false;
+        }
+        return true; // unknown type — assume not eligible
+    }
+
+    /// Scan a body statement list for SEND <handle>, <var> where the
+    /// handle direction matches and the message is the binding variable.
+    fn bodyHasBounce(
+        self: *SemanticAnalyzer,
+        body: []ast.StmtPtr,
+        binding_var: []const u8,
+        handle_is_parent: bool,
+    ) bool {
+        _ = self;
+        var bind_buf: [128]u8 = undefined;
+        const bind_upper = upperBuf(binding_var, &bind_buf) orelse return false;
+
+        for (body) |s| {
+            if (s.data != .send) continue;
+            const sd = s.data.send;
+
+            // Handle must match direction (both PARENT or both variable).
+            const send_is_parent = (sd.handle.data == .parent);
+            if (send_is_parent != handle_is_parent) continue;
+
+            // Message must be a bare variable matching the binding var.
+            switch (sd.message.data) {
+                .variable => |v| {
+                    var vbuf: [128]u8 = undefined;
+                    const v_upper = upperBuf(v.name, &vbuf) orelse continue;
+                    if (std.mem.eql(u8, v_upper, bind_upper)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
     }
 
     /// Validate a statement inside a WORKER body.  This is the main
@@ -2760,6 +2985,22 @@ pub const SemanticAnalyzer = struct {
             .delete,
             .unmarshall,
             => {},
+            // Allow SEND (workers can SEND PARENT, msg) and CANCEL
+            .send => |sd| {
+                try self.validateWorkerExpression(sd.handle, stmt.loc);
+                try self.validateWorkerExpression(sd.message, stmt.loc);
+            },
+            .match_receive => |mr| {
+                try self.validateWorkerExpression(mr.handle_expression, stmt.loc);
+                for (mr.case_arms) |arm| {
+                    for (arm.body) |s| try self.validateWorkerStatement(s);
+                }
+            },
+            .cancel => |cn| {
+                // CANCEL is not allowed inside workers (can't cancel other workers)
+                _ = cn;
+                try self.addError(.worker_isolation_violation, "CANCEL not allowed inside a WORKER (no nested worker control)", stmt.loc);
+            },
             // Worker definitions cannot be nested.
             .worker => {
                 try self.addError(.worker_isolation_violation, "WORKER cannot be nested inside another WORKER", stmt.loc);
@@ -2814,6 +3055,33 @@ pub const SemanticAnalyzer = struct {
             },
             .spawn => {
                 try self.addError(.worker_isolation_violation, "SPAWN not allowed inside a WORKER (no nested workers)", loc);
+            },
+            .parent => {
+                // PARENT is explicitly allowed inside workers — it's the messaging handle.
+                // Mark the current worker as messaging-enabled.
+                if (self.current_function_name.len > 0) {
+                    var fn_upper_buf: [128]u8 = undefined;
+                    const fn_upper = upperBuf(self.current_function_name, &fn_upper_buf) orelse self.current_function_name;
+                    if (self.symbol_table.functions.getPtr(fn_upper)) |fsym| {
+                        fsym.uses_messaging = true;
+                    }
+                }
+            },
+            .receive => |r| {
+                try self.validateWorkerExpression(r.handle, loc);
+            },
+            .has_message => |h| {
+                try self.validateWorkerExpression(h.handle, loc);
+            },
+            .cancelled => {
+                // CANCELLED(PARENT) is allowed — mark worker as messaging-enabled.
+                if (self.current_function_name.len > 0) {
+                    var fn_upper_buf2: [128]u8 = undefined;
+                    const fn_upper2 = upperBuf(self.current_function_name, &fn_upper_buf2) orelse self.current_function_name;
+                    if (self.symbol_table.functions.getPtr(fn_upper2)) |fsym| {
+                        fsym.uses_messaging = true;
+                    }
+                }
             },
             .variable => |v| {
                 try self.validateWorkerVarAccess(v.name, loc);
@@ -2909,6 +3177,24 @@ pub const SemanticAnalyzer = struct {
             .spawn => |sp| {
                 for (sp.arguments) |arg| try self.validateExpression(arg);
             },
+            .receive => |r| {
+                try self.validateExpression(r.handle);
+            },
+            .has_message => |h| {
+                try self.validateExpression(h.handle);
+            },
+            .parent => {
+                // PARENT outside a worker is an error
+                if (!self.in_worker) {
+                    try self.addError(.type_mismatch, "PARENT can only be used inside a WORKER block", expr.loc);
+                }
+            },
+            .cancelled => {
+                // CANCELLED outside a worker is an error
+                if (!self.in_worker) {
+                    try self.addError(.type_mismatch, "CANCELLED(PARENT) can only be used inside a WORKER block", expr.loc);
+                }
+            },
             .await_expr => |aw| {
                 try self.validateExpression(aw.future);
             },
@@ -2946,6 +3232,10 @@ pub const SemanticAnalyzer = struct {
             .spawn => TypeDescriptor.fromBase(.long), // FUTURE handle is a pointer (64-bit)
             .await_expr => TypeDescriptor.fromBase(.double), // AWAIT returns double (runtime converts)
             .ready => TypeDescriptor.fromBase(.integer), // READY returns 0 or 1
+            .receive => TypeDescriptor.fromBase(.double), // RECEIVE returns double by default (runtime converts)
+            .has_message => TypeDescriptor.fromBase(.integer), // HASMESSAGE returns 0 or 1
+            .parent => TypeDescriptor.fromBase(.long), // PARENT is a handle (pointer)
+            .cancelled => TypeDescriptor.fromBase(.integer), // CANCELLED returns 0 or 1
             .marshall => TypeDescriptor.fromBase(.marshalled), // MARSHALL returns opaque blob pointer
         };
     }

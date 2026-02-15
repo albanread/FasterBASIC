@@ -13,7 +13,7 @@
 const std = @import("std");
 const token = @import("token.zig");
 const Tag = token.Tag;
-const SourceLocation = token.SourceLocation;
+pub const SourceLocation = token.SourceLocation;
 
 // ─── Pointer types ──────────────────────────────────────────────────────────
 
@@ -78,6 +78,14 @@ pub const ExprData = union(enum) {
     ready: ReadyExpr,
     /// MARSHALL(variable) — deep-copy array/UDT for worker transfer
     marshall: MarshallExpr,
+    /// RECEIVE(handle) or RECEIVE(PARENT) — blocking message receive
+    receive: ReceiveExpr,
+    /// HASMESSAGE(handle) or HASMESSAGE(PARENT) — non-blocking check
+    has_message: HasMessageExpr,
+    /// PARENT — pseudo-handle to spawner (only valid inside WORKER)
+    parent: void,
+    /// CANCELLED(PARENT) — check if cancellation was requested
+    cancelled: void,
 };
 
 pub const BinaryExpr = struct {
@@ -268,6 +276,12 @@ pub const StmtData = union(enum) {
     // ── Workers (concurrency) ───────────────────────────────────────────
     worker: WorkerStmt,
     unmarshall: UnmarshallStmt,
+    /// SEND handle, expression — send a marshalled message
+    send: SendStmt,
+    /// CANCEL handle — send cancellation signal to worker
+    cancel: CancelStmt,
+    /// MATCH RECEIVE(handle) — dispatch on message type
+    match_receive: MatchReceiveStmt,
 
     // ── CLASS / Object system ───────────────────────────────────────────
     class: ClassStmt,
@@ -556,6 +570,32 @@ pub const MatchTypeStmt = struct {
     };
 
     match_expression: ExprPtr,
+    case_arms: []CaseArm,
+    case_else_body: []StmtPtr = &.{},
+};
+
+/// MATCH RECEIVE(handle) — pop a message and dispatch on its type tag.
+/// Arms can match scalar types (DOUBLE, INTEGER, STRING), specific UDT
+/// type names, or specific CLASS names.  The binding variable in each arm
+/// receives the unmarshalled value.
+pub const MatchReceiveStmt = struct {
+    pub const CaseArm = struct {
+        type_keyword: []const u8 = "",
+        binding_variable: []const u8 = "",
+        binding_suffix: ?Tag = null,
+        body: []StmtPtr = &.{},
+        is_class_match: bool = false,
+        match_class_name: []const u8 = "",
+        is_udt_match: bool = false,
+        udt_type_name: []const u8 = "",
+        /// Set by the semantic analyzer when the arm's body contains a
+        /// SEND back to the same handle with the binding variable as
+        /// payload (the "bounce" pattern).  Codegen uses this to emit
+        /// zero-copy forwarding instead of unmarshal + re-marshal.
+        is_forward: bool = false,
+    };
+
+    handle_expression: ExprPtr,
     case_arms: []CaseArm,
     case_else_body: []StmtPtr = &.{},
 };
@@ -861,6 +901,28 @@ pub const AwaitExpr = struct {
 /// READY(future) — non-blocking check, returns 1 (true) or 0 (false).
 pub const ReadyExpr = struct {
     future: ExprPtr,
+};
+
+/// RECEIVE(handle) — blocking message receive expression.
+/// handle is either a future handle variable or a PARENT pseudo-handle.
+pub const ReceiveExpr = struct {
+    handle: ExprPtr,
+};
+
+/// HASMESSAGE(handle) — non-blocking check if messages are queued.
+pub const HasMessageExpr = struct {
+    handle: ExprPtr,
+};
+
+/// SEND handle, expression — send a marshalled message to worker or parent.
+pub const SendStmt = struct {
+    handle: ExprPtr,
+    message: ExprPtr,
+};
+
+/// CANCEL handle — send cancellation signal to a worker.
+pub const CancelStmt = struct {
+    handle: ExprPtr,
 };
 
 /// MARSHALL(variable) — deep-copy an array or UDT into a portable blob.
@@ -1440,7 +1502,7 @@ test "all expression variants can be constructed" {
     const variants = comptime std.meta.fields(ExprData);
     try std.testing.expect(variants.len > 0);
     // Just verify we have the expected count of expression types
-    try std.testing.expectEqual(@as(usize, 23), variants.len);
+    try std.testing.expectEqual(@as(usize, 27), variants.len);
 }
 
 test "all statement variants can be constructed" {

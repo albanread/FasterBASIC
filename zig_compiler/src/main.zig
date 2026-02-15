@@ -1324,6 +1324,7 @@ pub fn main() !void {
                         "binary_io",
                         "array_ops",
                         "marshalling",
+                        "messaging",
                         "terminal_io",
                     };
                     for (zig_runtime_libs) |lib_name| {

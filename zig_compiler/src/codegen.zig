@@ -1073,18 +1073,64 @@ pub const RuntimeLibrary = struct {
 
         // Worker / concurrency runtime
         try self.declare("worker_spawn", "l %func_ptr, l %args, w %num_args, w %ret_type");
+        try self.declare("worker_spawn_messaging", "l %func_ptr, l %args, w %num_args, w %ret_type");
         try self.declare("worker_await", "l %handle");
         try self.declare("worker_ready", "l %handle");
         try self.declare("worker_args_alloc", "w %num_args");
         try self.declare("worker_args_set_double", "l %args, w %index, d %value");
         try self.declare("worker_args_set_int", "l %args, w %index, w %value");
         try self.declare("worker_args_set_ptr", "l %args, w %index, l %value");
+        try self.declare("worker_future_outbox_offset", "");
+        try self.declare("worker_future_inbox_offset", "");
         try self.declare("marshall_array", "l %desc_ptr");
         try self.declare("marshall_udt", "l %udt_ptr, w %size");
         try self.declare("marshall_udt_deep", "l %udt_ptr, w %size, l %offsets, w %num");
         try self.declare("unmarshall_array", "l %blob, l %desc_ptr");
         try self.declare("unmarshall_udt", "l %blob, l %udt_ptr, w %size");
         try self.declare("unmarshall_udt_deep", "l %blob, l %udt_ptr, w %size, l %offsets, w %num");
+
+        // Worker messaging runtime
+        try self.declare("msg_queue_create", "");
+        try self.declare("msg_queue_destroy", "l %q");
+        try self.declare("msg_queue_push", "l %q, l %blob");
+        try self.declare("msg_queue_pop", "l %q");
+        try self.declare("msg_queue_has_message", "l %q");
+        try self.declare("msg_queue_close", "l %q");
+        try self.declare("msg_send_double", "l %q, d %value");
+        try self.declare("msg_send_int", "l %q, w %value");
+        try self.declare("msg_send_string", "l %q, l %str");
+        try self.declare("msg_send_udt", "l %q, l %ptr, w %size, l %offsets, w %num");
+        try self.declare("msg_send_marshalled", "l %q, l %blob, w %size");
+        try self.declare("msg_receive_double", "l %q");
+        try self.declare("msg_receive_int", "l %q");
+        try self.declare("msg_receive_string", "l %q");
+        try self.declare("msg_receive_udt", "l %q, l %ptr, w %size, l %offsets, w %num");
+        try self.declare("msg_receive_marshalled", "l %q");
+        try self.declare("msg_cancel", "l %q");
+        try self.declare("msg_is_cancelled", "l %q");
+        try self.declare("msg_get_outbox", "l %handle, w %offset");
+        try self.declare("msg_get_inbox", "l %handle, w %offset");
+        try self.declare("msg_drain_and_destroy", "l %outbox, l %inbox");
+        try self.declare("msg_send_udt_typed", "l %q, l %ptr, w %size, l %offsets, w %num, w %tid");
+        try self.declare("msg_send_class", "l %q, l %ptr, w %size, l %offsets, w %num, w %cid");
+        try self.declare("msg_blob_tag", "l %blob");
+        try self.declare("msg_blob_type_id", "l %blob");
+        try self.declare("msg_marshall_udt_typed", "l %ptr, w %size, l %offsets, w %num, w %tid");
+        try self.declare("msg_marshall_class", "l %ptr, w %size, l %offsets, w %num, w %cid");
+        try self.declare("msg_marshall_string", "l %str");
+        try self.declare("msg_marshall_array", "l %desc");
+        try self.declare("msg_unmarshall_double", "l %blob");
+        try self.declare("msg_unmarshall_int", "l %blob");
+        try self.declare("msg_unmarshall_string", "l %blob");
+        try self.declare("msg_unmarshall_udt", "l %blob, l %target, w %size, l %offsets, w %num");
+        try self.declare("msg_unmarshall_array", "l %blob, l %desc");
+
+        // Zero-copy ping-pong forwarding (runtime: messaging.zig)
+        try self.declare("msg_blob_payload_ptr", "l %blob");
+        try self.declare("msg_blob_inline_ptr", "l %blob");
+        try self.declare("msg_blob_set_inline", "l %blob, l %value");
+        try self.declare("msg_blob_forward", "l %blob, l %q");
+        try self.declare("msg_bounce_udt", "l %src_q, l %dest_q, l %target, w %size");
 
         // Terminal I/O  (runtime: terminal_io.zig)
         try self.declare("terminal_init", "");
@@ -1644,6 +1690,10 @@ pub const ExprEmitter = struct {
             .spawn => .double, // SPAWN returns a FUTURE handle (pointer as double)
             .await_expr => .double, // AWAIT returns the worker's result (as double)
             .ready => .integer, // READY returns 0 or 1
+            .receive => .double, // RECEIVE returns double by default
+            .has_message => .integer, // HASMESSAGE returns 0 or 1
+            .parent => .double, // PARENT is a handle (pointer cast to double)
+            .cancelled => .integer, // CANCELLED returns 0 or 1
             .marshall => .double, // MARSHALL returns blob pointer (as double)
         };
     }
@@ -1748,9 +1798,27 @@ pub const ExprEmitter = struct {
             .list_constructor => |lc| self.emitListConstructor(lc.elements),
             .array_binop => |ab| self.emitArrayBinop(ab.left_array, ab.operation, ab.right_expr),
             .registry_function => |rf| self.emitRegistryFunction(rf.name, rf.arguments),
-            .spawn => |sp| self.emitSpawn(sp.worker_name, sp.arguments),
+            .spawn => |sp| blk: {
+                // Check if the target worker uses messaging — if so, use the messaging spawn path
+                var spawn_upper_buf: [128]u8 = undefined;
+                const spawn_base = SymbolMapper.stripSuffix(sp.worker_name);
+                const spawn_ulen = @min(spawn_base.len, spawn_upper_buf.len);
+                for (0..spawn_ulen) |si| spawn_upper_buf[si] = std.ascii.toUpper(spawn_base[si]);
+                const spawn_upper = spawn_upper_buf[0..spawn_ulen];
+                const spawn_fsym = self.symbol_table.lookupFunction(spawn_upper);
+                const is_messaging = if (spawn_fsym) |fs| fs.uses_messaging else false;
+                if (is_messaging) {
+                    break :blk self.emitSpawnMessaging(sp.worker_name, sp.arguments);
+                } else {
+                    break :blk self.emitSpawn(sp.worker_name, sp.arguments);
+                }
+            },
             .await_expr => |aw| self.emitAwait(aw.future),
             .ready => |rd| self.emitReady(rd.future),
+            .receive => |rc| self.emitReceive(rc.handle),
+            .has_message => |hm| self.emitHasMessage(hm.handle),
+            .parent => self.emitParent(),
+            .cancelled => self.emitCancelled(),
             .marshall => |m| self.emitMarshall(m.variable_name),
         };
     }
@@ -4389,6 +4457,88 @@ pub const ExprEmitter = struct {
 
     /// Emit AWAIT future — blocks until the worker finishes and returns
     /// the result.
+    /// Emit SPAWN for a messaging-enabled worker — uses worker_spawn_messaging.
+    fn emitSpawnMessaging(self: *ExprEmitter, worker_name: []const u8, arguments: []const ast.ExprPtr) EmitError![]const u8 {
+        try self.builder.emitComment("SPAWN messaging worker");
+
+        // Look up the worker/function symbol for parameter type info.
+        var fn_upper_buf: [128]u8 = undefined;
+        const fn_base = SymbolMapper.stripSuffix(worker_name);
+        const fn_ulen = @min(fn_base.len, fn_upper_buf.len);
+        for (0..fn_ulen) |ui| fn_upper_buf[ui] = std.ascii.toUpper(fn_base[ui]);
+        const fn_upper = fn_upper_buf[0..fn_ulen];
+        const fn_sym = self.symbol_table.lookupFunction(fn_upper);
+
+        // Determine number of args.
+        // For messaging workers, we allocate one extra slot for the hidden
+        // parent handle pointer, but num_args passed to worker_spawn_messaging
+        // is the explicit count — the runtime appends the hidden arg.
+        const num_args: i32 = @intCast(arguments.len);
+
+        // Allocate args block with one extra slot for the hidden handle pointer
+        const args_block = try self.builder.newTemp();
+        const alloc_count = num_args + 1; // extra slot for hidden parent handle
+        const num_args_str = try bufPrintDupe(self.allocator, "w {d}", .{alloc_count});
+        try self.builder.emitCall(args_block, "l", "worker_args_alloc", num_args_str);
+
+        // Pack each argument (same logic as emitSpawn)
+        for (arguments, 0..) |arg, i| {
+            var arg_val = try self.emitExpression(arg);
+
+            const declared_type: []const u8 = if (fn_sym) |fsym| blk: {
+                break :blk if (i < fsym.parameter_type_descs.len)
+                    fsym.parameter_type_descs[i].toQBEType()
+                else
+                    "d";
+            } else "d";
+
+            const expr_et = self.inferExprType(arg);
+            if (std.mem.eql(u8, declared_type, "d") and expr_et == .integer) {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "d", "swtof", arg_val);
+                arg_val = cvt;
+            } else if (std.mem.eql(u8, declared_type, "w") and expr_et == .double) {
+                const cvt = try self.builder.newTemp();
+                try self.builder.emitConvert(cvt, "w", "dtosi", arg_val);
+                arg_val = cvt;
+            }
+
+            const type_suffix_str: []const u8 = if (std.mem.eql(u8, declared_type, "d"))
+                "double"
+            else if (std.mem.eql(u8, declared_type, "w"))
+                "int"
+            else
+                "ptr";
+
+            const set_fn = try bufPrintDupe(self.allocator, "worker_args_set_{s}", .{type_suffix_str});
+            const set_args = try bufPrintDupe(self.allocator, "l {s}, w {d}, {s} {s}", .{ args_block, i, declared_type, arg_val });
+            try self.builder.emitCall("", "", set_fn, set_args);
+        }
+
+        // Get the function pointer for the worker
+        const mangled = try self.symbol_mapper.functionName(worker_name);
+        const func_ptr = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l copy ${s}\n", .{ func_ptr, mangled });
+
+        // Determine return type code
+        const ret_type_code: i32 = if (fn_sym) |fsym| blk: {
+            const rt = fsym.return_type_desc.toQBEType();
+            if (std.mem.eql(u8, rt, "d")) break :blk 0 else if (std.mem.eql(u8, rt, "w")) break :blk 1 else if (std.mem.eql(u8, rt, "l")) break :blk 2 else break :blk 0;
+        } else 0;
+
+        // worker_spawn_messaging(func_ptr, args_block, num_args, ret_type) → handle
+        // The runtime will allocate queues and append the handle pointer as hidden arg
+        const handle = try self.builder.newTemp();
+        const spawn_args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, w {d}", .{ func_ptr, args_block, num_args, ret_type_code });
+        try self.builder.emitCall(handle, "l", "worker_spawn_messaging", spawn_args);
+
+        // Cast pointer to double for storage
+        const handle_d = try self.builder.newTemp();
+        try self.builder.emit("    {s} =d cast {s}\n", .{ handle_d, handle });
+
+        return handle_d;
+    }
+
     fn emitAwait(self: *ExprEmitter, future_expr: *const ast.Expression) EmitError![]const u8 {
         try self.builder.emitComment("AWAIT worker");
         const handle_d = try self.emitExpression(future_expr);
@@ -4418,6 +4568,125 @@ pub const ExprEmitter = struct {
         const dest = try self.builder.newTemp();
         const ready_args = try bufPrintDupe(self.allocator, "l {s}", .{handle});
         try self.builder.emitCall(dest, "w", "worker_ready", ready_args);
+
+        return dest;
+    }
+
+    /// Emit RECEIVE(handle) — blocking message receive.
+    /// Returns the received value as a double.
+    fn emitReceive(self: *ExprEmitter, handle_expr: *const ast.Expression) EmitError![]const u8 {
+        try self.builder.emitComment("RECEIVE message");
+
+        // handle_expr is either PARENT (resolved to the hidden param) or a future handle variable
+        const handle_d = try self.emitExpression(handle_expr);
+
+        // If handle is PARENT, it's already a pointer. If it's a future handle variable,
+        // it's a double that we need to cast to pointer.
+        const is_parent = (handle_expr.data == .parent);
+
+        const handle: []const u8 = if (is_parent) blk: {
+            break :blk handle_d; // PARENT emits as a pointer already
+        } else blk: {
+            const h = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l cast {s}\n", .{ h, handle_d });
+            break :blk h;
+        };
+
+        // For PARENT inside a worker: worker reads from outbox (main→worker direction)
+        // For main reading from a worker: main reads from inbox (worker→main direction)
+        const queue = try self.builder.newTemp();
+        if (is_parent) {
+            // Worker side: read from outbox (main→worker)
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+        } else {
+            // Main side: read from inbox (worker→main)
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_inbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_inbox", get_args);
+        }
+
+        // msg_receive_double(queue) → double
+        const dest = try self.builder.newTemp();
+        const recv_args = try bufPrintDupe(self.allocator, "l {s}", .{queue});
+        try self.builder.emitCall(dest, "d", "msg_receive_double", recv_args);
+
+        return dest;
+    }
+
+    /// Emit HASMESSAGE(handle) — non-blocking message check.
+    fn emitHasMessage(self: *ExprEmitter, handle_expr: *const ast.Expression) EmitError![]const u8 {
+        try self.builder.emitComment("HASMESSAGE check");
+
+        const handle_d = try self.emitExpression(handle_expr);
+        const is_parent = (handle_expr.data == .parent);
+
+        const handle: []const u8 = if (is_parent) blk: {
+            break :blk handle_d;
+        } else blk: {
+            const h = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l cast {s}\n", .{ h, handle_d });
+            break :blk h;
+        };
+
+        // Same direction logic as RECEIVE
+        const queue = try self.builder.newTemp();
+        if (is_parent) {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+        } else {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_inbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_inbox", get_args);
+        }
+
+        const dest = try self.builder.newTemp();
+        const has_args = try bufPrintDupe(self.allocator, "l {s}", .{queue});
+        try self.builder.emitCall(dest, "w", "msg_queue_has_message", has_args);
+
+        return dest;
+    }
+
+    /// Emit PARENT — resolves to the hidden parent handle parameter.
+    /// Inside a messaging-enabled worker, PARENT is the last argument
+    /// (the FutureHandle pointer passed by worker_spawn_messaging).
+    fn emitParent(self: *ExprEmitter) EmitError![]const u8 {
+        try self.builder.emitComment("PARENT handle");
+
+        // The hidden parent handle is passed as the last parameter.
+        // In QBE, it's stored as a double in the argument list.
+        // The codegen for the worker function definition names the
+        // hidden parameter %__parent_handle.
+        // Return it as a pointer (long).
+        const dest = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast %__parent_handle\n", .{dest});
+        return dest;
+    }
+
+    /// Emit CANCELLED(PARENT) — checks the cancel flag on the outbox queue.
+    fn emitCancelled(self: *ExprEmitter) EmitError![]const u8 {
+        try self.builder.emitComment("CANCELLED check");
+
+        // Get the parent handle
+        const handle = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast %__parent_handle\n", .{handle});
+
+        // Get the outbox (main→worker) where the cancel flag lives
+        const offset = try self.builder.newTemp();
+        try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+        const queue = try self.builder.newTemp();
+        const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+        try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+
+        const dest = try self.builder.newTemp();
+        const cancel_args = try bufPrintDupe(self.allocator, "l {s}", .{queue});
+        try self.builder.emitCall(dest, "w", "msg_is_cancelled", cancel_args);
 
         return dest;
     }
@@ -4665,6 +4934,66 @@ const MatchTypeContext = struct {
     current_arm: u32,
 };
 
+/// Context saved when a MATCH RECEIVE is emitted so that case_test blocks
+/// can compare the message blob tag (and type_id for UDT/CLASS arms).
+const MatchReceiveContext = struct {
+    /// Temp holding the popped MessageBlob pointer (result of msg_queue_pop).
+    blob_temp: []const u8,
+    /// Temp holding the blob tag (result of msg_blob_tag).
+    tag_temp: []const u8,
+    /// Temp holding the blob type_id (result of msg_blob_type_id).
+    type_id_temp: []const u8,
+    /// The MATCH RECEIVE AST node arms for per-arm metadata.
+    arms: []const ast.MatchReceiveStmt.CaseArm,
+    /// Index of the current arm being tested (incremented per case_test block).
+    current_arm: u32,
+    /// Index of the merge block where blob cleanup should be emitted.
+    merge_block_index: ?u32 = null,
+
+    // ── Zero-copy ping-pong forwarding ─────────────────────────────
+    /// Stack slot holding the blob pointer.  Used instead of the SSA
+    /// temp so that forward-arms can null it out after pushing the blob
+    /// back, making the merge-block msg_blob_free(load(slot)) a no-op.
+    blob_slot: []const u8 = "",
+    /// Per-arm flags: true when the arm's body contains a SEND back to
+    /// the same handle with the binding variable as payload (detected
+    /// bounce pattern).  When set the trampoline uses payload_ptr
+    /// instead of unmarshall and the SEND emits msg_blob_forward.
+    forward_arm_flags: []bool = &.{},
+    /// Whether the MATCH RECEIVE handle is PARENT (vs a future variable).
+    handle_is_parent: bool = false,
+    /// The QBE temp holding the resolved message queue pointer, so that
+    /// forward-arms can reuse it for msg_blob_forward without
+    /// re-deriving the queue from the handle expression.
+    queue_temp: []const u8 = "",
+};
+
+/// Tracks the active forward (bounce) context when emitting statements
+/// inside a forward-arm body.  `emitSendStatement` checks this to
+/// replace the normal marshal+push path with `msg_blob_forward`.
+const ActiveForwardCtx = struct {
+    /// The binding variable name (uppercased) that triggers the forward.
+    binding_var_upper: []const u8,
+    /// The SSA temp holding the blob pointer to forward.
+    blob_temp: []const u8,
+    /// Stack slot for the blob pointer (nulled after forward).
+    blob_slot: []const u8,
+    /// The SSA temp holding the send-direction queue.
+    queue_temp: []const u8,
+    /// Whether the handle is PARENT.
+    handle_is_parent: bool,
+};
+
+/// Info stored for the merge-block cleanup of a MATCH RECEIVE.
+const MergeCleanup = struct {
+    /// QBE temp or stack-slot name holding the blob pointer.
+    blob_ref: []const u8,
+    /// When true, blob_ref is a stack slot — emit a load before calling
+    /// msg_blob_free.  Forward-arms null the slot after pushing the blob
+    /// so the load yields null and the free becomes a no-op.
+    needs_load: bool,
+};
+
 /// Emits code for the statements within a single basic block and emits
 /// the block's terminator (branch / jump / return) based on CFG edges.
 pub const BlockEmitter = struct {
@@ -4703,6 +5032,22 @@ pub const BlockEmitter = struct {
     /// MATCH TYPE contexts, keyed by the match entry block index.
     match_type_contexts: std.AutoHashMap(u32, MatchTypeContext),
 
+    /// MATCH RECEIVE contexts, keyed by the match entry block index.
+    match_receive_contexts: std.AutoHashMap(u32, MatchReceiveContext),
+
+    /// MATCH RECEIVE merge-block cleanups: merge_block_index → cleanup info.
+    /// Emitted at the start of the merge block to free the message envelope.
+    match_receive_merge_cleanups: std.AutoHashMap(u32, MergeCleanup),
+
+    /// When non-null, we are inside a forward-arm body block.  The SEND
+    /// emitter checks this to replace marshal+push with msg_blob_forward.
+    active_forward_ctx: ?ActiveForwardCtx = null,
+
+    /// Maps case_body block index → forward context.  Registered during
+    /// the forward-arm trampoline so that `emitBlock` can activate the
+    /// context around the body block's statements and clear it after.
+    forward_body_blocks: std.AutoHashMap(u32, ActiveForwardCtx),
+
     /// Pre-allocated FOR loop slots, keyed by uppercase variable name.
     for_pre_allocs: std.StringHashMap(ForPreAlloc),
 
@@ -4740,6 +5085,9 @@ pub const BlockEmitter = struct {
             .foreach_hashmap_contexts = std.AutoHashMap(u32, ForEachHashmapContext).init(allocator),
             .case_contexts = std.AutoHashMap(u32, CaseContext).init(allocator),
             .match_type_contexts = std.AutoHashMap(u32, MatchTypeContext).init(allocator),
+            .match_receive_contexts = std.AutoHashMap(u32, MatchReceiveContext).init(allocator),
+            .match_receive_merge_cleanups = std.AutoHashMap(u32, MergeCleanup).init(allocator),
+            .forward_body_blocks = std.AutoHashMap(u32, ActiveForwardCtx).init(allocator),
             .for_pre_allocs = std.StringHashMap(ForPreAlloc).init(allocator),
             .field_mappings = std.StringHashMap(FieldMapping).init(allocator),
         };
@@ -4752,6 +5100,9 @@ pub const BlockEmitter = struct {
         self.foreach_hashmap_contexts.deinit();
         self.case_contexts.deinit();
         self.match_type_contexts.deinit();
+        self.match_receive_contexts.deinit();
+        self.match_receive_merge_cleanups.deinit();
+        self.forward_body_blocks.deinit();
         self.for_pre_allocs.deinit();
         self.field_mappings.deinit();
     }
@@ -4955,7 +5306,10 @@ pub const BlockEmitter = struct {
             .sub => {}, // handled via function_cfgs
             .worker => {}, // handled via function_cfgs
             .unmarshall => |um| try self.emitUnmarshallStatement(&um),
+            .send => |sd| try self.emitSendStatement(&sd),
+            .cancel => |cn| try self.emitCancelStatement(&cn),
             .match_type => |mt| try self.emitMatchTypeInit(&mt, block),
+            .match_receive => |mr| try self.emitMatchReceiveInit(&mr, block),
 
             // ── Terminal I/O ────────────────────────────────────────────
             .cls => try self.emitCLS(),
@@ -5203,6 +5557,12 @@ pub const BlockEmitter = struct {
         // ── Case test block: compare selector vs value ──────────────────
         if (block.kind == .case_test) {
             if (case_match_target != null and case_next_target != null) {
+                // Check if this is a MATCH RECEIVE test first.
+                const mr_ctx = self.findMatchReceiveContext(block);
+                if (mr_ctx != null) {
+                    try self.emitMatchReceiveTest(block, case_match_target.?, case_next_target.?);
+                    return;
+                }
                 // Check if this is a MATCH TYPE test by looking for a
                 // match_type context reachable from this block's predecessors.
                 const mt_ctx = self.findMatchTypeContext(block);
@@ -6770,6 +7130,577 @@ pub const BlockEmitter = struct {
         }
     }
 
+    // ── MATCH RECEIVE ───────────────────────────────────────────────────
+
+    /// Initialise the MATCH RECEIVE context: resolve the queue, pop a
+    /// message blob, read its tag and type_id, and store the context for
+    /// the subsequent case_test blocks.  Forward (bounce) arms are already
+    /// tagged by the semantic analyzer (arm.is_forward).
+    fn emitMatchReceiveInit(self: *BlockEmitter, mr: *const ast.MatchReceiveStmt, block: *const cfg_mod.BasicBlock) EmitError!void {
+        try self.builder.emitComment("MATCH RECEIVE — pop blob and read tag");
+
+        // Evaluate the handle expression
+        const handle_d = try self.expr_emitter.emitExpression(mr.handle_expression);
+        const is_parent = (mr.handle_expression.data == .parent);
+
+        const handle: []const u8 = if (is_parent) blk: {
+            break :blk handle_d;
+        } else blk: {
+            const h = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l cast {s}\n", .{ h, handle_d });
+            break :blk h;
+        };
+
+        // Determine which queue to read from (opposite of SEND direction):
+        //   PARENT inside worker → read from outbox (main→worker)
+        //   Future handle in main → read from inbox (worker→main)
+        const queue = try self.builder.newTemp();
+        if (is_parent) {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+        } else {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_inbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_inbox", get_args);
+        }
+
+        // Pop the next blob (blocking)
+        const blob = try self.builder.newTemp();
+        const pop_args = try bufPrintDupe(self.allocator, "l {s}", .{queue});
+        try self.builder.emitCall(blob, "l", "msg_queue_pop", pop_args);
+
+        // Read the tag
+        const tag = try self.builder.newTemp();
+        const tag_args = try bufPrintDupe(self.allocator, "l {s}", .{blob});
+        try self.builder.emitCall(tag, "w", "msg_blob_tag", tag_args);
+
+        // Read the type_id (for UDT / CLASS discrimination)
+        const type_id = try self.builder.newTemp();
+        const tid_args = try bufPrintDupe(self.allocator, "l {s}", .{blob});
+        try self.builder.emitCall(type_id, "w", "msg_blob_type_id", tid_args);
+
+        // ── Check for bounce (forward) arms ─────────────────────────────
+        // The semantic analyzer already tagged arms whose body contains
+        // SEND <same-handle>, <binding-var> with arm.is_forward = true.
+        // We just read the flags here for codegen decisions.
+        const forward_flags = try self.allocator.alloc(bool, mr.case_arms.len);
+        var any_forward = false;
+        for (mr.case_arms, 0..) |arm, ai| {
+            forward_flags[ai] = arm.is_forward;
+            if (forward_flags[ai]) any_forward = true;
+        }
+
+        // If any arm forwards the blob, we need a stack slot so we can
+        // null the pointer after forwarding (msg_blob_free(null) is a
+        // no-op at the merge block).  Non-forward arms leave the slot
+        // intact so the merge cleanup frees normally.
+        const blob_slot: []const u8 = if (any_forward) blk: {
+            const slot = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l alloc8 8\n", .{slot});
+            try self.builder.emitStore("l", blob, slot);
+            try self.builder.emitComment("MATCH RECEIVE — bounce detection: blob stored in slot for conditional cleanup");
+            break :blk slot;
+        } else "";
+
+        // We also need the *send-direction* queue for forward arms.
+        // SEND inside a worker goes to inbox (worker→main), SEND from
+        // main goes to outbox (main→worker) — the opposite of the
+        // receive direction we already resolved above.
+        const send_queue: []const u8 = if (any_forward) sq: {
+            const sq = try self.builder.newTemp();
+            if (is_parent) {
+                // Worker side: send queue is inbox (worker→main)
+                const off = try self.builder.newTemp();
+                try self.builder.emitCall(off, "w", "worker_future_inbox_offset", "");
+                const gargs = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, off });
+                try self.builder.emitCall(sq, "l", "msg_get_inbox", gargs);
+            } else {
+                // Main side: send queue is outbox (main→worker)
+                const off = try self.builder.newTemp();
+                try self.builder.emitCall(off, "w", "worker_future_outbox_offset", "");
+                const gargs = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, off });
+                try self.builder.emitCall(sq, "l", "msg_get_outbox", gargs);
+            }
+            break :sq sq;
+        } else "";
+
+        // Find the merge block for this MATCH RECEIVE by traversing the CFG.
+        //
+        // Strategy: follow the case_next chain from the first test block.
+        // Each test block's "no match" edge (case_next) leads to the next
+        // test block, or — from the last test — to the merge block (or to
+        // a case_otherwise block whose fallthrough reaches the merge).
+        //
+        // The previous approach (body → fallthrough → merge) broke when
+        // the case body contained loops or nested control flow, because
+        // the fallthrough from the body goes to the loop header, not the
+        // merge block.
+        var merge_idx: ?u32 = null;
+        for (self.cfg.edges.items) |edge| {
+            if (edge.from == block.index and edge.kind == .fallthrough) {
+                // First case_test block
+                var cur_test: u32 = edge.to;
+
+                // Follow case_next edges through the test chain.
+                var found = false;
+                var safety: u32 = 0;
+                while (safety < 100) : (safety += 1) {
+                    var next_found = false;
+                    for (self.cfg.edges.items) |e2| {
+                        if (e2.from == cur_test and e2.kind == .case_next) {
+                            const target = self.cfg.getBlockConst(e2.to);
+                            if (target.kind == .merge) {
+                                // Direct: last test → merge (no CASE ELSE)
+                                merge_idx = e2.to;
+                                found = true;
+                            } else if (target.kind == .case_test) {
+                                // Intermediate: test → next test
+                                cur_test = e2.to;
+                                next_found = true;
+                            } else if (target.kind == .case_otherwise) {
+                                // CASE ELSE block — follow its fallthrough to merge
+                                for (self.cfg.edges.items) |e3| {
+                                    if (e3.from == e2.to and e3.kind == .fallthrough) {
+                                        const cand = self.cfg.getBlockConst(e3.to);
+                                        if (cand.kind == .merge) {
+                                            merge_idx = e3.to;
+                                        }
+                                        break;
+                                    }
+                                }
+                                found = true;
+                            } else {
+                                // Unknown target kind — treat as merge candidate
+                                found = true;
+                            }
+                            break;
+                        }
+                    }
+                    if (found or !next_found) break;
+                }
+                break;
+            }
+        }
+
+        try self.match_receive_contexts.put(block.index, .{
+            .blob_temp = blob,
+            .tag_temp = tag,
+            .type_id_temp = type_id,
+            .arms = mr.case_arms,
+            .current_arm = 0,
+            .merge_block_index = merge_idx,
+            .blob_slot = blob_slot,
+            .forward_arm_flags = forward_flags,
+            .handle_is_parent = is_parent,
+            .queue_temp = send_queue,
+        });
+
+        // Register cleanup: emit msg_blob_free at the merge block.
+        // When any arm can forward, we use the blob_slot (which may
+        // have been nulled) instead of the SSA temp.
+        if (merge_idx) |midx| {
+            if (any_forward) {
+                try self.match_receive_merge_cleanups.put(midx, .{
+                    .blob_ref = blob_slot,
+                    .needs_load = true,
+                });
+            } else {
+                try self.match_receive_merge_cleanups.put(midx, .{
+                    .blob_ref = blob,
+                    .needs_load = false,
+                });
+            }
+        }
+    }
+
+    /// Find the MatchReceiveContext that governs a given case_test block
+    /// by walking back through predecessor edges to the entry block
+    /// where the context was registered.
+    fn findMatchReceiveContext(self: *BlockEmitter, block: *const cfg_mod.BasicBlock) ?*MatchReceiveContext {
+        // Direct lookup first.
+        if (self.match_receive_contexts.getPtr(block.index)) |ptr| return ptr;
+
+        // Walk predecessors: case_test blocks chain via case_next edges.
+        var visited: [64]u32 = undefined;
+        var visited_count: usize = 0;
+        var current = block;
+        while (visited_count < 64) {
+            var already_visited = false;
+            for (visited[0..visited_count]) |v| {
+                if (v == current.index) {
+                    already_visited = true;
+                    break;
+                }
+            }
+            if (already_visited) break;
+            visited[visited_count] = current.index;
+            visited_count += 1;
+
+            if (self.match_receive_contexts.getPtr(current.index)) |ptr| return ptr;
+
+            var found_pred = false;
+            for (current.predecessors.items) |pred_idx| {
+                if (self.match_receive_contexts.getPtr(pred_idx)) |ptr| return ptr;
+                current = self.cfg.getBlockConst(pred_idx);
+                found_pred = true;
+                break;
+            }
+            if (!found_pred) break;
+        }
+
+        return null;
+    }
+
+    /// Emit the comparison for a MATCH RECEIVE case_test block.
+    /// Compares the blob tag against the expected message type for this arm.
+    /// For UDT and CLASS arms, also compares the blob type_id against the
+    /// compile-time type_id / class_id.
+    fn emitMatchReceiveTest(self: *BlockEmitter, block: *const cfg_mod.BasicBlock, match_target: u32, next_target: u32) EmitError!void {
+        const ctx = self.findMatchReceiveContext(block);
+
+        if (ctx == null) {
+            try self.builder.emitComment("WARN: MATCH RECEIVE test — no context found");
+            try self.builder.emitJump(try blockLabel(self.cfg, next_target, self.allocator));
+            return;
+        }
+
+        const mc = ctx.?;
+        const arm_idx = mc.current_arm;
+        if (arm_idx >= mc.arms.len) {
+            try self.builder.emitJump(try blockLabel(self.cfg, next_target, self.allocator));
+            return;
+        }
+
+        const arm = mc.arms[arm_idx];
+        mc.current_arm += 1;
+
+        // Determine expected tag and whether we need a type_id sub-check
+        var expected_tag: []const u8 = "0"; // MSG_DOUBLE
+        var need_type_id_check = false;
+        var expected_type_id: i32 = 0;
+        var is_udt_arm = false;
+        var is_class_arm = false;
+        var udt_name: []const u8 = "";
+
+        if (arm.is_udt_match and arm.udt_type_name.len > 0) {
+            // Identifier arm — check symbol table to distinguish UDT vs CLASS
+            var tu_buf: [128]u8 = undefined;
+            const tu_len = @min(arm.udt_type_name.len, tu_buf.len);
+            for (0..tu_len) |i| tu_buf[i] = std.ascii.toUpper(arm.udt_type_name[i]);
+            const tu_upper = tu_buf[0..tu_len];
+
+            if (self.symbol_table.lookupClass(tu_upper)) |cls| {
+                // CLASS match
+                expected_tag = "5"; // MSG_CLASS
+                is_class_arm = true;
+                udt_name = tu_upper;
+                need_type_id_check = true;
+                expected_type_id = cls.class_id;
+            } else {
+                // UDT match
+                expected_tag = "3"; // MSG_UDT
+                is_udt_arm = true;
+                udt_name = tu_upper;
+                if (self.symbol_table.getTypeId(tu_upper)) |tid| {
+                    need_type_id_check = true;
+                    expected_type_id = tid;
+                }
+            }
+        } else if (arm.type_keyword.len > 0) {
+            const upper = arm.type_keyword;
+            if (std.ascii.eqlIgnoreCase(upper, "INTEGER")) {
+                expected_tag = "1"; // MSG_INTEGER
+            } else if (std.ascii.eqlIgnoreCase(upper, "DOUBLE") or std.ascii.eqlIgnoreCase(upper, "SINGLE")) {
+                expected_tag = "0"; // MSG_DOUBLE
+            } else if (std.ascii.eqlIgnoreCase(upper, "STRING")) {
+                expected_tag = "2"; // MSG_STRING
+            } else if (std.ascii.eqlIgnoreCase(upper, "ARRAY")) {
+                expected_tag = "4"; // MSG_ARRAY
+            } else if (std.ascii.eqlIgnoreCase(upper, "OBJECT")) {
+                expected_tag = "5"; // MSG_CLASS (generic catch-all)
+            }
+        }
+
+        // ── Scalar binding-variable extraction ──────────────────────────
+        // For DOUBLE / INTEGER arms we pre-load the value from the blob's
+        // inline_value field BEFORE the branch.  Reading a few bytes at
+        // the wrong type is harmless (the body won't execute if the tag
+        // doesn't match), and there is no ownership to transfer.
+        //
+        // STRING arms use a trampoline (like UDT / CLASS arms) so that
+        // we can null out inline_value AFTER extraction.  This prevents
+        // msg_blob_free at the merge block from double-releasing the
+        // string (ownership transfers to the binding variable).
+        //
+        // UDT / CLASS arms also use a trampoline because they need to
+        // dereference the payload pointer, which is only safe after the
+        // tag check confirms it's a composite message.
+        const is_string_arm = std.mem.eql(u8, expected_tag, "2");
+        const has_scalar_binding = arm.binding_variable.len > 0 and
+            !is_udt_arm and !is_class_arm and !is_string_arm;
+
+        if (has_scalar_binding) {
+            const resolved = try self.resolveVarAddr(arm.binding_variable, arm.binding_suffix);
+
+            if (std.mem.eql(u8, expected_tag, "0")) {
+                // DOUBLE — read inline_value (offset 16 in MessageBlob)
+                const val = try self.builder.newTemp();
+                const iv_addr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l add {s}, 16\n", .{ iv_addr, mc.blob_temp });
+                try self.builder.emitLoad(val, "d", iv_addr);
+                try self.builder.emitStore(resolved.store_type, val, resolved.addr);
+            } else if (std.mem.eql(u8, expected_tag, "1")) {
+                // INTEGER — read inline_value as int
+                const iv_addr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l add {s}, 16\n", .{ iv_addr, mc.blob_temp });
+                const val = try self.builder.newTemp();
+                try self.builder.emitLoad(val, "w", iv_addr);
+                if (std.mem.eql(u8, resolved.store_type, "w")) {
+                    try self.builder.emitStore("w", val, resolved.addr);
+                } else {
+                    const dval = try self.builder.newTemp();
+                    try self.builder.emitConvert(dval, "d", "swtof", val);
+                    try self.builder.emitStore("d", dval, resolved.addr);
+                }
+            }
+        }
+
+        // ── Tag comparison & branch ─────────────────────────────────────
+        // For UDT / CLASS / STRING arms that need a binding variable we
+        // insert a trampoline label between the successful comparison
+        // and the body block.  The trampoline does extraction (and for
+        // STRING: nulls inline_value; for UDT: unmarshalls + nulls
+        // payload) so msg_blob_free at the merge block is safe.
+        //
+        // For DOUBLE / INTEGER arms (or arms without a binding variable)
+        // we jump directly to the body block.
+        const needs_trampoline = (is_udt_arm or is_class_arm or is_string_arm) and arm.binding_variable.len > 0;
+
+        const effective_match_target: []const u8 = if (needs_trampoline) blk: {
+            break :blk try bufPrintDupe(self.allocator, "mr_extract_{d}", .{block.index});
+        } else try blockLabel(self.cfg, match_target, self.allocator);
+
+        if (need_type_id_check) {
+            // Two-step: tag == expected AND type_id == expected_type_id
+            const tag_cmp = try self.builder.newTemp();
+            try self.builder.emitCompare(tag_cmp, "w", "eq", mc.tag_temp, expected_tag);
+
+            const check_tid_label = try bufPrintDupe(self.allocator, "mr_chktid_{d}", .{block.index});
+            const no_match_label = try blockLabel(self.cfg, next_target, self.allocator);
+
+            try self.builder.emitBranch(tag_cmp, check_tid_label, no_match_label);
+            try self.builder.emitLabel(check_tid_label);
+
+            const tid_cmp = try self.builder.newTemp();
+            const expected_tid_str = try bufPrintDupe(self.allocator, "{d}", .{expected_type_id});
+            try self.builder.emitCompare(tid_cmp, "w", "eq", mc.type_id_temp, expected_tid_str);
+
+            try self.builder.emitBranch(tid_cmp, effective_match_target, no_match_label);
+        } else if (std.mem.eql(u8, expected_tag, "5")) {
+            // Generic OBJECT: any tag >= 5 matches
+            const cmp = try self.builder.newTemp();
+            try self.builder.emitCompare(cmp, "w", "sge", mc.tag_temp, expected_tag);
+            try self.builder.emitBranch(
+                cmp,
+                effective_match_target,
+                try blockLabel(self.cfg, next_target, self.allocator),
+            );
+        } else {
+            // Simple tag comparison
+            const cmp = try self.builder.newTemp();
+            try self.builder.emitCompare(cmp, "w", "eq", mc.tag_temp, expected_tag);
+            try self.builder.emitBranch(
+                cmp,
+                effective_match_target,
+                try blockLabel(self.cfg, next_target, self.allocator),
+            );
+        }
+
+        // ── Extraction trampoline ───────────────────────────────────────
+        // Emitted for STRING, UDT, and CLASS arms that have a binding
+        // variable.  This code runs only after the tag (and type_id)
+        // comparison succeeded.  After extracting the value it nulls out
+        // the blob's pointer (inline_value for STRING, payload for
+        // UDT/CLASS) so msg_blob_free at the merge block won't
+        // double-free the transferred data.
+        if (needs_trampoline) {
+            const trampoline_label = try bufPrintDupe(self.allocator, "mr_extract_{d}", .{block.index});
+            try self.builder.emitLabel(trampoline_label);
+
+            const resolved = try self.resolveVarAddr(arm.binding_variable, arm.binding_suffix);
+
+            if (is_string_arm) {
+                // STRING — extract pointer from inline_value, store to
+                // binding variable, then null out inline_value so
+                // msg_blob_free at the merge block won't double-release.
+                const iv_addr = try self.builder.newTemp();
+                try self.builder.emit("    {s} =l add {s}, 16\n", .{ iv_addr, mc.blob_temp });
+                const val = try self.builder.newTemp();
+                try self.builder.emitLoad(val, "l", iv_addr);
+                try self.builder.emitStore("l", val, resolved.addr);
+                // Null out inline_value — ownership transferred
+                try self.builder.emitStore("l", "0", iv_addr);
+                // Jump to body
+                try self.builder.emitJump(try blockLabel(self.cfg, match_target, self.allocator));
+            } else {
+                const obj_size: u32 = if (is_class_arm) blk: {
+                    if (self.symbol_table.lookupClass(udt_name)) |cls| {
+                        break :blk @intCast(cls.object_size);
+                    }
+                    break :blk 0;
+                } else self.type_manager.sizeOfUDT(udt_name);
+
+                // Check if this arm is a detected forward (bounce) arm.
+                const is_forward = arm_idx < mc.forward_arm_flags.len and mc.forward_arm_flags[arm_idx];
+
+                if (is_forward and obj_size > 0) {
+                    // ── Zero-copy forward path ──────────────────────────
+                    // Instead of unmarshalling (memcpy + free payload),
+                    // point the binding variable directly at the blob's
+                    // payload buffer.  The user's field accesses modify
+                    // the payload in-place.  The matched SEND in the body
+                    // will emit msg_blob_forward instead of marshal+push.
+                    try self.builder.emitComment("MATCH RECEIVE — zero-copy forward: binding var → blob payload");
+
+                    // Get the payload pointer via msg_blob_payload_ptr.
+                    const pp_args = try bufPrintDupe(self.allocator, "l {s}", .{mc.blob_temp});
+                    const payload_ptr = try self.builder.newTemp();
+                    try self.builder.emitCall(payload_ptr, "l", "msg_blob_payload_ptr", pp_args);
+
+                    // Store payload pointer as the binding variable's value.
+                    // The binding var slot holds a pointer-to-UDT; we just
+                    // make it point into the blob's payload directly.
+                    try self.builder.emitStore("l", payload_ptr, resolved.addr);
+
+                    // Do NOT null the payload or free anything — the blob
+                    // stays intact for forwarding.  The SEND in the body
+                    // will call msg_blob_forward and then null the blob_slot
+                    // so the merge-block free becomes a no-op.
+
+                    // Register the body block so emitBlock can activate
+                    // the forward context around its statements.  We
+                    // upper-case the binding variable for matching in
+                    // emitSendStatement.
+                    var bv_buf: [128]u8 = undefined;
+                    const bv_len = @min(arm.binding_variable.len, bv_buf.len);
+                    for (0..bv_len) |bi| bv_buf[bi] = std.ascii.toUpper(arm.binding_variable[bi]);
+                    const bv_upper = try self.allocator.dupe(u8, bv_buf[0..bv_len]);
+
+                    try self.forward_body_blocks.put(match_target, .{
+                        .binding_var_upper = bv_upper,
+                        .blob_temp = mc.blob_temp,
+                        .blob_slot = mc.blob_slot,
+                        .queue_temp = mc.queue_temp,
+                        .handle_is_parent = mc.handle_is_parent,
+                    });
+                } else if (obj_size > 0) {
+                    // ── Normal unmarshal path ────────────────────────────
+                    // Load the UDT/object pointer from the variable slot.
+                    // If the slot is null (binding variable was never DIM'd),
+                    // allocate memory on the fly via basic_malloc.
+                    const raw_ptr = try self.builder.newTemp();
+                    try self.builder.emitLoad(raw_ptr, "l", resolved.addr);
+
+                    const is_null = try self.builder.newTemp();
+                    try self.builder.emitCompare(is_null, "w", "eq", raw_ptr, "0");
+
+                    const alloc_label = try bufPrintDupe(self.allocator, "mr_alloc_{d}", .{block.index});
+                    const ready_label = try bufPrintDupe(self.allocator, "mr_ready_{d}", .{block.index});
+
+                    try self.builder.emitBranch(is_null, alloc_label, ready_label);
+
+                    // Allocate UDT memory when the slot was uninitialized.
+                    try self.builder.emitLabel(alloc_label);
+                    const new_ptr = try self.builder.newTemp();
+                    try self.builder.emitCall(new_ptr, "l", "basic_malloc", try bufPrintDupe(self.allocator, "l {d}", .{obj_size}));
+                    try self.builder.emitStore("l", new_ptr, resolved.addr);
+                    try self.builder.emitJump(ready_label);
+
+                    try self.builder.emitLabel(ready_label);
+
+                    // Re-load the (now non-null) pointer.
+                    const udt_ptr = try self.builder.newTemp();
+                    try self.builder.emitLoad(udt_ptr, "l", resolved.addr);
+
+                    // Load the payload pointer from the blob.
+                    // payload is at offset 8 (tag:1 + flags:1 + type_id:2 + payload_len:4 = 8)
+                    const payload_addr = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l add {s}, 8\n", .{ payload_addr, mc.blob_temp });
+                    const payload = try self.builder.newTemp();
+                    try self.builder.emitLoad(payload, "l", payload_addr);
+
+                    // Check for string fields
+                    const has_strings = blk: {
+                        if (is_class_arm) {
+                            if (self.symbol_table.lookupClass(udt_name)) |cls| {
+                                for (cls.fields) |field| {
+                                    if (field.type_desc.base_type == .string) break :blk true;
+                                }
+                            }
+                        } else {
+                            if (self.symbol_table.lookupType(udt_name)) |ts| {
+                                if (self.hasStringFields(ts)) break :blk true;
+                            }
+                        }
+                        break :blk false;
+                    };
+
+                    if (has_strings) {
+                        const num_offsets: u32 = blk: {
+                            if (is_class_arm) {
+                                if (self.symbol_table.lookupClass(udt_name)) |cls| {
+                                    var count: u32 = 0;
+                                    for (cls.fields) |field| {
+                                        if (field.type_desc.base_type == .string) count += 1;
+                                    }
+                                    break :blk count;
+                                }
+                            } else {
+                                if (self.symbol_table.lookupType(udt_name)) |ts| {
+                                    break :blk self.countUDTStringFields(ts);
+                                }
+                            }
+                            break :blk 0;
+                        };
+                        const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{udt_name});
+                        const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}", .{ payload, udt_ptr, obj_size, offsets_label, num_offsets });
+                        try self.builder.emitCall("", "", "unmarshall_udt_deep", args);
+                    } else {
+                        const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}", .{ payload, udt_ptr, obj_size });
+                        try self.builder.emitCall("", "", "unmarshall_udt", args);
+                    }
+
+                    // Null out the payload pointer in the blob so that
+                    // msg_blob_free at the merge block does not double-free
+                    // the payload (unmarshall_udt / unmarshall_udt_deep
+                    // already freed it).
+                    try self.builder.emitStore("l", "0", payload_addr);
+                }
+
+                // Fall through to the body block
+                try self.builder.emitJump(try blockLabel(self.cfg, match_target, self.allocator));
+            } // end else (UDT/CLASS branch of trampoline)
+        }
+
+        // ── Blob cleanup ────────────────────────────────────────────────
+        // The blob envelope is freed by a msg_blob_free(blob_temp) call
+        // emitted at the start of the merge block.  The merge block index
+        // and blob temp are registered in match_receive_merge_cleanups
+        // during emitMatchReceiveInit; emitBlock checks this map when
+        // entering a merge block and emits the cleanup call.
+        //
+        // For UDT/CLASS arms, the payload is freed by unmarshall_udt /
+        // unmarshall_udt_deep in the extraction trampoline.  We null out
+        // the blob's payload pointer immediately after unmarshalling so
+        // that msg_blob_free at the merge block does not double-free it.
+        //
+        // For scalar arms, msg_blob_free handles inline-only blobs
+        // correctly (no payload to free).
+    }
+
     // ── UDT Arithmetic Helpers (NEON + Scalar) ──────────────────────────
 
     /// Map SIMDInfo to the integer arrangement code used in NEON IL opcodes:
@@ -6802,6 +7733,22 @@ pub const BlockEmitter = struct {
             }
         }
         return false;
+    }
+
+    /// Count the total number of string fields in a UDT (including nested UDTs).
+    fn countUDTStringFields(self: *BlockEmitter, ts: *const semantic.TypeSymbol) u32 {
+        var count: u32 = 0;
+        for (ts.fields) |field| {
+            if (field.type_desc.base_type == .string) {
+                count += 1;
+            } else if (field.type_desc.base_type == .user_defined) {
+                const nested_name = if (field.type_desc.udt_name.len > 0) field.type_desc.udt_name else field.type_name;
+                if (self.symbol_table.lookupType(nested_name)) |nested_ts| {
+                    count += self.countUDTStringFields(nested_ts);
+                }
+            }
+        }
+        return count;
     }
 
     /// Emit code to obtain the memory address of a UDT expression.
@@ -8785,6 +9732,293 @@ pub const BlockEmitter = struct {
         try self.builder.emitStore(resolved.store_type, src_val, resolved.addr);
     }
 
+    /// Emit SEND handle, expression — send a marshalled message.
+    /// Phase 2: emits typed sends based on the expression's semantic type.
+    /// Scalars use msg_send_double / msg_send_int / msg_send_string.
+    /// UDTs use msg_send_udt_typed (with compile-time type_id).
+    /// CLASS instances use msg_send_class (with compile-time class_id).
+    fn emitSendStatement(self: *BlockEmitter, sd: *const ast.SendStmt) EmitError!void {
+        // ── Zero-copy forward path ──────────────────────────────────────
+        // If we're inside a forward-arm body block and this SEND matches
+        // the bounce pattern (same handle direction, message is the
+        // binding variable), emit msg_blob_forward instead of the normal
+        // marshal + push path.  The blob is already populated — the
+        // binding variable points directly into its payload buffer.
+        if (self.active_forward_ctx) |fwd| {
+            const send_is_parent = (sd.handle.data == .parent);
+            if (send_is_parent == fwd.handle_is_parent) {
+                // Check if the message expression is the binding variable.
+                const is_bounce_send = switch (sd.message.data) {
+                    .variable => |v| blk: {
+                        var vbuf: [128]u8 = undefined;
+                        const vlen = @min(v.name.len, vbuf.len);
+                        for (0..vlen) |i| vbuf[i] = std.ascii.toUpper(v.name[i]);
+                        break :blk std.mem.eql(u8, vbuf[0..vlen], fwd.binding_var_upper);
+                    },
+                    else => false,
+                };
+
+                if (is_bounce_send) {
+                    try self.builder.emitComment("SEND → zero-copy forward (bounce detected by semantic analyzer)");
+
+                    // Forward the blob to the send-direction queue.
+                    const fwd_args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ fwd.blob_temp, fwd.queue_temp });
+                    try self.builder.emitCall("", "", "msg_blob_forward", fwd_args);
+
+                    // Null the blob slot so the merge-block msg_blob_free
+                    // becomes a no-op (the blob now belongs to the queue).
+                    if (fwd.blob_slot.len > 0) {
+                        try self.builder.emitStore("l", "0", fwd.blob_slot);
+                    }
+
+                    return; // Skip normal marshal + push
+                }
+            }
+        }
+
+        try self.builder.emitComment("SEND message");
+
+        // Evaluate the handle expression
+        const handle_d = try self.expr_emitter.emitExpression(sd.handle);
+        const is_parent = (sd.handle.data == .parent);
+
+        // Get the raw pointer for the handle
+        const handle: []const u8 = if (is_parent) blk: {
+            break :blk handle_d; // PARENT emits as a pointer already
+        } else blk: {
+            const h = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l cast {s}\n", .{ h, handle_d });
+            break :blk h;
+        };
+
+        // Determine the correct queue direction:
+        // PARENT inside worker → push to inbox (worker→main)
+        // Future handle in main → push to outbox (main→worker)
+        const queue = try self.builder.newTemp();
+        if (is_parent) {
+            // Worker side: write to inbox (worker→main)
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_inbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_inbox", get_args);
+        } else {
+            // Main side: write to outbox (main→worker)
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+        }
+
+        // ── Determine the full semantic type of the message expression ──
+        // Try to resolve a rich TypeDescriptor from the expression so we
+        // can emit the correct typed send (UDT, CLASS, STRING, INTEGER).
+        const send_info = self.resolveSendType(sd.message);
+
+        switch (send_info.kind) {
+            .udt => {
+                // UDT: load pointer, compute size, send with type_id
+                const msg_val = try self.expr_emitter.emitExpression(sd.message);
+
+                // Uppercase the type name for symbol-table lookups (types
+                // are stored with uppercased keys).
+                var udt_upper_buf: [128]u8 = undefined;
+                const udt_ulen = @min(send_info.type_name.len, udt_upper_buf.len);
+                for (0..udt_ulen) |ui| udt_upper_buf[ui] = std.ascii.toUpper(send_info.type_name[ui]);
+                const udt_upper = udt_upper_buf[0..udt_ulen];
+
+                const obj_size: u32 = self.type_manager.sizeOfUDT(udt_upper);
+                const type_id: i32 = self.symbol_table.getTypeId(udt_upper) orelse 0;
+
+                // Check for string fields (deep marshall needed)
+                const has_strings = blk: {
+                    if (self.symbol_table.lookupType(udt_upper)) |ts| {
+                        if (self.hasStringFields(ts)) break :blk true;
+                    }
+                    break :blk false;
+                };
+
+                if (has_strings) {
+                    const num_offsets: u32 = blk: {
+                        if (self.symbol_table.lookupType(udt_upper)) |ts| {
+                            break :blk self.countUDTStringFields(ts);
+                        }
+                        break :blk 0;
+                    };
+                    const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{udt_upper});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}, w {d}", .{ queue, msg_val, obj_size, offsets_label, num_offsets, type_id });
+                    try self.builder.emitCall("", "", "msg_send_udt_typed", args);
+                } else {
+                    const zero_l = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l copy 0\n", .{zero_l});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w 0, w {d}", .{ queue, msg_val, obj_size, zero_l, type_id });
+                    try self.builder.emitCall("", "", "msg_send_udt_typed", args);
+                }
+            },
+            .class_instance => {
+                // CLASS: load pointer, compute object_size, send with class_id
+                const msg_val = try self.expr_emitter.emitExpression(sd.message);
+
+                // Uppercase the class name for symbol-table lookups.
+                var cls_upper_buf: [128]u8 = undefined;
+                const cls_ulen = @min(send_info.type_name.len, cls_upper_buf.len);
+                for (0..cls_ulen) |ci| cls_upper_buf[ci] = std.ascii.toUpper(send_info.type_name[ci]);
+                const cls_upper = cls_upper_buf[0..cls_ulen];
+
+                const cls = self.symbol_table.lookupClass(cls_upper);
+                const obj_size: u32 = if (cls) |c| @intCast(c.object_size) else 0;
+                const class_id: i32 = if (cls) |c| c.class_id else 0;
+
+                const has_strings = blk: {
+                    if (cls) |c| {
+                        for (c.fields) |field| {
+                            if (field.type_desc.base_type == .string) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+
+                if (has_strings) {
+                    const num_offsets: u32 = blk: {
+                        if (cls) |c| {
+                            var count: u32 = 0;
+                            for (c.fields) |field| {
+                                if (field.type_desc.base_type == .string) count += 1;
+                            }
+                            break :blk count;
+                        }
+                        break :blk 0;
+                    };
+                    const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{cls_upper});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w {d}, w {d}", .{ queue, msg_val, obj_size, offsets_label, num_offsets, class_id });
+                    try self.builder.emitCall("", "", "msg_send_class", args);
+                } else {
+                    const zero_l = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l copy 0\n", .{zero_l});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, l {s}, w {d}, l {s}, w 0, w {d}", .{ queue, msg_val, obj_size, zero_l, class_id });
+                    try self.builder.emitCall("", "", "msg_send_class", args);
+                }
+            },
+            .string => {
+                // STRING: deep-copy via msg_send_string
+                const msg_val = try self.expr_emitter.emitExpression(sd.message);
+                const args = try bufPrintDupe(self.allocator, "l {s}, l {s}", .{ queue, msg_val });
+                try self.builder.emitCall("", "", "msg_send_string", args);
+            },
+            .integer => {
+                // INTEGER: send as msg_send_int
+                const msg_val = try self.expr_emitter.emitExpression(sd.message);
+                const args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ queue, msg_val });
+                try self.builder.emitCall("", "", "msg_send_int", args);
+            },
+            .double => {
+                // DOUBLE (default): send as msg_send_double
+                const msg_val = try self.expr_emitter.emitExpression(sd.message);
+                const msg_type = self.expr_emitter.inferExprType(sd.message);
+
+                const double_val: []const u8 = if (msg_type == .integer) blk: {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "d", "swtof", msg_val);
+                    break :blk cvt;
+                } else msg_val;
+
+                const args = try bufPrintDupe(self.allocator, "l {s}, d {s}", .{ queue, double_val });
+                try self.builder.emitCall("", "", "msg_send_double", args);
+            },
+        }
+    }
+
+    /// Resolve the semantic send-type of a message expression.
+    /// Returns a tagged kind + optional type name for UDT/CLASS dispatch.
+    const SendTypeKind = enum { double, integer, string, udt, class_instance };
+    const SendTypeInfo = struct { kind: SendTypeKind, type_name: []const u8 };
+
+    fn resolveSendType(self: *BlockEmitter, expr: *const ast.Expression) SendTypeInfo {
+        switch (expr.data) {
+            .variable => |v| {
+                // Look up the variable in the symbol table for a rich type
+                const base = SymbolMapper.stripSuffix(v.name);
+                var upper_buf: [128]u8 = undefined;
+                const ulen = @min(base.len, upper_buf.len);
+                for (0..ulen) |i| upper_buf[i] = std.ascii.toUpper(base[i]);
+                const upper = upper_buf[0..ulen];
+
+                // Check function-local variables first
+                if (self.func_ctx) |fctx| {
+                    if (fctx.local_addrs.get(upper)) |li| {
+                        if (li.base_type == .user_defined and li.as_type_name.len > 0) {
+                            return .{ .kind = .udt, .type_name = li.as_type_name };
+                        }
+                        if (li.base_type == .class_instance and li.as_type_name.len > 0) {
+                            return .{ .kind = .class_instance, .type_name = li.as_type_name };
+                        }
+                        if (li.base_type == .string) {
+                            return .{ .kind = .string, .type_name = "" };
+                        }
+                        if (li.base_type == .integer) {
+                            return .{ .kind = .integer, .type_name = "" };
+                        }
+                    }
+                }
+
+                // Check global variables
+                if (self.symbol_table.lookupVariable(upper)) |vsym| {
+                    if (vsym.type_desc.base_type == .user_defined and vsym.type_desc.udt_name.len > 0) {
+                        return .{ .kind = .udt, .type_name = vsym.type_desc.udt_name };
+                    }
+                    if (vsym.type_desc.base_type == .class_instance and vsym.type_desc.class_name.len > 0) {
+                        return .{ .kind = .class_instance, .type_name = vsym.type_desc.class_name };
+                    }
+                    if (vsym.type_desc.base_type == .string) {
+                        return .{ .kind = .string, .type_name = "" };
+                    }
+                    if (vsym.type_desc.base_type == .integer) {
+                        return .{ .kind = .integer, .type_name = "" };
+                    }
+                }
+
+                // Fall back to suffix-based inference
+                if (v.name.len > 0) {
+                    const last = v.name[v.name.len - 1];
+                    if (last == '$') return .{ .kind = .string, .type_name = "" };
+                    if (last == '%') return .{ .kind = .integer, .type_name = "" };
+                }
+            },
+            .string_lit => return .{ .kind = .string, .type_name = "" },
+            .create => |cr| return .{ .kind = .udt, .type_name = cr.type_name },
+            .new => |n| return .{ .kind = .class_instance, .type_name = n.class_name },
+            else => {},
+        }
+
+        // Default: treat as double
+        const expr_type = self.expr_emitter.inferExprType(expr);
+        if (expr_type == .integer) return .{ .kind = .integer, .type_name = "" };
+        if (expr_type == .string) return .{ .kind = .string, .type_name = "" };
+        return .{ .kind = .double, .type_name = "" };
+    }
+
+    /// Emit CANCEL handle — send cancellation signal to a worker.
+    fn emitCancelStatement(self: *BlockEmitter, cn: *const ast.CancelStmt) EmitError!void {
+        try self.builder.emitComment("CANCEL worker");
+
+        // Evaluate the handle expression
+        const handle_d = try self.expr_emitter.emitExpression(cn.handle);
+
+        // Cast double to pointer
+        const handle = try self.builder.newTemp();
+        try self.builder.emit("    {s} =l cast {s}\n", .{ handle, handle_d });
+
+        // Get the outbox (main→worker) to set the cancel flag
+        const offset = try self.builder.newTemp();
+        try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+        const queue = try self.builder.newTemp();
+        const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+        try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+
+        // msg_cancel(queue)
+        const cancel_args = try bufPrintDupe(self.allocator, "l {s}", .{queue});
+        try self.builder.emitCall("", "", "msg_cancel", cancel_args);
+    }
+
     // ── Terminal I/O Statement Emitters ─────────────────────────────────
 
     fn emitCLS(self: *BlockEmitter) EmitError!void {
@@ -10672,6 +11906,16 @@ pub const CFGCodeGenerator = struct {
                     try std.fmt.format(params_buf.writer(self.allocator), "{s} %{s}", .{ pt, param_stripped });
                 }
 
+                // For messaging-enabled workers, append the hidden
+                // __parent_handle parameter (FutureHandle pointer passed
+                // as a double by worker_spawn_messaging via the args block).
+                if (fsym.is_worker and fsym.uses_messaging) {
+                    if (fsym.parameters.len > 0) {
+                        try params_buf.appendSlice(self.allocator, ", ");
+                    }
+                    try params_buf.appendSlice(self.allocator, "d %__parent_handle");
+                }
+
                 // Build function context for parameter / local tracking.
                 const duped_upper = try self.allocator.dupe(u8, upper_name_stripped);
                 var func_ctx = FunctionContext.init(
@@ -11055,8 +12299,36 @@ pub const CFGCodeGenerator = struct {
             try be.emitForEachBodyLoad(block);
         }
 
+        // Special: merge block for MATCH RECEIVE — free the message blob envelope.
+        if (block.kind == .merge) {
+            if (be.match_receive_merge_cleanups.get(block.index)) |cleanup| {
+                try self.builder.emitComment("MATCH RECEIVE — free message blob envelope");
+                if (cleanup.needs_load) {
+                    // blob_ref is a stack slot — load the pointer first.
+                    // Forward-arms null this slot after pushing, so the
+                    // load yields null and msg_blob_free becomes a no-op.
+                    const loaded = try self.builder.newTemp();
+                    try self.builder.emitLoad(loaded, "l", cleanup.blob_ref);
+                    const free_args = try bufPrintDupe(self.allocator, "l {s}", .{loaded});
+                    try be.runtime.callVoid("msg_blob_free", free_args);
+                } else {
+                    const free_args = try bufPrintDupe(self.allocator, "l {s}", .{cleanup.blob_ref});
+                    try be.runtime.callVoid("msg_blob_free", free_args);
+                }
+            }
+        }
+
+        // Activate forward context if this is a forward-arm body block.
+        const saved_fwd_ctx = be.active_forward_ctx;
+        if (be.forward_body_blocks.get(block.index)) |fwd| {
+            be.active_forward_ctx = fwd;
+        }
+
         // Emit statements in this block.
         try be.emitBlockStatements(block);
+
+        // Restore previous forward context.
+        be.active_forward_ctx = saved_fwd_ctx;
 
         // Special: exit block for main function.
         if (block.kind == .exit_block and is_main) {
