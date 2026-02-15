@@ -30,6 +30,7 @@ const token_mod = @import("token.zig");
 const parser_mod = @import("parser.zig");
 const ast = @import("ast.zig");
 const semantic = @import("semantic.zig");
+const ast_optimize = @import("ast_optimize.zig");
 const cfg_mod = @import("cfg.zig");
 const codegen = @import("codegen.zig");
 const qbe = @import("qbe.zig");
@@ -68,6 +69,7 @@ const Options = struct {
     run_after_compile: bool = false,
     jit_verbose: bool = false,
     metrics: bool = false,
+    no_optimize: bool = false,
     cc_path: []const u8 = "cc",
     runtime_dir: ?[]const u8 = null,
     error_message: ?[]const u8 = null,
@@ -139,6 +141,8 @@ fn parseArgs(allocator: std.mem.Allocator) Options {
             };
         } else if (std.mem.eql(u8, arg, "--fail-fast")) {
             opts.batch_fail_fast = true;
+        } else if (std.mem.eql(u8, arg, "--no-optimize")) {
+            opts.no_optimize = true;
         } else if (std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, arg, "-r") or std.mem.eql(u8, arg, "--run")) {
@@ -204,6 +208,7 @@ fn printHelp(writer: anytype) void {
         \\Options:
         \\  -o <path>                Output file path (default: derived from input)
         \\  -v, --verbose            Verbose compiler output
+        \\  --no-optimize            Disable AST optimization pass
         \\  -h, --help               Show this help message
         \\  -V, --version            Show version information
         \\
@@ -876,6 +881,7 @@ fn runSingleBatchFile(
     jit_verbose: bool,
     show_metrics: bool,
     timeout_secs: u32,
+    no_optimize: bool,
 ) BatchResult {
     const stderr = std.fs.File.stderr().deprecatedWriter();
 
@@ -944,6 +950,16 @@ fn runSingleBatchFile(
         return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "semantic" };
     }
 
+    // ── AST optimization ────────────────────────────────────────────
+    var ast_opt = ast_optimize.ASTOptimizer.init(analyzer.getSymbolTable(), allocator);
+    defer ast_opt.deinit();
+    if (!no_optimize) {
+        ast_opt.optimize(@constCast(&program)) catch {
+            stderr.print("  ERROR: AST optimization failure\n", .{}) catch {};
+            return .{ .ok = false, .exit_code = -1, .compile_ms = 0, .exec_ms = 0, .error_phase = "ast_opt" };
+        };
+    }
+
     // ── CFG ─────────────────────────────────────────────────────────
     var cfg_builder = CFGBuilder.init(allocator);
     defer cfg_builder.deinit();
@@ -957,6 +973,7 @@ fn runSingleBatchFile(
     defer gen.deinit();
     gen.verbose = false; // suppress per-file codegen verbosity
     gen.samm_enabled = analyzer.options.samm_enabled;
+    gen.for_step_directions = &ast_opt.for_step_directions;
 
     const il = gen.generate(&program) catch {
         stderr.print("  ERROR: code generation failure\n", .{}) catch {};
@@ -1169,6 +1186,7 @@ pub fn main() !void {
                 opts.jit_verbose,
                 opts.metrics,
                 opts.batch_timeout,
+                opts.no_optimize,
             );
 
             total_compile_ms += result.compile_ms;
@@ -1369,6 +1387,40 @@ pub fn main() !void {
         return;
     }
 
+    // ── Phase 4a: AST optimization ──────────────────────────────────────
+
+    var ast_opt = ast_optimize.ASTOptimizer.init(analyzer.getSymbolTable(), allocator);
+    defer ast_opt.deinit();
+
+    if (!opts.no_optimize) {
+        ast_opt.optimize(@constCast(&program)) catch |err| {
+            stderr.print("Error: AST optimization failure: {s}\n", .{@errorName(err)}) catch {};
+            std.process.exit(1);
+        };
+    }
+
+    if (opts.verbose and ast_opt.stats.total() > 0) {
+        stderr.print("AST optimizer: {d} optimizations (fold={d} prop={d} str={d}/{d} pow={d} dead={d} iif={d} alg={d} for={d} not={d} dblneg={d} strfn={d} div2mul={d} mod2and={d} deadloop={d} bool={d})\n", .{
+            ast_opt.stats.total(),
+            ast_opt.stats.constants_folded,
+            ast_opt.stats.constants_propagated,
+            ast_opt.stats.strings_folded,
+            ast_opt.stats.string_identities,
+            ast_opt.stats.powers_reduced,
+            ast_opt.stats.dead_branches,
+            ast_opt.stats.iifs_simplified,
+            ast_opt.stats.algebraic_identities,
+            ast_opt.stats.for_loops_specialized,
+            ast_opt.stats.not_folded,
+            ast_opt.stats.double_negations,
+            ast_opt.stats.string_funcs_folded,
+            ast_opt.stats.div_to_mul,
+            ast_opt.stats.mod_to_and,
+            ast_opt.stats.dead_loops,
+            ast_opt.stats.bool_identities,
+        }) catch {};
+    }
+
     // ── Phase 4b: Control Flow Graph construction ───────────────────────
 
     var cfg_builder = CFGBuilder.init(allocator);
@@ -1427,6 +1479,7 @@ pub fn main() !void {
 
     gen.verbose = opts.verbose;
     gen.samm_enabled = analyzer.options.samm_enabled;
+    gen.for_step_directions = &ast_opt.for_step_directions;
 
     const il = gen.generate(&program) catch |err| {
         stderr.print("Error: code generation failure: {s}\n", .{@errorName(err)}) catch {};

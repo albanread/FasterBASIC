@@ -466,6 +466,7 @@ pub fn build(b: *std.Build) void {
         .{ .root_source_file = b.path("src/semantic.zig"), .needs_qbe = false },
         .{ .root_source_file = b.path("src/codegen.zig"), .needs_qbe = false },
         .{ .root_source_file = b.path("src/cfg.zig"), .needs_qbe = false },
+        .{ .root_source_file = b.path("src/ast_optimize.zig"), .needs_qbe = false },
         .{ .root_source_file = b.path("src/qbe.zig"), .needs_qbe = true },
     };
 
