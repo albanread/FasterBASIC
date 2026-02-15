@@ -78,6 +78,33 @@ fn flushIfNeeded() void {
     }
 }
 
+// =========================================================================
+// Thread-safe PRINT — statement-level mutex
+// =========================================================================
+//
+// A single PRINT statement (e.g. PRINT "x="; x; " y="; y) compiles to
+// multiple basic_print_* calls.  Without protection, concurrent PRINT
+// from workers and main interleave mid-line, producing garbled output.
+//
+// basic_print_lock / basic_print_unlock bracket an entire PRINT statement
+// so all its items, separators, and trailing newline appear atomically.
+// The codegen emits lock() before the first item and unlock() after the
+// last (including the newline if present).
+//
+// The mutex is a simple non-recursive std.Thread.Mutex.  PRINT items are
+// expressions that cannot themselves contain PRINT statements, so
+// recursive acquisition is not needed.
+
+var g_print_mutex: std.Thread.Mutex = .{};
+
+export fn basic_print_lock() callconv(.c) void {
+    g_print_mutex.lock();
+}
+
+export fn basic_print_unlock() callconv(.c) void {
+    g_print_mutex.unlock();
+}
+
 // POSIX (for INKEY$)
 extern fn fcntl(fd: c_int, cmd: c_int, ...) c_int;
 extern fn read(fd: c_int, buf: [*]u8, count: usize) isize;

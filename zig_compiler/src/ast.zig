@@ -1188,15 +1188,20 @@ pub const PlaySoundStmt = struct {
 pub const TimeUnit = enum {
     milliseconds,
     seconds,
+    minutes,
     frames,
 };
 
 pub const TimerEventStmt = struct {
     duration: ExprPtr,
     unit: TimeUnit = .milliseconds,
+    // Legacy CALL-based handler (unused, kept for AST compat)
     handler_name: []const u8 = "",
     inline_body: []StmtPtr = &.{},
     is_inline_handler: bool = false,
+    // SEND-based timer: AFTER/EVERY <dur> <unit> SEND <handle>, <message>
+    send_handle: ?ExprPtr = null,
+    send_message: ?ExprPtr = null,
 };
 
 pub const RunStmt = struct {

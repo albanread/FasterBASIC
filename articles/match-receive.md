@@ -189,6 +189,121 @@ PRINT "Total: "; total   ' 30.5
 
 ---
 
+## How Messages Flow
+
+If you've read the examples above and the syntax makes sense, you can skip ahead to the [parallel pi calculator](#real-world-example-parallel-pi-calculator). This section explains what's happening behind the scenes — useful when you need to reason about message ordering or debug unexpected behavior.
+
+### The Big Picture
+
+When you `SPAWN` a worker, the runtime creates two one-way message queues — one for each direction. `SEND` puts a message on a queue; `MATCH RECEIVE` takes one off. The main program and the worker never touch the same memory directly.
+
+```
+    Main Program                              Worker
+    ════════════                              ══════
+
+                       outbox (main → worker)
+    SEND f, data  ──▶ ┌───┬───┬───┬───┐ ──▶  MATCH RECEIVE(PARENT)
+                       │ 1 │ 2 │ 3 │   │        CASE Point → ...
+                       └───┴───┴───┴───┘        CASE INTEGER → ...
+                              FIFO               CASE ELSE → ...
+
+                       inbox (worker → main)
+    MATCH RECEIVE(f) ◀── ┌───┬───┬───┬───┐ ◀──  SEND PARENT, result
+      CASE WorkResult →  │ 1 │ 2 │   │   │
+      CASE STRING →      └───┴───┴───┴───┘
+                               FIFO
+```
+
+Each queue holds up to 256 messages. If a queue is full, `SEND` blocks until the other side consumes something. If a queue is empty, `MATCH RECEIVE` blocks until a message arrives. This back-pressure keeps fast producers from overwhelming slow consumers.
+
+### What Happens Inside MATCH RECEIVE
+
+`MATCH RECEIVE` always takes the **next message in line** — the one at the front of the queue. It checks the type, runs the first CASE arm that matches, and moves on. One message per `MATCH RECEIVE`, always from the front.
+
+```
+    Queue (front → back):  [ Point | INTEGER | STRING ]
+                              │
+                         pop front
+                              │
+                              ▼
+                     ┌─────────────────┐
+                     │  What type is   │
+                     │  this message?  │
+                     └──┬──────┬───────┘
+                        │      │       │
+                   Point?   INTEGER?  no match
+                     │         │       │
+                     ▼         ▼       ▼
+                  CASE arm  CASE arm  CASE ELSE
+                  runs      runs      runs
+```
+
+This is different from some other languages (like Erlang) where `receive` can scan the entire mailbox looking for a specific message type, skipping over non-matching messages until it finds one. That approach is flexible but can be a performance trap — if thousands of "Type A" messages pile up while you're waiting for a "Type B", every receive has to scan past all of them.
+
+FasterBASIC keeps it simple: you always get the front message. No scanning, no skipping, no surprises. This means `MATCH RECEIVE` is always O(1) — constant time regardless of how many messages are in the queue.
+
+### Message Ordering Matters
+
+Because `MATCH RECEIVE` always takes the front message, sender and receiver need to agree on the order. If a worker sends a `Point` and then a `Box`:
+
+```
+' Worker sends in this order:
+SEND PARENT, myPoint     ' goes in first
+SEND PARENT, myBox       ' goes in second
+
+' Main receives in the same order:
+MATCH RECEIVE(f)          ' gets the Point
+    CASE Point pt → ...
+END MATCH
+
+MATCH RECEIVE(f)          ' gets the Box
+    CASE Box rc → ...
+END MATCH
+```
+
+The messages arrive in the order they were sent. If you put both CASEs in a single `MATCH RECEIVE` inside a loop, it still works — each iteration pops the next message and dispatches it to whichever arm matches.
+
+When you don't know the exact order, that's fine — just make sure every `MATCH RECEIVE` has arms for all the types you expect. The loop-and-dispatch pattern handles any ordering naturally:
+
+```
+WHILE count < total_expected
+    MATCH RECEIVE(f)
+        CASE Point pt
+            ' might arrive first, second, or third — doesn't matter
+        CASE Box rc
+            ' handled whenever it shows up
+        CASE ELSE
+            ' catch anything unexpected
+    END MATCH
+    count = count + 1
+WEND
+```
+
+### Always Include CASE ELSE
+
+If the front message doesn't match any CASE arm, it is consumed and discarded. There's no error and no memory leak — the runtime frees it safely. But you lose the message silently, with no indication that anything went wrong.
+
+`CASE ELSE` catches anything that doesn't match a typed arm. During development, always include it:
+
+```
+MATCH RECEIVE(f)
+    CASE Point pt
+        PRINT "Got a point"
+    CASE INTEGER n%
+        PRINT "Got an integer"
+    CASE ELSE
+        PRINT "Unexpected message — check your protocol!"
+END MATCH
+```
+
+This turns a silent discard into a visible warning. Once your protocol is stable and tested, you can remove the `CASE ELSE` if you prefer — unmatched messages are still handled safely, just silently.
+
+### Cleanup at AWAIT
+
+When you call `AWAIT` on a worker handle, any messages still sitting in either queue are freed automatically. The `Dropped (drained)` counter in the [diagnostics report](#message-memory-diagnostics) tells you how many were cleaned up this way. If that number is unexpectedly high, it means your receiver finished before consuming everything the sender sent — worth investigating.
+
+---
+
 ## Real-World Example: Parallel Pi Calculator
 
 Here's a complete program that uses workers to solve a real problem — computing π via numerical integration. The integral of `4/(1+x²)` over `[0, 1]` equals π exactly. We split the range across 4 workers, each computing its sub-range using the midpoint rectangle rule, then collect and sum the partial results.
@@ -317,7 +432,44 @@ A few things to notice:
 
 ## Zero-Copy Bounce Optimization
 
-When a worker receives a UDT and sends the same variable back to the same handle, the compiler detects the **bounce pattern** and skips the marshal/unmarshal cycle. Instead of copying the payload out and then copying it back in, it modifies the payload in-place and forwards the original blob:
+When a worker receives a UDT and sends the same variable back to the same handle, the compiler detects the **bounce pattern** and skips the marshal/unmarshal cycle. Instead of copying the payload out and then copying it back in, it modifies the payload in-place and forwards the original blob.
+
+Here's what normally happens versus what the optimization does:
+
+```
+  Normal path (every receive + send = 4 allocations):
+
+    Queue          Worker memory         Queue
+    ┌─────┐        ┌─────────┐          ┌─────┐
+    │ blob│──pop──▶│ unmarshal│          │     │
+    │     │  free  │ into     │          │     │
+    └─────┘  blob  │ local p  │          │     │
+                   │          │          │     │
+                   │ p.x=p.x+1│          │     │
+                   │          │          │     │
+                   │ marshal  │──push──▶│ new │
+                   │ from p   │  alloc   │ blob│
+                   └─────────┘  blob    └─────┘
+
+    Cost: free old blob, alloc local, alloc new blob, free local
+          = 2 malloc + 2 free + 2 memcpy per round trip
+
+
+  Zero-copy path (0 allocations per bounce):
+
+    Queue          Blob payload          Queue
+    ┌─────┐        ┌──────────┐         ┌─────┐
+    │ blob│──pop──▶│ modify   │──push──▶│same │
+    │     │        │ in-place │         │blob!│
+    └─────┘        │          │         └─────┘
+                   │ p.x=p.x+1│
+                   └──────────┘
+
+    Cost: 0 malloc, 0 free, 0 memcpy
+          The same blob survives the entire ping-pong
+```
+
+Here's the code that triggers the optimization:
 
 ```
 TYPE Point
@@ -350,7 +502,9 @@ This optimization is:
 
 - **Automatic.** No special syntax needed. Write the natural ping-pong pattern and the compiler recognizes it.
 - **Per-arm.** In a MATCH RECEIVE with multiple CASE arms, some can forward while others consume normally.
-- **Safe for flat UDTs.** Types with only DOUBLE/INTEGER fields are forwarded without restriction. Types with STRING fields currently use the standard marshal/unmarshal path to ensure correct memory management.
+- **Safe for flat UDTs.** Types with only DOUBLE/INTEGER fields are forwarded without restriction.
+
+**Note on STRING fields:** UDTs that contain STRING fields do *not* use zero-copy forwarding. Strings in FasterBASIC are managed by the SAMM memory system, and forwarding a blob that contains string pointers across thread boundaries would create ownership conflicts. For these types, the compiler automatically falls back to the standard marshal/unmarshal path, which deep-copies all string data safely. You don't need to do anything — the compiler makes the right choice based on the UDT's field types.
 
 In the message memory diagnostics (see below), forwarded messages show up in the `Forwarded (0-cp)` counter.
 
@@ -443,11 +597,13 @@ The back-pressure counters are particularly useful for diagnosing performance: i
 ## Things to Know
 
 - **MATCH RECEIVE blocks** until a message arrives, just like `RECEIVE`. Use `HASMESSAGE(handle)` first if you don't want to block.
+- **Always pops from the front.** There is no mailbox scanning — you get the next message in line, every time. See [How Messages Flow](#how-messages-flow) for details.
 - **One message per MATCH RECEIVE.** Put it in a loop to process multiple messages.
-- **CASE ELSE must be last.** Include it during development to catch unexpected types.
+- **Include CASE ELSE during development.** Without it, unmatched messages are consumed and silently discarded. `CASE ELSE` makes those visible. See [Always Include CASE ELSE](#always-include-case-else).
+- **CASE ELSE must be last** when present.
 - **Arms are tested in order.** The first match wins.
 - **No DIM needed** for binding variables — the compiler allocates storage automatically.
-- **You still need AWAIT** after you're done with messages, to join the thread and clean up.
+- **You still need AWAIT** after you're done with messages, to join the thread and clean up. Any unconsumed messages are freed automatically.
 - `END MATCH` and `ENDMATCH` are both accepted.
 
 ---

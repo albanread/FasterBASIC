@@ -409,6 +409,7 @@ pub const Tag = enum(u16) {
     // ── Keywords (time units) ────────────────────────────────────────────
     kw_ms,
     kw_secs,
+    kw_minutes,
     kw_frames,
 
     // ── Keywords (hashmap methods) ───────────────────────────────────────
@@ -806,17 +807,18 @@ fn initKeywordMap(_: std.mem.Allocator) !void {
         // .{ "PLAY", .kw_play },
         // .{ "PLAY_SOUND", .kw_play_sound },
         .{ "SLEEP", .kw_sleep },
-        // Timing - commented out some to reduce keyword map size
+        // Timing
         // .{ "VSYNC", .kw_vsync },
-        // .{ "AFTER", .kw_after },
-        // .{ "EVERY", .kw_every },
+        .{ "AFTER", .kw_after },
+        .{ "EVERY", .kw_every },
         // .{ "AFTERFRAMES", .kw_afterframes },
         // .{ "EVERYFRAME", .kw_everyframe },
-        // .{ "TIMER", .kw_timer },
-        // .{ "STOP", .kw_stop },
+        .{ "TIMER", .kw_timer },
+        .{ "STOP", .kw_stop },
         // .{ "RUN", .kw_run },
-        // .{ "MS", .kw_ms },
-        // .{ "SECS", .kw_secs },
+        .{ "MS", .kw_ms },
+        .{ "SECS", .kw_secs },
+        .{ "MINUTES", .kw_minutes },
         // .{ "FRAMES", .kw_frames },
         .{ "AND", .kw_and },
         .{ "OR", .kw_or },

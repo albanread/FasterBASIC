@@ -882,6 +882,8 @@ pub const RuntimeLibrary = struct {
         try self.declare("basic_print_string_desc", "l %str");
         try self.declare("basic_print_newline", "");
         try self.declare("basic_print_tab", "");
+        try self.declare("basic_print_lock", "");
+        try self.declare("basic_print_unlock", "");
         try self.declare("basic_input_string", "l %prompt");
         try self.declare("basic_input_int", "l %prompt");
         try self.declare("basic_input_double", "l %prompt");
@@ -996,6 +998,12 @@ pub const RuntimeLibrary = struct {
         try self.declare("basic_timer", "");
         try self.declare("basic_timer_ms", "");
         try self.declare("basic_sleep_ms", "w %ms");
+
+        // Timer SEND  (runtime: messaging.zig)
+        try self.declare("timer_after_send", "l %queue, l %blob, l %delay_ms");
+        try self.declare("timer_every_send", "l %queue, l %blob, l %interval_ms");
+        try self.declare("timer_stop", "w %slot");
+        try self.declare("timer_stop_all", "");
 
         // Hashmap  (runtime: hashmap.qbe — appended to IL when needed)
         try self.declare("hashmap_new", "w %capacity");
@@ -5308,6 +5316,9 @@ pub const BlockEmitter = struct {
             .unmarshall => |um| try self.emitUnmarshallStatement(&um),
             .send => |sd| try self.emitSendStatement(&sd),
             .cancel => |cn| try self.emitCancelStatement(&cn),
+            .after => |af| try self.emitTimerSendStatement(&af, false),
+            .every => |ev| try self.emitTimerSendStatement(&ev, true),
+            .timer_stop => |ts| try self.emitTimerStopStatement(&ts),
             .match_type => |mt| try self.emitMatchTypeInit(&mt, block),
             .match_receive => |mr| try self.emitMatchReceiveInit(&mr, block),
 
@@ -5345,6 +5356,212 @@ pub const BlockEmitter = struct {
             // ── Fallback ────────────────────────────────────────────────
             else => {
                 try self.builder.emitComment("TODO: unhandled statement in block");
+            },
+        }
+    }
+
+    // ── AFTER / EVERY ... SEND ──────────────────────────────────────────
+
+    /// Emit code for AFTER/EVERY <duration> [MS|SECS|MINUTES] SEND <handle>, <message>.
+    /// Marshals the message into a blob, resolves the target queue, computes
+    /// the delay in milliseconds, and calls timer_after_send or timer_every_send.
+    fn emitTimerSendStatement(self: *BlockEmitter, te: *const ast.TimerEventStmt, is_repeating: bool) EmitError!void {
+        const send_handle = te.send_handle orelse return;
+        const send_message = te.send_message orelse return;
+
+        if (is_repeating) {
+            try self.builder.emitComment("EVERY ... SEND — repeating timer");
+        } else {
+            try self.builder.emitComment("AFTER ... SEND — one-shot timer");
+        }
+
+        // ── 1. Resolve the target queue (same logic as emitSendStatement) ──
+        const handle_d = try self.expr_emitter.emitExpression(send_handle);
+        const is_parent = (send_handle.data == .parent);
+
+        const handle: []const u8 = if (is_parent) blk: {
+            break :blk handle_d;
+        } else blk: {
+            const h = try self.builder.newTemp();
+            try self.builder.emit("    {s} =l cast {s}\n", .{ h, handle_d });
+            break :blk h;
+        };
+
+        const queue = try self.builder.newTemp();
+        if (is_parent) {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_inbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_inbox", get_args);
+        } else {
+            const offset = try self.builder.newTemp();
+            try self.builder.emitCall(offset, "w", "worker_future_outbox_offset", "");
+            const get_args = try bufPrintDupe(self.allocator, "l {s}, w {s}", .{ handle, offset });
+            try self.builder.emitCall(queue, "l", "msg_get_outbox", get_args);
+        }
+
+        // ── 2. Marshal the message into a blob (without pushing) ────────
+        const blob = try self.builder.newTemp();
+        const send_info = self.resolveSendType(send_message);
+
+        switch (send_info.kind) {
+            .udt => {
+                const msg_val = try self.expr_emitter.emitExpression(send_message);
+                var udt_upper_buf: [128]u8 = undefined;
+                const udt_ulen = @min(send_info.type_name.len, udt_upper_buf.len);
+                for (0..udt_ulen) |ui| udt_upper_buf[ui] = std.ascii.toUpper(send_info.type_name[ui]);
+                const udt_upper = udt_upper_buf[0..udt_ulen];
+
+                const obj_size: u32 = self.type_manager.sizeOfUDT(udt_upper);
+                const type_id: i32 = self.symbol_table.getTypeId(udt_upper) orelse 0;
+
+                const has_strings = blk: {
+                    if (self.symbol_table.lookupType(udt_upper)) |ts| {
+                        if (self.hasStringFields(ts)) break :blk true;
+                    }
+                    break :blk false;
+                };
+
+                if (has_strings) {
+                    const num_offsets: u32 = blk: {
+                        if (self.symbol_table.lookupType(udt_upper)) |ts| {
+                            break :blk self.countUDTStringFields(ts);
+                        }
+                        break :blk 0;
+                    };
+                    const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{udt_upper});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, w {d}, l {s}, w {d}, w {d}", .{ msg_val, obj_size, offsets_label, num_offsets, type_id });
+                    try self.builder.emitCall(blob, "l", "msg_marshall_udt_typed", args);
+                } else {
+                    const zero_l = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l copy 0\n", .{zero_l});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, w {d}, l {s}, w 0, w {d}", .{ msg_val, obj_size, zero_l, type_id });
+                    try self.builder.emitCall(blob, "l", "msg_marshall_udt_typed", args);
+                }
+            },
+            .class_instance => {
+                const msg_val = try self.expr_emitter.emitExpression(send_message);
+                var cls_upper_buf: [128]u8 = undefined;
+                const cls_ulen = @min(send_info.type_name.len, cls_upper_buf.len);
+                for (0..cls_ulen) |ci| cls_upper_buf[ci] = std.ascii.toUpper(send_info.type_name[ci]);
+                const cls_upper = cls_upper_buf[0..cls_ulen];
+
+                const cls = self.symbol_table.lookupClass(cls_upper);
+                const obj_size: u32 = if (cls) |cc| @intCast(cc.object_size) else 0;
+                const class_id: i32 = if (cls) |cc| cc.class_id else 0;
+
+                const has_strings = blk: {
+                    if (cls) |cc| {
+                        for (cc.fields) |field| {
+                            if (field.type_desc.base_type == .string) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+
+                if (has_strings) {
+                    const num_offsets: u32 = blk: {
+                        if (cls) |cc| {
+                            var count: u32 = 0;
+                            for (cc.fields) |field| {
+                                if (field.type_desc.base_type == .string) count += 1;
+                            }
+                            break :blk count;
+                        }
+                        break :blk 0;
+                    };
+                    const offsets_label = try bufPrintDupe(self.allocator, "$str_offsets_{s}", .{cls_upper});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, w {d}, l {s}, w {d}, w {d}", .{ msg_val, obj_size, offsets_label, num_offsets, class_id });
+                    try self.builder.emitCall(blob, "l", "msg_marshall_class", args);
+                } else {
+                    const zero_l = try self.builder.newTemp();
+                    try self.builder.emit("    {s} =l copy 0\n", .{zero_l});
+                    const args = try bufPrintDupe(self.allocator, "l {s}, w {d}, l {s}, w 0, w {d}", .{ msg_val, obj_size, zero_l, class_id });
+                    try self.builder.emitCall(blob, "l", "msg_marshall_class", args);
+                }
+            },
+            .string => {
+                const msg_val = try self.expr_emitter.emitExpression(send_message);
+                const args = try bufPrintDupe(self.allocator, "l {s}", .{msg_val});
+                try self.builder.emitCall(blob, "l", "msg_marshall_string", args);
+            },
+            .integer => {
+                const msg_val = try self.expr_emitter.emitExpression(send_message);
+                const args = try bufPrintDupe(self.allocator, "w {s}", .{msg_val});
+                try self.builder.emitCall(blob, "l", "msg_marshall_int", args);
+            },
+            .double => {
+                const msg_val = try self.expr_emitter.emitExpression(send_message);
+                const msg_type = self.expr_emitter.inferExprType(send_message);
+                const double_val: []const u8 = if (msg_type == .integer) blk: {
+                    const cvt = try self.builder.newTemp();
+                    try self.builder.emitConvert(cvt, "d", "swtof", msg_val);
+                    break :blk cvt;
+                } else msg_val;
+                const args = try bufPrintDupe(self.allocator, "d {s}", .{double_val});
+                try self.builder.emitCall(blob, "l", "msg_marshall_double", args);
+            },
+        }
+
+        // ── 3. Compute delay in milliseconds ────────────────────────────
+        const dur_val = try self.expr_emitter.emitExpression(te.duration);
+        const dur_type = self.expr_emitter.inferExprType(te.duration);
+
+        // Convert duration to a double for multiplication
+        const dur_double: []const u8 = if (dur_type == .integer) blk: {
+            const cvt = try self.builder.newTemp();
+            try self.builder.emitConvert(cvt, "d", "swtof", dur_val);
+            break :blk cvt;
+        } else dur_val;
+
+        // Multiply by unit factor to get milliseconds
+        const delay_ms_d = switch (te.unit) {
+            .milliseconds => dur_double,
+            .seconds => blk: {
+                const factor = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d d_1000.0\n", .{factor});
+                const result = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d mul {s}, {s}\n", .{ result, dur_double, factor });
+                break :blk result;
+            },
+            .minutes => blk: {
+                const factor = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d d_60000.0\n", .{factor});
+                const result = try self.builder.newTemp();
+                try self.builder.emit("    {s} =d mul {s}, {s}\n", .{ result, dur_double, factor });
+                break :blk result;
+            },
+            .frames => dur_double, // treat as ms for now
+        };
+
+        // Convert to i64 for the runtime call
+        const delay_ms = try self.builder.newTemp();
+        try self.builder.emitConvert(delay_ms, "l", "dtosi", delay_ms_d);
+
+        // ── 4. Call timer_after_send or timer_every_send ─────────────────
+        const timer_fn = if (is_repeating) "timer_every_send" else "timer_after_send";
+        const timer_args = try bufPrintDupe(self.allocator, "l {s}, l {s}, l {s}", .{ queue, blob, delay_ms });
+        const timer_id = try self.builder.newTemp();
+        try self.builder.emitCall(timer_id, "w", timer_fn, timer_args);
+    }
+
+    /// Emit code for TIMER STOP <id> or TIMER STOP ALL.
+    fn emitTimerStopStatement(self: *BlockEmitter, ts: *const ast.TimerStopStmt) EmitError!void {
+        switch (ts.target_type) {
+            .all => {
+                try self.builder.emitComment("TIMER STOP ALL");
+                try self.runtime.callVoid("timer_stop_all", "");
+            },
+            .timer_id => {
+                try self.builder.emitComment("TIMER STOP <id>");
+                if (ts.timer_id) |id_expr| {
+                    const id_val = try self.expr_emitter.emitExpression(id_expr);
+                    const args = try bufPrintDupe(self.allocator, "w {s}", .{id_val});
+                    try self.runtime.callVoid("timer_stop", args);
+                }
+            },
+            .handler => {
+                try self.builder.emitComment("TIMER STOP (handler — legacy, no-op)");
             },
         }
     }
@@ -9093,6 +9310,14 @@ pub const BlockEmitter = struct {
             file_handle = fh;
         }
 
+        // Acquire the print mutex for console output so that a complete
+        // PRINT statement (all items + trailing newline) appears atomically.
+        // File output is already serialised by the file handle and doesn't
+        // need the console mutex.
+        if (file_handle == null) {
+            try self.runtime.callVoid("basic_print_lock", "");
+        }
+
         for (pr.items) |item| {
             if (file_handle) |fh| {
                 // Print to file
@@ -9150,6 +9375,11 @@ pub const BlockEmitter = struct {
             } else {
                 try self.runtime.callVoid("basic_print_newline", "");
             }
+        }
+
+        // Release the print mutex (console output only).
+        if (file_handle == null) {
+            try self.runtime.callVoid("basic_print_unlock", "");
         }
     }
 
@@ -9265,6 +9495,9 @@ pub const BlockEmitter = struct {
     }
 
     fn emitConsoleStatement(self: *BlockEmitter, con: *const ast.ConsoleStmt) EmitError!void {
+        // Acquire the print mutex so the entire CONSOLE statement is atomic.
+        try self.runtime.callVoid("basic_print_lock", "");
+
         for (con.items) |item| {
             // Check for UDT variables — same treatment as emitPrintStatement
             const udt_name = self.expr_emitter.inferUDTNameForExpr(item.expr);
@@ -9280,6 +9513,8 @@ pub const BlockEmitter = struct {
         if (con.trailing_newline) {
             try self.runtime.callVoid("basic_print_newline", "");
         }
+
+        try self.runtime.callVoid("basic_print_unlock", "");
     }
 
     // ── FIELD / LSET / RSET / PUT / GET / SEEK emitters ─────────────────

@@ -2855,10 +2855,12 @@ pub const SemanticAnalyzer = struct {
     /// use graphics/sprites/audio, or spawn nested workers.
     fn validateWorkerStatement(self: *SemanticAnalyzer, stmt: *const ast.Statement) !void {
         switch (stmt.data) {
-            // ── Forbidden: I/O ──────────────────────────────────────────
-            .print, .console => {
-                try self.addError(.worker_isolation_violation, "PRINT/CONSOLE not allowed inside a WORKER (no I/O in isolated threads)", stmt.loc);
-            },
+            // ── Allowed: PRINT / CONSOLE ────────────────────────────────
+            // Thread-safe since the codegen wraps each statement in
+            // basic_print_lock / basic_print_unlock (statement-level mutex).
+            .print, .console => {},
+
+            // ── Forbidden: INPUT (requires stdin, not meaningful in a worker)
             .input, .input_at => {
                 try self.addError(.worker_isolation_violation, "INPUT not allowed inside a WORKER (no I/O in isolated threads)", stmt.loc);
             },
@@ -2903,15 +2905,16 @@ pub const SemanticAnalyzer = struct {
             .sprexplode,
             .play,
             .play_sound,
-            .after,
-            .every,
             .afterframes,
             .everyframe,
-            .timer_stop,
             .timer_interval,
             => {
                 try self.addError(.worker_isolation_violation, "Graphics/sprites/audio/timer commands not allowed inside a WORKER", stmt.loc);
             },
+            // ── Allowed: AFTER / EVERY / TIMER STOP ─────────────────────
+            // These spawn lightweight timer threads that SEND messages via
+            // the existing queue infrastructure — no isolation violation.
+            .after, .every, .timer_stop => {},
             // ── Allowed: local assignments, control flow, etc. ──────────
             .let => |lt| {
                 // Check that the variable isn't a GLOBAL.

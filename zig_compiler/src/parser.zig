@@ -341,6 +341,7 @@ pub const Parser = struct {
             .kw_on => self.parseOnStatement(),
             .kw_after => self.parseAfterStatement(),
             .kw_every => self.parseEveryStatement(),
+            .kw_timer => self.parseTimerStatement(),
             .kw_run => self.parseRunStatement(),
             .kw_match => self.parseMatchTypeStatement(),
 
@@ -3533,70 +3534,89 @@ pub const Parser = struct {
         return error.ParseError;
     }
 
+    /// Parse AFTER <duration> [MS|SECS|MINUTES] SEND <handle>, <message>
+    /// One-shot timer: sends a message after a delay.
     fn parseAfterStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume AFTER
         const dur = try self.parseExpression();
 
-        var unit: ast.TimeUnit = .milliseconds;
-        if (self.check(.kw_ms)) {
-            _ = self.advance();
-            unit = .milliseconds;
-        } else if (self.check(.kw_secs)) {
-            _ = self.advance();
-            unit = .seconds;
-        } else if (self.check(.kw_frames)) {
-            _ = self.advance();
-            unit = .frames;
-        }
+        const unit = self.parseTimeUnit();
 
-        var handler_name: []const u8 = "";
-        if (self.check(.kw_call) or self.check(.kw_goto) or self.check(.kw_gosub)) {
-            _ = self.advance();
-        }
-        if (self.check(.identifier)) {
-            handler_name = self.current().lexeme;
-            _ = self.advance();
-        }
+        _ = try self.consume(.kw_send, "Expected SEND after AFTER <duration> [MS|SECS|MINUTES]");
+        const handle = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' between handle and message in AFTER ... SEND");
+        const message = try self.parseExpression();
 
         return self.builder.stmt(loc, .{ .after = .{
             .duration = dur,
             .unit = unit,
-            .handler_name = handler_name,
+            .send_handle = handle,
+            .send_message = message,
         } });
     }
 
+    /// Parse EVERY <duration> [MS|SECS|MINUTES] SEND <handle>, <message>
+    /// Repeating timer: sends a message at regular intervals.
     fn parseEveryStatement(self: *Parser) ExprError!ast.StmtPtr {
         const loc = self.currentLocation();
         _ = self.advance(); // consume EVERY
         const dur = try self.parseExpression();
 
-        var unit: ast.TimeUnit = .milliseconds;
-        if (self.check(.kw_ms)) {
-            _ = self.advance();
-            unit = .milliseconds;
-        } else if (self.check(.kw_secs)) {
-            _ = self.advance();
-            unit = .seconds;
-        } else if (self.check(.kw_frames)) {
-            _ = self.advance();
-            unit = .frames;
-        }
+        const unit = self.parseTimeUnit();
 
-        var handler_name: []const u8 = "";
-        if (self.check(.kw_call) or self.check(.kw_goto) or self.check(.kw_gosub)) {
-            _ = self.advance();
-        }
-        if (self.check(.identifier)) {
-            handler_name = self.current().lexeme;
-            _ = self.advance();
-        }
+        _ = try self.consume(.kw_send, "Expected SEND after EVERY <duration> [MS|SECS|MINUTES]");
+        const handle = try self.parseExpression();
+        _ = try self.consume(.comma, "Expected ',' between handle and message in EVERY ... SEND");
+        const message = try self.parseExpression();
 
         return self.builder.stmt(loc, .{ .every = .{
             .duration = dur,
             .unit = unit,
-            .handler_name = handler_name,
+            .send_handle = handle,
+            .send_message = message,
         } });
+    }
+
+    /// Parse TIMER STOP <id> | TIMER STOP ALL
+    fn parseTimerStatement(self: *Parser) ExprError!ast.StmtPtr {
+        const loc = self.currentLocation();
+        _ = self.advance(); // consume TIMER
+
+        _ = try self.consume(.kw_stop, "Expected STOP after TIMER");
+
+        // Check for TIMER STOP ALL (case-insensitive)
+        if (self.check(.identifier) and self.current().lexeme.len == 3 and std.ascii.eqlIgnoreCase(self.current().lexeme, "ALL")) {
+            _ = self.advance();
+            return self.builder.stmt(loc, .{ .timer_stop = .{
+                .target_type = .all,
+            } });
+        }
+
+        // TIMER STOP <expr>  (timer ID)
+        const id_expr = try self.parseExpression();
+        return self.builder.stmt(loc, .{ .timer_stop = .{
+            .target_type = .timer_id,
+            .timer_id = id_expr,
+        } });
+    }
+
+    /// Consume an optional time unit keyword.  Defaults to milliseconds.
+    fn parseTimeUnit(self: *Parser) ast.TimeUnit {
+        if (self.check(.kw_ms)) {
+            _ = self.advance();
+            return .milliseconds;
+        } else if (self.check(.kw_secs)) {
+            _ = self.advance();
+            return .seconds;
+        } else if (self.check(.kw_minutes)) {
+            _ = self.advance();
+            return .minutes;
+        } else if (self.check(.kw_frames)) {
+            _ = self.advance();
+            return .frames;
+        }
+        return .milliseconds;
     }
 
     fn parseRunStatement(self: *Parser) ExprError!ast.StmtPtr {

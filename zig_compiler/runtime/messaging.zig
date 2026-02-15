@@ -1179,3 +1179,363 @@ export fn msg_metrics_check_leaks() callconv(.c) i32 {
 export fn msg_metrics_reset() callconv(.c) void {
     g_msg_metrics = .{};
 }
+
+// =========================================================================
+// Timer infrastructure — AFTER / EVERY ... SEND
+// =========================================================================
+//
+// AFTER  <n> MS SEND <handle>, <value>
+//   Spawns a lightweight thread that sleeps for <n> milliseconds and
+//   then pushes a pre-marshalled message blob onto the target queue.
+//   One-shot: the thread exits after sending.
+//
+// EVERY  <n> MS SEND <handle>, <value>
+//   Same, but the thread loops: sleep → clone blob → push, repeating
+//   until cancelled via timer_stop() or timer_stop_all().
+//
+// The message is marshalled at the time the AFTER/EVERY statement
+// executes (a snapshot).  For EVERY, each tick sends a fresh clone of
+// that snapshot.  This is consistent with SEND semantics (marshal a
+// copy) and preserves worker isolation — the timer thread never reads
+// the sender's variables after the initial marshal.
+//
+// Cancellation responsiveness: long sleeps are broken into ≤100 ms
+// chunks with cancel-flag checks between them, so timer_stop()
+// returns promptly even for multi-minute intervals.
+//
+// Safety: if the target queue is closed (e.g. AWAIT already ran),
+// msg_queue_push returns 0 and frees the blob.  No leak, no crash.
+
+const MAX_TIMERS: usize = 64;
+
+const TimerSlot = struct {
+    thread: ?std.Thread = null,
+    cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    active: bool = false,
+};
+
+var g_timers: [MAX_TIMERS]TimerSlot = [_]TimerSlot{.{}} ** MAX_TIMERS;
+var g_timer_mutex: std.Thread.Mutex = .{};
+
+/// Heap-allocated context passed to the timer thread.  The thread
+/// owns this allocation and frees it before exiting.
+const TimerContext = struct {
+    queue: *MessageQueue,
+    blob: *MessageBlob,
+    delay_ms: u64,
+    is_repeating: bool,
+    slot_index: u32,
+};
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+/// Sleep `ms` milliseconds, checking `cancel` every ≤100 ms.
+/// Returns true if cancellation was detected.
+fn sleepWithCancel(ms: u64, cancel: *std.atomic.Value(bool)) bool {
+    var remaining: u64 = ms;
+    while (remaining > 0) {
+        if (cancel.load(.acquire)) return true;
+        const chunk: u64 = if (remaining > 100) 100 else remaining;
+        const secs: isize = @intCast(chunk / 1000);
+        const nsecs: isize = @intCast((chunk % 1000) * 1_000_000);
+        var ts = Timespec{ .tv_sec = secs, .tv_nsec = nsecs };
+        _ = c.nanosleep(&ts, null);
+        remaining -= chunk;
+    }
+    return false;
+}
+
+/// Deep-clone a MessageBlob (envelope + payload/inline).
+/// The caller owns the returned blob.  Returns null on alloc failure.
+fn blobClone(src: *const MessageBlob) ?*MessageBlob {
+    const dst = allocBlob(src.tag, src.payload_len) orelse return null;
+    dst.flags = src.flags;
+    dst.type_id = src.type_id;
+    dst.inline_value = src.inline_value;
+
+    switch (src.tag) {
+        MSG_DOUBLE, MSG_INTEGER, MSG_SIGNAL => {
+            // Inline-only — already copied via inline_value above.
+        },
+        MSG_STRING => {
+            // inline_value holds a string descriptor pointer.
+            // Clone the string so each blob has independent ownership.
+            if (src.inline_value != 0) {
+                const orig_ptr: *StringDescriptor = @ptrFromInt(src.inline_value);
+                const cloned = string_clone(orig_ptr);
+                dst.inline_value = @intFromPtr(cloned);
+                MessageMetrics.inc(&g_msg_metrics.strings_cloned);
+            }
+        },
+        MSG_UDT, MSG_CLASS, MSG_ARRAY, MSG_MARSHALLED => {
+            if (src.payload) |p| {
+                const len: usize = @intCast(src.payload_len);
+                const buf = c.malloc(len) orelse {
+                    // Payload alloc failed — free envelope and bail.
+                    c.free(@ptrCast(dst));
+                    return null;
+                };
+                const d: [*]u8 = @ptrCast(buf);
+                const s: [*]const u8 = @ptrCast(p);
+                @memcpy(d[0..len], s[0..len]);
+                dst.payload = buf;
+                MessageMetrics.inc(&g_msg_metrics.payloads_allocated);
+                MessageMetrics.add(&g_msg_metrics.total_payload_bytes, len);
+            }
+        },
+        else => {
+            // Unknown tag — best-effort: payload copy if present
+            if (src.payload) |p| {
+                const len: usize = @intCast(src.payload_len);
+                const buf = c.malloc(len) orelse {
+                    c.free(@ptrCast(dst));
+                    return null;
+                };
+                const d: [*]u8 = @ptrCast(buf);
+                const s: [*]const u8 = @ptrCast(p);
+                @memcpy(d[0..len], s[0..len]);
+                dst.payload = buf;
+                MessageMetrics.inc(&g_msg_metrics.payloads_allocated);
+            }
+        },
+    }
+    return dst;
+}
+
+// ── Timer thread entry point ────────────────────────────────────────
+
+fn timerThreadFn(ctx_raw: ?*anyopaque) void {
+    const ctx: *TimerContext = @ptrCast(@alignCast(ctx_raw orelse return));
+
+    if (ctx.is_repeating) {
+        // ── EVERY: loop until cancelled ─────────────────────────────
+        const cancel = &g_timers[ctx.slot_index].cancel;
+
+        while (true) {
+            // Sleep first (first tick fires after one interval)
+            if (sleepWithCancel(ctx.delay_ms, cancel)) break;
+            if (cancel.load(.acquire)) break;
+
+            // Clone the template blob and push
+            const clone = blobClone(ctx.blob);
+            if (clone) |cloned| {
+                const rc = msg_queue_push(ctx.queue, cloned);
+                if (rc == 0) break; // queue closed — stop
+            } else {
+                break; // alloc failure — stop
+            }
+        }
+
+        // Free the template blob (we still own it)
+        msg_blob_free(ctx.blob);
+    } else {
+        // ── AFTER: one-shot ─────────────────────────────────────────
+        // Sleep, then push the blob (transfers ownership to queue).
+        var remaining: u64 = ctx.delay_ms;
+        while (remaining > 0) {
+            const chunk: u64 = if (remaining > 100) 100 else remaining;
+            const secs: isize = @intCast(chunk / 1000);
+            const nsecs: isize = @intCast((chunk % 1000) * 1_000_000);
+            var ts = Timespec{ .tv_sec = secs, .tv_nsec = nsecs };
+            _ = c.nanosleep(&ts, null);
+            remaining -= chunk;
+        }
+        _ = msg_queue_push(ctx.queue, ctx.blob);
+    }
+
+    // Mark slot inactive
+    g_timer_mutex.lock();
+    g_timers[ctx.slot_index].active = false;
+    g_timers[ctx.slot_index].thread = null;
+    g_timer_mutex.unlock();
+
+    // Free context
+    c.free(@ptrCast(ctx));
+}
+
+// ── Exported timer API ──────────────────────────────────────────────
+
+/// Find a free timer slot and mark it active.  Returns slot index or -1.
+fn acquireTimerSlot() i32 {
+    g_timer_mutex.lock();
+    defer g_timer_mutex.unlock();
+    for (0..MAX_TIMERS) |i| {
+        if (!g_timers[i].active) {
+            g_timers[i].active = true;
+            g_timers[i].cancel = std.atomic.Value(bool).init(false);
+            g_timers[i].thread = null;
+            return @intCast(i);
+        }
+    }
+    return -1; // all slots occupied
+}
+
+/// AFTER <delay_ms> MS SEND <queue>, <blob>
+///
+/// Spawns a timer thread that sleeps for `delay_ms` then pushes `blob`
+/// to `queue`.  The blob ownership transfers to the timer thread.
+/// Returns the timer slot index (≥0) on success, -1 on failure.
+export fn timer_after_send(
+    queue: ?*MessageQueue,
+    blob: ?*MessageBlob,
+    delay_ms: i64,
+) callconv(.c) i32 {
+    const q = queue orelse {
+        msg_blob_free(blob);
+        return -1;
+    };
+    const b = blob orelse return -1;
+    if (delay_ms < 0) {
+        msg_blob_free(blob);
+        return -1;
+    }
+
+    const slot = acquireTimerSlot();
+    if (slot < 0) {
+        msg_blob_free(blob);
+        return -1;
+    }
+
+    // Allocate context on the heap — timer thread owns it.
+    const ctx_raw = c.calloc(1, @sizeOf(TimerContext)) orelse {
+        msg_blob_free(blob);
+        g_timer_mutex.lock();
+        g_timers[@intCast(slot)].active = false;
+        g_timer_mutex.unlock();
+        return -1;
+    };
+    const ctx: *TimerContext = @ptrCast(@alignCast(ctx_raw));
+    ctx.queue = q;
+    ctx.blob = b;
+    ctx.delay_ms = @intCast(delay_ms);
+    ctx.is_repeating = false;
+    ctx.slot_index = @intCast(slot);
+
+    const thread = std.Thread.spawn(.{}, timerThreadFn, .{@as(?*anyopaque, ctx_raw)}) catch {
+        msg_blob_free(blob);
+        c.free(ctx_raw);
+        g_timer_mutex.lock();
+        g_timers[@intCast(slot)].active = false;
+        g_timer_mutex.unlock();
+        return -1;
+    };
+
+    g_timer_mutex.lock();
+    g_timers[@intCast(slot)].thread = thread;
+    g_timer_mutex.unlock();
+
+    return slot;
+}
+
+/// EVERY <interval_ms> MS SEND <queue>, <blob>
+///
+/// Spawns a timer thread that repeatedly clones `blob` and pushes a
+/// copy to `queue` every `interval_ms` milliseconds.  The first tick
+/// fires after one full interval.  The template blob ownership
+/// transfers to the timer thread.
+/// Returns the timer slot index (≥0) on success, -1 on failure.
+export fn timer_every_send(
+    queue: ?*MessageQueue,
+    blob: ?*MessageBlob,
+    interval_ms: i64,
+) callconv(.c) i32 {
+    const q = queue orelse {
+        msg_blob_free(blob);
+        return -1;
+    };
+    const b = blob orelse return -1;
+    if (interval_ms <= 0) {
+        msg_blob_free(blob);
+        return -1;
+    }
+
+    const slot = acquireTimerSlot();
+    if (slot < 0) {
+        msg_blob_free(blob);
+        return -1;
+    }
+
+    const ctx_raw = c.calloc(1, @sizeOf(TimerContext)) orelse {
+        msg_blob_free(blob);
+        g_timer_mutex.lock();
+        g_timers[@intCast(slot)].active = false;
+        g_timer_mutex.unlock();
+        return -1;
+    };
+    const ctx: *TimerContext = @ptrCast(@alignCast(ctx_raw));
+    ctx.queue = q;
+    ctx.blob = b;
+    ctx.delay_ms = @intCast(interval_ms);
+    ctx.is_repeating = true;
+    ctx.slot_index = @intCast(slot);
+
+    const thread = std.Thread.spawn(.{}, timerThreadFn, .{@as(?*anyopaque, ctx_raw)}) catch {
+        msg_blob_free(blob);
+        c.free(ctx_raw);
+        g_timer_mutex.lock();
+        g_timers[@intCast(slot)].active = false;
+        g_timer_mutex.unlock();
+        return -1;
+    };
+
+    g_timer_mutex.lock();
+    g_timers[@intCast(slot)].thread = thread;
+    g_timer_mutex.unlock();
+
+    return slot;
+}
+
+/// Stop a specific timer by slot index.  Sets the cancel flag and
+/// joins the timer thread.  Safe to call on inactive/invalid slots.
+export fn timer_stop(slot: i32) callconv(.c) void {
+    if (slot < 0 or slot >= @as(i32, MAX_TIMERS)) return;
+    const idx: usize = @intCast(slot);
+
+    g_timer_mutex.lock();
+    if (!g_timers[idx].active) {
+        g_timer_mutex.unlock();
+        return;
+    }
+    g_timers[idx].cancel.store(true, .release);
+    const maybe_thread = g_timers[idx].thread;
+    g_timer_mutex.unlock();
+
+    // Join outside the mutex to avoid deadlock
+    if (maybe_thread) |thread| {
+        thread.join();
+    }
+
+    g_timer_mutex.lock();
+    g_timers[idx].active = false;
+    g_timers[idx].thread = null;
+    g_timer_mutex.unlock();
+}
+
+/// Stop all active timers.  Sets cancel flags first, then joins all
+/// threads.  Called automatically during runtime cleanup.
+export fn timer_stop_all() callconv(.c) void {
+    // Phase 1: signal all active timers to stop
+    g_timer_mutex.lock();
+    for (0..MAX_TIMERS) |i| {
+        if (g_timers[i].active) {
+            g_timers[i].cancel.store(true, .release);
+        }
+    }
+    g_timer_mutex.unlock();
+
+    // Phase 2: join all threads (outside mutex)
+    for (0..MAX_TIMERS) |i| {
+        g_timer_mutex.lock();
+        const maybe_thread = g_timers[i].thread;
+        g_timer_mutex.unlock();
+
+        if (maybe_thread) |thread| {
+            thread.join();
+        }
+
+        g_timer_mutex.lock();
+        g_timers[i].active = false;
+        g_timers[i].thread = null;
+        g_timer_mutex.unlock();
+    }
+}

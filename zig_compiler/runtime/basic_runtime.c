@@ -81,6 +81,10 @@ extern void msg_metrics_report(void);
 extern int32_t msg_metrics_check_leaks(void);
 
 void basic_runtime_cleanup(void) {
+    // Stop all active timers (AFTER/EVERY) before tearing down queues
+    extern void timer_stop_all(void);
+    timer_stop_all();
+
     // Close all open files
     file_close_all();
     

@@ -126,6 +126,8 @@ Workers have full access to:
 - **Array operations** — `REDIM`, `ERASE`, `DELETE` (on local arrays)
 - **Data reconstruction** — `UNMARSHALL`
 - **Return values** — `RETURN expression`
+- **Thread-safe output** — `PRINT`, `CONSOLE` (protected by a statement-level mutex so lines never interleave)
+- **Timers** — `AFTER ... SEND`, `EVERY ... SEND`, `TIMER STOP` (timers are just message producers)
 
 ## What Workers Cannot Do
 
@@ -133,18 +135,19 @@ The compiler rejects workers that attempt any of the following:
 
 | Forbidden | Reason |
 |---|---|
-| `PRINT`, `CONSOLE`, `INPUT` | No I/O in isolated threads |
-| `GLOBAL`, `SHARED` variables | Workers are isolated |
-| `OPEN`, `CLOSE` (file I/O) | File I/O not allowed |
+| `INPUT` | Reading stdin from a background thread is not meaningful |
+| `GLOBAL`, `SHARED` variables | Workers are isolated — no shared state |
+| `OPEN`, `CLOSE` (file I/O) | File I/O not allowed in workers |
 | `CLS`, `PSET`, `LINE`, `CIRCLE` | Graphics commands not allowed |
 | `SPRLOAD`, sprite commands | Sprite commands not allowed |
 | `PLAY`, audio commands | Audio commands not allowed |
-| `TIMER` | Timer commands not allowed |
 | Accessing global variables | Isolation violation |
 | `SPAWN` inside a worker | No nested workers |
 | Nested `WORKER` definitions | Cannot nest WORKER inside WORKER |
 
 These aren't runtime errors — they're **compile-time errors**. The semantic analyzer catches every violation before any code is generated.
+
+Note: `PRINT` and `CONSOLE` **are** allowed inside workers. Each `PRINT` statement is wrapped in a mutex so that an entire line (all items + newline) appears atomically — no garbled output from concurrent threads. `AFTER ... SEND` and `EVERY ... SEND` are also allowed, since timers are just lightweight threads that push messages onto queues.
 
 ## Running Multiple Workers
 
